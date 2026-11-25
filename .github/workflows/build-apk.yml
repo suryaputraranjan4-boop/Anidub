@@ -9,7 +9,9 @@ on:
       - 'app/**'
       - 'gradle/**'
       - '*.gradle.kts'
+      - 'gradle.properties'
       - 'gradle/libs.versions.toml'
+      - '.env.example'
       - '.github/workflows/build-apk.yml'
 
 permissions:
@@ -23,28 +25,52 @@ jobs:
   build-debug-apk:
     name: Build debug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Install project Android SDK packages
+        run: |
+          sdkmanager --install "platforms;android-36.1" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '9.3.1'
 
+      - name: Create the debug signing keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000
+          fi
+          test -s debug.keystore
+
       - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
 
       - name: Verify APK output
         shell: bash
@@ -52,14 +78,15 @@ jobs:
           set -euo pipefail
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
-          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
-          ls -lh "$APK"
+          mkdir -p build-output
+          cp "$APK" build-output/Anidub-debug.apk
+          sha256sum build-output/Anidub-debug.apk
+          ls -lh build-output/Anidub-debug.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: anidub-debug-apk
-          path: ${{ env.APK_PATH }}
+          path: build-output/Anidub-debug.apk
           if-no-files-found: error
           retention-days: 14
-
