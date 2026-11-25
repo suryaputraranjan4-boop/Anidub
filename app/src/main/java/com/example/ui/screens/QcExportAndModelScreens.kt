@@ -18,15 +18,19 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FactCheck
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Outbox
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
@@ -57,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import com.example.data.local.ModelManifestEntity
 import com.example.engine.HinglishTtsNormalizer
 import com.example.engine.ModelDownloadManager
+import com.example.engine.VerifiedModelCatalog
 import com.example.ui.components.AudioPlayPauseButton
 import com.example.ui.components.MetadataChipRow
 import com.example.ui.components.StatusPill
@@ -282,7 +287,20 @@ fun QcAndExportView(viewModel: StudioViewModel) {
                 ) {
                     Icon(Icons.Default.Outbox, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(if (exportFormat == "MP4_VIDEO") "Export Muxed MP4 Video" else "Export Lossless WAV Audio")
+                    Text(if (exportFormat == "MP4_VIDEO") "Export Verified MP4 + Subtitles" else "Export Verified WAV + Subtitles")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { viewModel.exportSubtitlesOnly(fileName) },
+                    enabled = !banner.isRunning,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("export_subtitles_only_btn"),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, StudioBorder)
+                ) {
+                    Text("Export Subtitles Only (JA/HI/Bilingual SRT + ASS)", color = StudioCyan)
                 }
             }
         }
@@ -322,11 +340,35 @@ fun QcAndExportView(viewModel: StudioViewModel) {
                                 style = MaterialTheme.typography.bodySmall,
                                 color = StudioTextSecondary
                             )
-                            Text(
-                                text = formatShortDate(exp.exportedAt),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = StudioTextMuted
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = formatShortDate(exp.exportedAt),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = StudioTextMuted
+                                )
+                                StatusPill(text = exp.status, color = statusColorFor(exp.status))
+                            }
+                            if (exp.subtitlePathsSummary.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Subtitles: ${exp.subtitlePathsSummary}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                    color = StudioCyan,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (exp.verificationReport.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = exp.verificationReport,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = StudioTextSecondary
+                                )
+                            }
                         }
                         AudioPlayPauseButton(
                             filePath = exp.outputFilePath,
@@ -344,16 +386,26 @@ fun QcAndExportView(viewModel: StudioViewModel) {
 
 /**
  * MODEL LIBRARY SCREEN (PRIMARY TAB 5)
- * Cleanly separates Local / On-Device Models from Remote API & GPU Worker Services.
- * Shows real progress bars ONLY during active download/verification.
+ * Shows verified downloadable AI models (with exact Hugging Face combined sizes, companion counts,
+ * formats, languages, and honest runtime compatibility) separated from built-in Android & Firebase API runtimes.
  */
 @Composable
 fun ModelLibraryScreen(viewModel: StudioViewModel) {
     val models by viewModel.models.collectAsState()
-    val localModels = remember(models) { models.filter { ModelDownloadManager.isLocalRuntime(it.runtimeCompatibility) } }
-    val remoteModels = remember(models) { models.filterNot { ModelDownloadManager.isLocalRuntime(it.runtimeCompatibility) } }
+    val downloadableModels = remember(models) {
+        models.filter { VerifiedModelCatalog.isDownloadablePackage(it) }
+    }
+    val builtInAndCloudModels = remember(models) {
+        models.filterNot { VerifiedModelCatalog.isDownloadablePackage(it) }
+    }
     val usedBytes = remember(models) { viewModel.modelDownloadManager.getModelsStorageUsedBytes() }
     val freeBytes = remember(models) { viewModel.modelDownloadManager.getAvailableStorageBytes() }
+    val totalKnownPackageBytes = remember(downloadableModels) {
+        downloadableModels.filter { it.isSizeKnown }.sumOf { it.expectedSizeBytes }
+    }
+    val installedCount = remember(downloadableModels) {
+        downloadableModels.count { it.downloadState == "INSTALLED" }
+    }
 
     LazyColumn(
         modifier = Modifier
@@ -364,62 +416,64 @@ fun ModelLibraryScreen(viewModel: StudioViewModel) {
     ) {
         item {
             StudioSectionHeader(
-                title = "Model Library",
-                subtitle = "Verified on-device DSP/ONNX runtimes & remote API / GPU worker services"
+                title = "Model Assets & Downloads",
+                subtitle = "Verified official Hugging Face weights, companion manifests, and honest runtime compatibility"
             )
             Spacer(modifier = Modifier.height(6.dp))
             MetadataChipRow(
                 items = listOf(
-                    "On-Device" to "${localModels.size} runtimes",
-                    "Remote / API" to "${remoteModels.size} services",
+                    "Verified Packs" to "$installedCount / ${downloadableModels.size}",
+                    "Catalog Total" to "${formatBytes(totalKnownPackageBytes)}+",
                     "Disk Free" to formatBytes(freeBytes)
                 )
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "Downloaded manifest/model cache on device: ${formatBytes(usedBytes)}",
+                text = "On-device model storage used: ${formatBytes(usedBytes)} • Ungated catalog requires ${formatBytes(totalKnownPackageBytes)} (+ gated pyannote after HF auth)",
                 style = MaterialTheme.typography.labelSmall,
                 color = StudioTextMuted
             )
         }
 
-        // Section 1: Local / On-Device Models
+        // Section 1: Verified Downloadable AI Model Packages
         item {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.padding(top = 6.dp)
             ) {
-                Icon(Icons.Default.PhoneAndroid, contentDescription = null, tint = StudioEmerald, modifier = Modifier.size(18.dp))
-                Text("Local / On-Device Models", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+                Icon(Icons.Default.Download, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(18.dp))
+                Text("Downloadable AI Models (Verified Sources)", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
             }
         }
-        items(localModels, key = { it.modelId }) { model ->
+        items(downloadableModels, key = { it.modelId }) { model ->
             ModelLibraryCard(
                 model = model,
                 onOpenDetail = { viewModel.openModelDetail(model.modelId) },
                 onDownload = { viewModel.downloadModel(model.modelId) },
+                onCancel = { viewModel.cancelModelDownload(model.modelId) },
                 onDelete = { viewModel.deleteModel(model.modelId) }
             )
         }
 
-        // Section 2: Remote API & GPU Worker Services
+        // Section 2: Built-In Android & Firebase Cloud Services (0 B Download)
         item {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.padding(top = 8.dp)
             ) {
-                Icon(Icons.Default.Cloud, contentDescription = null, tint = StudioCyan, modifier = Modifier.size(18.dp))
-                Text("Remote API & GPU Worker Services", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+                Icon(Icons.Default.PhoneAndroid, contentDescription = null, tint = StudioEmerald, modifier = Modifier.size(18.dp))
+                Text("Built-In Android & Cloud Services (0 B)", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
             }
         }
-        items(remoteModels, key = { it.modelId }) { model ->
+        items(builtInAndCloudModels, key = { it.modelId }) { model ->
             ModelLibraryCard(
                 model = model,
                 onOpenDetail = { viewModel.openModelDetail(model.modelId) },
-                onDownload = { viewModel.downloadModel(model.modelId) },
-                onDelete = { viewModel.deleteModel(model.modelId) }
+                onDownload = {},
+                onCancel = {},
+                onDelete = {}
             )
         }
     }
@@ -430,14 +484,25 @@ private fun ModelLibraryCard(
     model: ModelManifestEntity,
     onOpenDetail: () -> Unit,
     onDownload: () -> Unit,
+    onCancel: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val provider = remember(model.modelId) { ModelDownloadManager.providerForModel(model.modelId) }
+    val provider = remember(model.modelId) { VerifiedModelCatalog.providerForModel(model.modelId) }
+    val runtimeBadge = remember(model.runtimeCompatibility) {
+        VerifiedModelCatalog.runtimeBadgeLabel(model.runtimeCompatibility)
+    }
+    val isDownloadable = remember(model) { VerifiedModelCatalog.isDownloadablePackage(model) }
     val isDownloading = model.downloadState == "DOWNLOADING" || model.downloadState == "VERIFYING"
-    val isBuiltInOrApi = model.runtimeCompatibility in setOf("ANDROID_LOCAL", "NATIVE_CPP_DSP", "EXTERNAL_API")
     val stateColor = statusColorFor(model.downloadState)
+    val remainingBytes = if (model.isSizeKnown && model.expectedSizeBytes > 0L) {
+        (model.expectedSizeBytes - model.downloadedBytes).coerceAtLeast(0L)
+    } else 0L
 
-    StudioCard(padding = 14.dp, onClick = onOpenDetail) {
+    StudioCard(
+        padding = 14.dp,
+        onClick = onOpenDetail,
+        modifier = Modifier.testTag("model_card_${model.modelId}")
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -446,7 +511,7 @@ private fun ModelLibraryCard(
             Column(modifier = Modifier.weight(1f)) {
                 Text(model.modelName, style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
                 Text(
-                    text = "$provider • ${model.runtimeCompatibility.replace('_', ' ')}",
+                    text = "$provider • $runtimeBadge",
                     style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
                     color = StudioTextMuted
                 )
@@ -454,8 +519,9 @@ private fun ModelLibraryCard(
             Spacer(modifier = Modifier.width(8.dp))
             StatusPill(
                 text = when {
-                    model.runtimeCompatibility == "EXTERNAL_API" -> "FIREBASE AI"
-                    model.downloadState == "INSTALLED" -> "READY"
+                    model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_EXTERNAL_API -> "FIREBASE AI"
+                    model.downloadState == "BUILT_IN" -> "BUILT-IN"
+                    model.downloadState == "INSTALLED" -> "VERIFIED"
                     else -> model.downloadState.replace('_', ' ')
                 },
                 color = stateColor
@@ -465,13 +531,42 @@ private fun ModelLibraryCard(
         Spacer(modifier = Modifier.height(6.dp))
         Text(model.purpose, style = MaterialTheme.typography.bodySmall, color = StudioTextSecondary)
 
-        if (model.isExperimentalArchived) {
-            Spacer(modifier = Modifier.height(6.dp))
-            StatusPill(text = "ARCHIVED RESEARCH (AUG 2026)", color = StudioAmber)
+        Spacer(modifier = Modifier.height(8.dp))
+        // Format & Languages metadata strip
+        Text(
+            text = "Format: ${model.fileFormat} • Languages: ${model.supportedLanguages}",
+            style = MaterialTheme.typography.labelSmall,
+            color = StudioTextMuted,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+
+        if (isDownloadable) {
+            Spacer(modifier = Modifier.height(8.dp))
+            val expectedLabel = when {
+                !model.isSizeKnown && model.isGatedHuggingFace -> "Gated (HF token required)"
+                model.expectedSizeBytes > 0L -> formatBytes(model.expectedSizeBytes)
+                else -> "Unknown"
+            }
+            val downloadedLabel = formatBytes(model.downloadedBytes)
+            val remainingLabel = when {
+                !model.isSizeKnown -> "—"
+                model.downloadState == "INSTALLED" -> "0 B"
+                else -> formatBytes(remainingBytes)
+            }
+
+            MetadataChipRow(
+                items = listOf(
+                    "Expected" to expectedLabel,
+                    "Downloaded" to downloadedLabel,
+                    "Remaining" to remainingLabel,
+                    "Files" to "${model.verifiedFilesCount}/${model.totalFilesCount}"
+                )
+            )
         }
 
-        // Show progress bar ONLY during active download or SHA-256 verification
-        if (isDownloading) {
+        // Progress bar during active download/verification or partial resume state
+        if (isDownloading || (isDownloadable && model.downloadedBytes > 0L && model.downloadState != "INSTALLED" && model.isSizeKnown)) {
             Spacer(modifier = Modifier.height(10.dp))
             LinearProgressIndicator(
                 progress = { (model.downloadProgressPercent / 100f).coerceIn(0f, 1f) },
@@ -479,11 +574,18 @@ private fun ModelLibraryCard(
                     .fillMaxWidth()
                     .height(6.dp)
                     .clip(RoundedCornerShape(3.dp)),
-                color = StudioCyan,
+                color = if (isDownloading) StudioCyan else StudioAmber,
                 trackColor = StudioBorder
             )
             Spacer(modifier = Modifier.height(4.dp))
-            Text(model.statusNote, style = MaterialTheme.typography.labelSmall, color = StudioCyan)
+            Text(
+                text = model.statusNote,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (isDownloading) StudioCyan else StudioTextSecondary
+            )
+        } else if (model.downloadState == "FAILED" || model.downloadState == "CORRUPTED") {
+            Spacer(modifier = Modifier.height(8.dp))
+            WarningBanner(message = model.statusNote, isError = true)
         }
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -493,25 +595,55 @@ private fun ModelLibraryCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "${model.licenseName}${if (model.expectedSizeBytes > 0L) " • ${formatBytes(model.expectedSizeBytes)}" else ""}",
+                text = model.licenseName,
                 style = MaterialTheme.typography.labelSmall,
                 color = StudioTextMuted,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
-            if (!isBuiltInOrApi) {
-                if (model.downloadState == "INSTALLED") {
-                    IconButton(onClick = onDelete, modifier = Modifier.size(48.dp)) {
-                        Icon(Icons.Default.DeleteOutline, contentDescription = "Delete model", tint = StudioCrimson)
+            if (isDownloadable) {
+                when {
+                    isDownloading -> {
+                        TextButton(
+                            onClick = onCancel,
+                            modifier = Modifier.testTag("model_cancel_${model.modelId}")
+                        ) {
+                            Icon(Icons.Default.Cancel, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Pause / Cancel", color = StudioAmber)
+                        }
                     }
-                } else if (!isDownloading) {
-                    TextButton(
-                        onClick = if (model.isGatedHuggingFace) onOpenDetail else onDownload
-                    ) {
-                        Icon(Icons.Default.Download, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(if (model.isGatedHuggingFace) "Token Required" else "Install", color = StudioViolet)
+                    model.downloadState == "INSTALLED" -> {
+                        IconButton(
+                            onClick = onDelete,
+                            modifier = Modifier.size(48.dp).testTag("model_delete_${model.modelId}")
+                        ) {
+                            Icon(Icons.Default.DeleteOutline, contentDescription = "Delete model files", tint = StudioCrimson)
+                        }
+                    }
+                    model.isGatedHuggingFace -> {
+                        TextButton(
+                            onClick = onOpenDetail,
+                            modifier = Modifier.testTag("model_gated_${model.modelId}")
+                        ) {
+                            Icon(Icons.Default.Lock, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("HF Token Required", color = StudioAmber)
+                        }
+                    }
+                    else -> {
+                        TextButton(
+                            onClick = onDownload,
+                            modifier = Modifier.testTag("model_download_${model.modelId}")
+                        ) {
+                            Icon(Icons.Default.Download, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (model.downloadedBytes > 0L) "Resume" else "Download",
+                                color = StudioViolet
+                            )
+                        }
                     }
                 }
             }
@@ -520,21 +652,31 @@ private fun ModelLibraryCard(
 }
 
 /**
- * MODEL MANIFEST & CHECKSUM DETAIL OVERLAY
+ * MODEL ASSET & COMPANION FILES DETAIL OVERLAY
+ * Displays full official source URL, expected/downloaded/remaining bytes, compatibility summary,
+ * per-file companion manifest breakdown with individual sizes & SHA-256 verification, and controls.
  */
 @Composable
 fun ModelDetailScreen(viewModel: StudioViewModel) {
     val models by viewModel.models.collectAsState()
     val selectedId by viewModel.selectedModelId.collectAsState()
     val model = models.find { it.modelId == selectedId }
-    var hfToken by remember { mutableStateOf("") }
+    var hfToken by remember(selectedId) { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { viewModel.closeOverlay() }, modifier = Modifier.size(48.dp)) {
+            IconButton(
+                onClick = { viewModel.closeOverlay() },
+                modifier = Modifier.size(48.dp).testTag("model_detail_back_btn")
+            ) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = StudioTextPrimary)
             }
-            Text("Model Details", style = MaterialTheme.typography.titleLarge, color = StudioTextPrimary)
+            Column {
+                Text("Model Asset Inspector", style = MaterialTheme.typography.titleLarge, color = StudioTextPrimary)
+                if (model != null) {
+                    Text(model.modelVersion.ifBlank { model.modelId }, style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily), color = StudioTextMuted)
+                }
+            }
         }
 
         if (model == null) {
@@ -546,75 +688,242 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
             return
         }
 
+        val isDownloadable = remember(model) { VerifiedModelCatalog.isDownloadablePackage(model) }
+        val isDownloading = model.downloadState == "DOWNLOADING" || model.downloadState == "VERIFYING"
+        val diskStatuses = remember(model.modelId, model.filesManifestJson, model.downloadedBytes, model.downloadState) {
+            viewModel.modelDownloadManager.inspectLocalFiles(model)
+        }
+        val remainingBytes = if (model.isSizeKnown && model.expectedSizeBytes > 0L) {
+            (model.expectedSizeBytes - model.downloadedBytes).coerceAtLeast(0L)
+        } else 0L
+
         LazyColumn(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(vertical = 10.dp)
         ) {
+            // Core Metadata Card
             item {
-                StudioCard {
+                StudioCard(elevated = true) {
                     Text(model.modelName, style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StatusPill(text = model.runtimeCompatibility.replace('_', ' '), color = StudioCyan)
+                        StatusPill(text = VerifiedModelCatalog.runtimeBadgeLabel(model.runtimeCompatibility), color = StudioCyan)
                         StatusPill(text = model.downloadState.replace('_', ' '), color = statusColorFor(model.downloadState))
                     }
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(model.purpose, style = MaterialTheme.typography.bodyMedium, color = StudioTextSecondary)
+
+                    if (isDownloadable) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        MetadataChipRow(
+                            items = listOf(
+                                "Expected Total" to if (model.isSizeKnown) formatBytes(model.expectedSizeBytes) else "Token required",
+                                "Downloaded" to formatBytes(model.downloadedBytes),
+                                "Remaining" to if (model.isSizeKnown) formatBytes(remainingBytes) else "—",
+                                "Verified Files" to "${model.verifiedFilesCount}/${model.totalFilesCount}"
+                            )
+                        )
+                    }
+
+                    if (isDownloading) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        LinearProgressIndicator(
+                            progress = { (model.downloadProgressPercent / 100f).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                            color = StudioCyan,
+                            trackColor = StudioBorder
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(12.dp))
                     HorizontalDivider(color = StudioBorderSubtle)
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("Required Files", style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
-                    Text(model.actualFilesNeededJson, style = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMonoFamily), color = StudioTextPrimary)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("Dependencies", style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
-                    Text(model.requiredDependencies, style = MaterialTheme.typography.bodySmall, color = StudioTextSecondary)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("License", style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
-                    Text("${model.licenseName} — ${model.licenseNotes}", style = MaterialTheme.typography.bodySmall, color = StudioTextSecondary)
+
+                    DetailRow("File Format", model.fileFormat)
+                    DetailRow("Supported Languages", model.supportedLanguages)
+                    DetailRow("Official Source", model.sourceUrl, mono = true)
+                    DetailRow("License", "${model.licenseName} — ${model.licenseNotes}")
+                    DetailRow("Runtime Compatibility", model.compatibilitySummary.ifBlank { model.runtimeCompatibility })
+                    DetailRow("Required Dependencies", model.requiredDependencies)
+                    if (model.localFilePath.isNotBlank()) {
+                        DetailRow("Device Storage Directory", model.localFilePath, mono = true)
+                    }
                     if (model.sha256Checksum.isNotBlank()) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text("Verified SHA-256", style = MaterialTheme.typography.labelSmall, color = StudioEmerald)
-                        Text(model.sha256Checksum, style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily), color = StudioTextPrimary)
+                        DetailRow("Verified Primary SHA-256", model.sha256Checksum, mono = true, valueColor = StudioEmerald)
                     }
                     if (model.statusNote.isNotBlank()) {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        WarningBanner(message = model.statusNote, isError = model.downloadState == "FAILED")
-                    }
-                }
-            }
-
-            if (model.isGatedHuggingFace) {
-                item {
-                    StudioCard {
-                        Text("Hugging Face Access Token", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
                         Spacer(modifier = Modifier.height(6.dp))
-                        OutlinedTextField(
-                            value = hfToken,
-                            onValueChange = { hfToken = it },
-                            label = { Text("Read-Only HF Token (hf_...)") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true
+                        WarningBanner(
+                            message = model.statusNote,
+                            isError = model.downloadState == "FAILED" || model.downloadState == "CORRUPTED"
                         )
                     }
                 }
             }
 
-            if (model.runtimeCompatibility !in setOf("ANDROID_LOCAL", "NATIVE_CPP_DSP", "EXTERNAL_API")) {
+            // Required Companion Files Breakdown Card
+            if (diskStatuses.isNotEmpty()) {
                 item {
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                        Button(
-                            onClick = { viewModel.downloadModel(model.modelId, hfToken.takeIf { it.isNotBlank() }) },
-                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = StudioViolet, contentColor = Color(0xFF0A0B0F)),
+                    StudioCard {
+                        Text(
+                            text = "Required Files & Companion Assets (${diskStatuses.size})",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = StudioTextPrimary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        diskStatuses.forEachIndexed { idx, status ->
+                            if (idx > 0) {
+                                HorizontalDivider(color = StudioBorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = status.artifact.relativePath,
+                                        style = MaterialTheme.typography.labelLarge.copy(fontFamily = JetBrainsMonoFamily),
+                                        color = StudioTextPrimary
+                                    )
+                                    val sizeDesc = when {
+                                        status.artifact.expectedBytes > 0L ->
+                                            "${formatBytes(status.artifact.expectedBytes)} (${status.artifact.expectedBytes} B)"
+                                        status.artifact.isGatedFile -> "Gated — query with HF token"
+                                        else -> "Unknown"
+                                    }
+                                    Text(
+                                        text = "${status.artifact.role} • Expected: $sizeDesc",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = StudioTextSecondary
+                                    )
+                                    if (status.actualBytesOnDisk > 0L || status.partialBytesOnDisk > 0L) {
+                                        Text(
+                                            text = "On disk: ${formatBytes(status.actualBytesOnDisk + status.partialBytesOnDisk)}",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                            color = if (status.isPresentAndSized) StudioEmerald else StudioAmber
+                                        )
+                                    }
+                                    if (status.artifact.expectedSha256.isNotBlank()) {
+                                        Text(
+                                            text = "SHA-256: ${status.artifact.expectedSha256.take(24)}…",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                            color = StudioTextMuted
+                                        )
+                                    }
+                                    Text(
+                                        text = status.artifact.downloadUrl,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                        color = StudioTextMuted,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                if (status.isPresentAndSized) {
+                                    Icon(
+                                        Icons.Default.CheckCircle,
+                                        contentDescription = "File present and sized",
+                                        tint = StudioEmerald,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                } else if (status.artifact.isGatedFile && status.artifact.expectedBytes <= 0L) {
+                                    Icon(
+                                        Icons.Default.Lock,
+                                        contentDescription = "Gated file",
+                                        tint = StudioAmber,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                } else {
+                                    StatusPill(
+                                        text = if (status.partialBytesOnDisk > 0L) "PARTIAL" else "PENDING",
+                                        color = if (status.partialBytesOnDisk > 0L) StudioAmber else StudioTextMuted
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Gated Hugging Face Token Panel
+            if (model.isGatedHuggingFace) {
+                item {
+                    StudioCard {
+                        Text("Gated Hugging Face Authorization", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Accept license terms on pyannote/speaker-diarization-3.1 AND pyannote/segmentation-3.0, then enter a read-only HF token to inspect real server sizes or download.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudioTextSecondary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = hfToken,
+                            onValueChange = { hfToken = it },
+                            label = { Text("Read-Only HF Token (hf_...)") },
+                            modifier = Modifier.fillMaxWidth().testTag("hf_token_input"),
+                            singleLine = true
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { viewModel.probeGatedModelSizes(model.modelId, hfToken) },
+                            enabled = hfToken.isNotBlank() && !isDownloading,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("probe_gated_size_btn"),
                             shape = RoundedCornerShape(10.dp)
                         ) {
-                            Text(if (model.downloadState == "INSTALLED") "Re-Verify Manifest" else "Download & Verify")
+                            Text("Query Exact Server File Sizes (HEAD)", color = StudioCyan)
                         }
-                        if (model.downloadState == "INSTALLED") {
+                    }
+                }
+            }
+
+            // Download / Cancel / Verify / Delete Controls
+            if (isDownloadable) {
+                item {
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        if (isDownloading) {
+                            OutlinedButton(
+                                onClick = { viewModel.cancelModelDownload(model.modelId) },
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("detail_cancel_download_btn"),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("Pause / Cancel Download", color = StudioAmber)
+                            }
+                        } else {
+                            Button(
+                                onClick = {
+                                    if (model.downloadState == "INSTALLED") {
+                                        viewModel.verifyModelIntegrity(model.modelId)
+                                    } else {
+                                        viewModel.downloadModel(model.modelId, hfToken.takeIf { it.isNotBlank() })
+                                    }
+                                },
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("detail_download_btn"),
+                                colors = ButtonDefaults.buttonColors(containerColor = StudioViolet, contentColor = Color(0xFF0A0B0F)),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (model.downloadState == "INSTALLED") Icons.Default.VerifiedUser else Icons.Default.Download,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    when {
+                                        model.downloadState == "INSTALLED" -> "Re-Verify SHA-256"
+                                        model.downloadedBytes > 0L -> "Resume Download"
+                                        else -> "Download All Files"
+                                    }
+                                )
+                            }
+                        }
+
+                        if (model.downloadState == "INSTALLED" || model.downloadedBytes > 0L) {
                             OutlinedButton(
                                 onClick = { viewModel.deleteModel(model.modelId) },
-                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                modifier = Modifier.heightIn(min = 48.dp).testTag("detail_delete_btn"),
                                 shape = RoundedCornerShape(10.dp)
                             ) {
                                 Text("Delete", color = StudioCrimson)
@@ -625,6 +934,27 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
             }
         }
     }
+}
+
+@Composable
+private fun DetailRow(
+    label: String,
+    value: String,
+    mono: Boolean = false,
+    valueColor: Color = StudioTextPrimary
+) {
+    if (value.isBlank()) return
+    Text(label, style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
+    Text(
+        text = value,
+        style = if (mono) {
+            MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMonoFamily)
+        } else {
+            MaterialTheme.typography.bodySmall
+        },
+        color = valueColor
+    )
+    Spacer(modifier = Modifier.height(8.dp))
 }
 
 /**
@@ -719,7 +1049,7 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                     Text("Self-Hosted GPU Inference Worker", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        "Optional endpoint for heavy Python/PyTorch models (Faster-Whisper Large-v3, pyannote, XTTS-v2).",
+                        "Optional endpoint for Python/PyTorch Safetensors models (Whisper Large V3 Turbo, HTDemucs, F5-Hindi-24KHz, pyannote 3.1).",
                         style = MaterialTheme.typography.bodySmall,
                         color = StudioTextSecondary
                     )

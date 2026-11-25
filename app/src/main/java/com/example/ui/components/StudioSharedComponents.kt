@@ -98,9 +98,9 @@ fun formatDurationCompact(ms: Long): String {
 fun formatBytes(bytes: Long): String {
     if (bytes <= 0L) return "0 B"
     return when {
-        bytes >= 1024L * 1024L * 1024L -> "%.2f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
-        bytes >= 1024L * 1024L -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
-        bytes >= 1024L -> "%.1f KB".format(bytes / 1024.0)
+        bytes >= 1_000_000_000L -> "%.2f GB".format(Locale.US, bytes / 1_000_000_000.0)
+        bytes >= 1_000_000L -> "%.2f MB".format(Locale.US, bytes / 1_000_000.0)
+        bytes >= 1_000L -> "%.1f KB".format(Locale.US, bytes / 1_000.0)
         else -> "$bytes B"
     }
 }

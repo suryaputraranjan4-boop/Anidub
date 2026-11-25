@@ -11,8 +11,8 @@ data class ProjectEntity(
     val sourceLanguage: String = "ja-JP (Japanese)",
     val targetLanguage: String = "hi-Latn (Roman Hinglish)",
     val masterSampleRateHz: Int = 24000,
-    val preferredTtsEngine: String = "XTTS-v2 (Cross-Language Clone)",
-    val preferredSeparationModel: String = "UVR-MDX-Net-Voc_FT",
+    val preferredTtsEngine: String = "F5-Hindi-24KHz",
+    val preferredSeparationModel: String = "HTDemucs",
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis()
 )
@@ -103,7 +103,7 @@ data class DialogueSegmentEntity(
     val durationDeviationMs: Long = 0L,
     val timeStretchRatio: Float = 1.0f,
     val voiceReferenceId: String = "",
-    val ttsEngineUsed: String = "XTTS-v2",
+    val ttsEngineUsed: String = "F5-Hindi-24KHz",
     val characterBatchNumber: Int = 0, // Batch 1 (A), Batch 2 (B), Batch 3 (C)
     val orderInCharacterBatch: Int = 0, // 1st in batch, 2nd in batch...
     val generationStatus: String = "PENDING", // PENDING, TRANSLATED, GENERATED, SYNCED, FAILED
@@ -111,7 +111,14 @@ data class DialogueSegmentEntity(
     val peakDbfs: Float = -4.0f,
     val translationVersion: Int = 1,
     val generationVersion: Int = 0,
-    val errorNote: String? = null
+    val errorNote: String? = null,
+    val characterId: String = "",
+    val emotionConfidence: Float = 0f,
+    val speakerConfidence: Float = 0f,
+    val translationConfidence: Float = 0f,
+    val sceneContextNote: String = "",
+    val syncStatus: String = "PENDING", // PENDING, ALIGNED, TIME_STRETCHED, NEEDS_ADAPTATION
+    val verificationStatus: String = "UNVERIFIED"
 )
 
 @Entity(tableName = "speaker_profiles")
@@ -137,9 +144,12 @@ data class SpeakerProfileEntity(
     val voiceReferenceId: String,
     val rightsConsentConfirmed: Boolean = true,
     val useConsentedGenericVoiceFallback: Boolean = false,
-    val preferredTtsEngine: String = "XTTS-v2",
+    val preferredTtsEngine: String = "F5-Hindi-24KHz",
     val dialogueCount: Int = 0,
-    val voiceConsistencyScore: Float = 0.96f
+    val voiceConsistencyScore: Float = 0.96f,
+    val characterId: String = "",
+    val visualIdentityNote: String = "Audio-Only Mode (No visual recognition)",
+    val profileConfidence: Float = 0f
 )
 
 @Entity(tableName = "dictionary_entries")
@@ -215,25 +225,33 @@ data class QualityCheckResultEntity(
 data class ModelManifestEntity(
     @PrimaryKey val modelId: String,
     val modelName: String,
+    val modelVersion: String = "",
     val specialistAgentNumber: Int, // 1..7
     val category: String,
     val purpose: String,
     val sourceUrl: String,
+    val fileFormat: String = "",
+    val supportedLanguages: String = "",
     val actualFilesNeededJson: String,
-    val downloadArtifactUrl: String, // Real verifiable HTTPS URL (HuggingFace / GitHub config/model manifest or ONNX weight)
-    val expectedSizeBytes: Long,
+    val filesManifestJson: String = "[]", // Structured JSON array of ModelArtifactFile entries
+    val downloadArtifactUrl: String, // Primary official Hugging Face file URL
+    val expectedSizeBytes: Long, // Exact combined size of all required files, or 0L when isSizeKnown == false
+    val isSizeKnown: Boolean = true, // False for gated models until authenticated HEAD probe resolves Content-Length
     val licenseName: String,
     val licenseNotes: String,
-    val runtimeCompatibility: String, // ANDROID_LOCAL, ONNX_ANDROID, NATIVE_CPP_DSP, REMOTE_PYTHON_GPU_WORKER, EXTERNAL_API
+    val runtimeCompatibility: String, // ANDROID_LOCAL, ONNX_RUNTIME_COMPATIBLE, REMOTE_PYTHON_GPU_WORKER, EXTERNAL_API
+    val compatibilitySummary: String = "",
     val requiredDependencies: String,
     val isGatedHuggingFace: Boolean = false,
     val isExperimentalArchived: Boolean = false,
     val downloadState: String = "NOT_DOWNLOADED", // NOT_DOWNLOADED, DOWNLOADING, VERIFYING, INSTALLED, CORRUPTED, FAILED, BUILT_IN
     val downloadProgressPercent: Int = 0,
     val downloadedBytes: Long = 0L,
+    val verifiedFilesCount: Int = 0,
+    val totalFilesCount: Int = 0,
     val installedVersion: String = "",
-    val localFilePath: String = "",
-    val sha256Checksum: String = "",
+    val localFilePath: String = "", // Directory containing actual official filenames
+    val sha256Checksum: String = "", // Verified SHA-256 of primary weight file
     val statusNote: String = ""
 )
 
@@ -271,5 +289,7 @@ data class ExportRecordEntity(
     val fileSizeBytes: Long,
     val durationMs: Long,
     val status: String,
-    val exportedAt: Long = System.currentTimeMillis()
+    val exportedAt: Long = System.currentTimeMillis(),
+    val subtitlePathsSummary: String = "",
+    val verificationReport: String = ""
 )

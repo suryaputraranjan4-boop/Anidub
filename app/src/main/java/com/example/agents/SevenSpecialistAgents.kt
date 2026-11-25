@@ -14,13 +14,20 @@ import com.example.data.local.SpeakerProfileEntity
 import com.example.data.local.TimelineTrackEntity
 import com.example.data.local.TranscriptSegmentEntity
 import com.example.data.local.VoiceGenerationRecordEntity
+import com.example.data.remote.RemoteWorkerClient
+import com.example.engine.AndroidSpeechTtsEngine
 import com.example.engine.AudioDspEngine
+import com.example.engine.FinalVerificationAgent
+import com.example.engine.GeneratedSubtitleBundle
 import com.example.engine.HinglishTtsNormalizer
 import com.example.engine.MediaExtractionResult
 import com.example.engine.MixPlacementItem
+import com.example.engine.SubtitleGenerator
+import com.example.engine.SynthesizedDialogueResult
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.Schema
+import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -36,28 +43,53 @@ import kotlin.math.roundToInt
 private const val TAG = "SevenSpecialistAgents"
 
 /**
- * Deterministic Pipeline Coordinator & The Seven Specialist Agents.
+ * Deterministic Pipeline Coordinator & Multi-Agent Studio Orchestrator.
  *
  * Implements the 14-stage workflow strictly against real imported media & user data:
  * - Stage 1: Media Import & Metadata Inspection
  * - Stage 2: Lossless Audio & Timebase Extraction (MediaExtractor + MediaCodec -> PCM WAV)
- * - Stage 3: Background Audio Separation (Agent 6 — runs BEFORE speaker analysis)
- * - Stage 4: Japanese Transcription & Speech Slice Extraction (Agent 1)
- * - Stage 5: Dialogue Timestamps & Segmentation (Agent 2)
- * - Stage 6: Audio-Only Speaker & Voice Analysis (Agent 3 — zero visual/facial recognition)
+ * - Stage 3: Background Audio Separation (Remote HTDemucs or On-Device 2-Stem Residual DSP)
+ * - Stage 4: Japanese Speech Recognition & Emotion Analysis (Remote Whisper Large V3 Turbo or Firebase AI Logic Gemini 3.8 Flash Multimodal Audio)
+ * - Stage 5: Dialogue Timestamps & Segmentation
+ * - Stage 6: Audio-Only Speaker Diarization & Character Profiling (zero visual/facial recognition)
  * - Stage 7: Global Sequential Dialogue Numbering (A-001, B-002, C-003...)
- * - Stage 8: Roman Hinglish Translation & Dictionary (Agent 4 — Firebase AI Logic Gemini 3.8 Flash)
+ * - Stage 8: Context Understanding, Roman Hinglish Translation & Adaptation (Firebase AI Logic Gemini 3.8 Flash)
  * - Stage 9: Character Voice Reference Setup
- * - Stage 10: Character-Wise Batch Voice Generation (Agent 5 — All A -> All B -> All C)
- * - Stage 11: Chronological Timeline Reconstruction (Agent 7)
- * - Stage 12: Background & Dialogue Multitrack Mixing (Agent 7)
- * - Stage 13: 13-Point Automated Quality Control (Agent 7)
- * - Stage 14: Final Export (Audio-Only WAV or Muxed Video MP4)
+ * - Stage 10: Character-Wise Batch Voice Generation (Remote F5-Hindi-24KHz or On-Device Android Speech TTS + WSOLA)
+ * - Stage 11: Chronological Timeline Reconstruction
+ * - Stage 12: Background & Dialogue Multitrack Mixing
+ * - Stage 13: 13-Point Automated Quality Control
+ * - Stage 14: Final Export + Agent 21 Subtitles (SRT + ASS) + Agent 22 Final Verification
  */
 class SevenSpecialistAgentsCoordinator(
     private val context: Context,
     private val dao: AnimeDubDao
 ) {
+    private val workerClient = RemoteWorkerClient()
+    private val androidTtsEngine = AndroidSpeechTtsEngine(context)
+
+    private val asrSliceSchema = Schema.obj(
+        properties = mapOf(
+            "japaneseText" to Schema.string(description = "Verbatim Japanese speech transcript from the audio clip; empty string if only music/noise or unintelligible"),
+            "romajiReading" to Schema.string(description = "Romaji reading of the Japanese speech"),
+            "asrConfidence" to Schema.double(description = "Honest transcription confidence between 0.0 and 1.0"),
+            "emotion" to Schema.enumeration(
+                values = listOf("ANGRY", "SAD", "HAPPY", "EXCITED", "FEARFUL", "CALM", "WHISPERING", "SHOUTING", "NEUTRAL"),
+                description = "Vocal emotional tone heard in the audio"
+            ),
+            "emotionConfidence" to Schema.double(description = "Honest emotion confidence between 0.0 and 1.0")
+        )
+    )
+
+    private val geminiAsrModel by lazy {
+        Firebase.ai.generativeModel(
+            modelName = "gemini-3.8-flash",
+            generationConfig = generationConfig {
+                responseMimeType = "application/json"
+                responseSchema = asrSliceSchema
+            }
+        )
+    }
 
     private val translationBatchSchema = Schema.obj(
         properties = mapOf(
@@ -71,6 +103,9 @@ class SevenSpecialistAgentsCoordinator(
                             values = listOf("ANGRY", "SAD", "HAPPY", "EXCITED", "FEARFUL", "CALM", "WHISPERING", "SHOUTING", "NEUTRAL"),
                             description = "Detected emotional tone"
                         ),
+                        "emotionConfidence" to Schema.double(description = "Honest emotion confidence between 0.0 and 1.0"),
+                        "translationConfidence" to Schema.double(description = "Honest translation quality confidence between 0.0 and 1.0"),
+                        "sceneContextNote" to Schema.string(description = "Brief note on speaker intent, honorifics, or relationship nuance"),
                         "dictionaryTermsApplied" to Schema.array(
                             items = Schema.string(),
                             description = "Dictionary terms preserved or applied in this line"
@@ -102,7 +137,8 @@ class SevenSpecialistAgentsCoordinator(
         episodeId: Long,
         startStage: Int = 2,
         endStage: Int = 13,
-        selectedTtsEngine: String = "XTTS-v2",
+        selectedTtsEngine: String = "F5-Hindi-24KHz",
+        remoteWorkerUrl: String = "",
         onProgress: suspend (stageNumber: Int, stageTitle: String, detail: String) -> Unit = { _, _, _ -> }
     ): Result<EpisodeEntity> = withContext(Dispatchers.IO) {
         try {
@@ -119,11 +155,11 @@ class SevenSpecialistAgentsCoordinator(
                     }
                     3 -> {
                         onProgress(3, "Stage 3 — Stem Separation (Agent 6)", "Separating vocal stem and residual background accompaniment...")
-                        episode = runStage3Agent6BackgroundSeparation(episode)
+                        episode = runStage3Agent6BackgroundSeparation(episode, remoteWorkerUrl)
                     }
                     4 -> {
-                        onProgress(4, "Stage 4 — Speech Detection & Transcript (Agent 1)", "Detecting vocal speech windows and slicing dialogue audio...")
-                        episode = runStage4Agent1JapaneseTranscription(episode)
+                        onProgress(4, "Stage 4 — Japanese ASR & Speech Slicing (Agent 1)", "Detecting speech windows and transcribing Japanese dialogue...")
+                        episode = runStage4Agent1JapaneseTranscription(episode, remoteWorkerUrl)
                     }
                     5 -> {
                         onProgress(5, "Stage 5 — Dialogue Segmentation (Agent 2)", "Validating dialogue timestamps and overlap boundaries...")
@@ -138,7 +174,7 @@ class SevenSpecialistAgentsCoordinator(
                         episode = runStage7GlobalDialogueNumbering(episode)
                     }
                     8 -> {
-                        onProgress(8, "Stage 8 — Gemini Hinglish Translation (Agent 4)", "Translating Japanese dialogue via Firebase AI Logic...")
+                        onProgress(8, "Stage 8 — Context & Hinglish Translation (Agent 4)", "Translating Japanese dialogue via Gemini 3.8 Flash...")
                         episode = runStage8Agent4GeminiTranslation(episode)
                     }
                     9 -> {
@@ -146,8 +182,8 @@ class SevenSpecialistAgentsCoordinator(
                         episode = runStage9VoiceProfileSetup(episode, selectedTtsEngine)
                     }
                     10 -> {
-                        onProgress(10, "Stage 10 — Character Batch Voice Gen (Agent 5)", "Synthesizing character batches (All A -> All B -> All C)...")
-                        episode = runStage10Agent5CharacterWiseVoiceGeneration(episode, selectedTtsEngine)
+                        onProgress(10, "Stage 10 — Character Batch Voice Gen (Agent 5)", "Synthesizing real Hindi/Hinglish speech (All A -> All B -> All C)...")
+                        episode = runStage10Agent5CharacterWiseVoiceGeneration(episode, selectedTtsEngine, remoteWorkerUrl)
                     }
                     11 -> {
                         onProgress(11, "Stage 11 — Timeline Reconstruction (Agent 7)", "Restoring chronological dialogue sequence on multitrack timeline...")
@@ -162,21 +198,31 @@ class SevenSpecialistAgentsCoordinator(
                         episode = runStage13Agent7QualityControl(episode)
                     }
                     14 -> {
-                        onProgress(14, "Stage 14 — Final Export", "Writing verified dubbed audio output...")
+                        onProgress(14, "Stage 14 — Export, Subtitles & Verification", "Exporting media, generating SRT/ASS subtitles, and running Final Verification...")
                         episode = runStage14FinalExport(episode, exportFormat = "WAV_AUDIO_ONLY")
                     }
                 }
             }
 
             val finalEpisode = dao.getEpisodeById(episodeId) ?: episode
-            val allDone = (finalEpisode.completedStagesMask and (1 shl 13)) != 0
+            val exportVerified = (finalEpisode.completedStagesMask and (1 shl 14)) != 0
             val doneEpisode = finalEpisode.copy(
-                pipelineStatus = if (allDone) "COMPLETED" else "READY",
+                pipelineStatus = if (exportVerified) "COMPLETED" else "READY",
                 updatedAt = System.currentTimeMillis()
             )
             dao.updateEpisode(doneEpisode)
             Result.success(doneEpisode)
         } catch (e: CancellationException) {
+            val current = dao.getEpisodeById(episodeId)
+            if (current != null && current.pipelineStatus == "RUNNING") {
+                dao.updateEpisode(
+                    current.copy(
+                        pipelineStatus = "PAUSED_CHECKPOINT",
+                        lastErrorMessage = "Pipeline cancelled by user.",
+                        updatedAt = System.currentTimeMillis()
+                    )
+                )
+            }
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Pipeline execution error", e)
@@ -328,9 +374,13 @@ class SevenSpecialistAgentsCoordinator(
 
     /**
      * Stage 3 — Agent 6: Background Audio Separation Agent.
-     * Runs before speaker analysis and preserves original master untouched.
+     * Uses Remote Worker HTDemucs when configured & reachable; otherwise runs honest on-device 2-stem
+     * residual DSP separation. Original master is always preserved untouched.
      */
-    suspend fun runStage3Agent6BackgroundSeparation(episode: EpisodeEntity): EpisodeEntity {
+    suspend fun runStage3Agent6BackgroundSeparation(
+        episode: EpisodeEntity,
+        remoteWorkerUrl: String = ""
+    ): EpisodeEntity {
         val startedAt = System.currentTimeMillis()
         val epDir = getEpisodeWorkspaceDir(episode.id)
         val masterFile = File(episode.originalMasterAudioPath)
@@ -342,7 +392,7 @@ class SevenSpecialistAgentsCoordinator(
                 stageNumber = 3,
                 agentName = "Agent 6 — Background Audio Separation",
                 operation = "Blocked: missing extracted audio",
-                modelUsed = "Hybrid Residual DSP Separator",
+                modelUsed = "HTDemucs / Residual DSP Separator",
                 runtimeMode = "ON_DEVICE_ANDROID",
                 inputSummary = "Missing master audio",
                 outputSummary = "No stems produced",
@@ -355,9 +405,43 @@ class SevenSpecialistAgentsCoordinator(
             throw IllegalStateException(msg)
         }
 
-        val sepResult = AudioDspEngine.separateStemsDsp(masterFile, File(epDir, "stems"))
-        val masterBuf = AudioDspEngine.readWavFile(sepResult.masterFile)
+        val stemsDir = File(epDir, "stems").apply { mkdirs() }
+        val remoteAttempt = if (remoteWorkerUrl.isNotBlank()) {
+            workerClient.separateAudioRemote(remoteWorkerUrl, masterFile, stemsDir)
+        } else {
+            Result.failure(IllegalStateException("Remote worker not configured"))
+        }
+
+        val masterBuf = AudioDspEngine.readWavFile(masterFile)
         val masterPeak = AudioDspEngine.computePeakDbfs(masterBuf)
+
+        val vocalFile: File
+        val bgFile: File
+        val vocalPeak: Float
+        val bgPeak: Float
+        val qualityScore: Float
+        val separatorModelLabel: String
+        val runtimeModeLabel: String
+
+        if (remoteAttempt.isSuccess) {
+            val remoteRes = remoteAttempt.getOrThrow()
+            vocalFile = remoteRes.vocalFile
+            bgFile = remoteRes.backgroundFile
+            vocalPeak = AudioDspEngine.computePeakDbfs(AudioDspEngine.readWavFile(vocalFile))
+            bgPeak = AudioDspEngine.computePeakDbfs(AudioDspEngine.readWavFile(bgFile))
+            qualityScore = 0.96f
+            separatorModelLabel = remoteRes.modelName
+            runtimeModeLabel = "REMOTE_GPU_WORKER"
+        } else {
+            val sepResult = AudioDspEngine.separateStemsDsp(masterFile, stemsDir)
+            vocalFile = sepResult.dialogueVocalFile
+            bgFile = sepResult.backgroundAccompanimentFile
+            vocalPeak = sepResult.vocalPeakDbfs
+            bgPeak = sepResult.backgroundPeakDbfs
+            qualityScore = sepResult.qualityScore
+            separatorModelLabel = "On-Device 2-Stem Residual DSP"
+            runtimeModeLabel = "ON_DEVICE_ANDROID"
+        }
 
         val existingStems = dao.getStemsForEpisodeOnce(episode.id)
         if (existingStems.none { it.stemType == "ORIGINAL_MASTER" }) {
@@ -367,7 +451,7 @@ class SevenSpecialistAgentsCoordinator(
                     stemType = "ORIGINAL_MASTER",
                     displayName = "Original Master Audio (Protected)",
                     separatorModelUsed = "Lossless PCM Copy",
-                    filePath = sepResult.masterFile.absolutePath,
+                    filePath = masterFile.absolutePath,
                     sampleRateHz = masterBuf.sampleRateHz,
                     channels = masterBuf.channels,
                     durationMs = masterBuf.durationMs,
@@ -386,15 +470,15 @@ class SevenSpecialistAgentsCoordinator(
                 episodeId = episode.id,
                 stemType = "DIALOGUE_VOCAL",
                 displayName = "Dialogue / Vocal Stem",
-                separatorModelUsed = "On-Device Vocal Formant Filter (2-Stem)",
-                filePath = sepResult.dialogueVocalFile.absolutePath,
+                separatorModelUsed = separatorModelLabel,
+                filePath = vocalFile.absolutePath,
                 sampleRateHz = masterBuf.sampleRateHz,
                 channels = 1,
                 durationMs = masterBuf.durationMs,
                 volumeGain = 1.0f,
                 isMuted = false,
-                separationQualityScore = sepResult.qualityScore,
-                peakDbfs = sepResult.vocalPeakDbfs,
+                separationQualityScore = qualityScore,
+                peakDbfs = vocalPeak,
                 isHonestTwoStemModel = true
             )
         )
@@ -404,15 +488,15 @@ class SevenSpecialistAgentsCoordinator(
                 episodeId = episode.id,
                 stemType = "BACKGROUND_ACCOMPANIMENT",
                 displayName = "Background Accompaniment (BGM + SFX)",
-                separatorModelUsed = "On-Device Residual Phase Complement (2-Stem)",
-                filePath = sepResult.backgroundAccompanimentFile.absolutePath,
+                separatorModelUsed = separatorModelLabel,
+                filePath = bgFile.absolutePath,
                 sampleRateHz = masterBuf.sampleRateHz,
                 channels = 1,
                 durationMs = masterBuf.durationMs,
                 volumeGain = 0.92f,
                 isMuted = false,
-                separationQualityScore = sepResult.qualityScore,
-                peakDbfs = sepResult.backgroundPeakDbfs,
+                separationQualityScore = qualityScore,
+                peakDbfs = bgPeak,
                 isHonestTwoStemModel = true
             )
         )
@@ -423,10 +507,10 @@ class SevenSpecialistAgentsCoordinator(
             stageNumber = 3,
             agentName = "Agent 6 — Background Audio Separation",
             operation = "Separated vocal and residual background stems",
-            modelUsed = "On-Device 2-Stem Residual DSP Separator",
-            runtimeMode = "ON_DEVICE_ANDROID",
-            inputSummary = sepResult.masterFile.name,
-            outputSummary = "Vocal (${sepResult.vocalPeakDbfs} dBFS) + Background (${sepResult.backgroundPeakDbfs} dBFS)",
+            modelUsed = separatorModelLabel,
+            runtimeMode = runtimeModeLabel,
+            inputSummary = masterFile.name,
+            outputSummary = "Vocal ($vocalPeak dBFS) + Background ($bgPeak dBFS)",
             completed = 2,
             total = 2,
             status = "COMPLETED",
@@ -444,11 +528,16 @@ class SevenSpecialistAgentsCoordinator(
     }
 
     /**
-     * Stage 4 — Agent 1: Japanese Transcription & Real Speech Slice Extraction.
-     * Detects genuine speech windows from the actual vocal stem. Preserves any existing
-     * user-entered/transcribed Japanese text; never fabricates fake Japanese scripts.
+     * Stage 4 — Agent 1 (Speech Detection + Japanese ASR):
+     * 1. Attempts Remote Worker Whisper Large V3 Turbo (`POST /v1/transcribe`) when configured & reachable.
+     * 2. Otherwise runs On-Device VAD slicing + real Firebase AI Logic `gemini-3.8-flash` multimodal audio
+     *    transcription (`inlineData(wavBytes, "audio/wav")`) for every speech slice lacking Japanese text.
+     * 3. Never fabricates fake Japanese transcripts on network/model failure.
      */
-    suspend fun runStage4Agent1JapaneseTranscription(episode: EpisodeEntity): EpisodeEntity {
+    suspend fun runStage4Agent1JapaneseTranscription(
+        episode: EpisodeEntity,
+        remoteWorkerUrl: String = ""
+    ): EpisodeEntity {
         val startedAt = System.currentTimeMillis()
         val epDir = getEpisodeWorkspaceDir(episode.id)
         val stems = dao.getStemsForEpisodeOnce(episode.id)
@@ -463,7 +552,7 @@ class SevenSpecialistAgentsCoordinator(
                 stageNumber = 4,
                 agentName = "Agent 1 — Japanese Transcription",
                 operation = "Blocked: missing vocal stem",
-                modelUsed = "DSP VAD + Faster-Whisper ASR",
+                modelUsed = "Whisper Large V3 Turbo / Gemini 3.8 Flash Audio",
                 runtimeMode = "ON_DEVICE_ANDROID",
                 inputSummary = "Missing vocal audio",
                 outputSummary = "0 segments",
@@ -480,57 +569,127 @@ class SevenSpecialistAgentsCoordinator(
         val slicesDir = File(epDir, "jp_slices").apply { mkdirs() }
         val existingTranscripts = dao.getTranscriptsForEpisodeOnce(episode.id)
 
-        val segmentsToSave = if (existingTranscripts.isNotEmpty()) {
-            // Re-slice audio for existing transcripts while strictly preserving user/ASR Japanese text
+        var usedRuntimeMode = "FIREBASE_AI_GEMINI"
+        var usedModelLabel = "Gemini 3.8 Flash Multimodal Audio (Firebase AI Logic)"
+        var asrErrorNote: String? = null
+
+        val segmentsToSave: List<TranscriptSegmentEntity> = if (existingTranscripts.isNotEmpty()) {
+            // Re-slice existing segments and transcribe any that are still blank
             existingTranscripts.map { tr ->
                 val sliceBuf = AudioDspEngine.sliceBuffer(vocalBuffer, tr.preliminaryStartMs, tr.preliminaryEndMs)
                 val sliceFile = AudioDspEngine.writeWavFile(
                     File(slicesDir, "jp_seg_%03d.wav".format(tr.segmentIndex)),
                     sliceBuf
                 )
-                tr.copy(originalAudioSlicePath = sliceFile.absolutePath)
+                if (tr.japaneseText.isNotBlank()) {
+                    tr.copy(originalAudioSlicePath = sliceFile.absolutePath)
+                } else {
+                    val asrRes = transcribeSliceWithGeminiAudio(sliceFile)
+                    if (asrRes.isSuccess) {
+                        val parsed = asrRes.getOrThrow()
+                        tr.copy(
+                            japaneseText = parsed.japaneseText,
+                            romajiReading = parsed.romajiReading,
+                            confidenceScore = parsed.asrConfidence,
+                            asrModelUsed = "Gemini 3.8 Flash Multimodal Audio",
+                            originalAudioSlicePath = sliceFile.absolutePath
+                        )
+                    } else {
+                        asrErrorNote = asrRes.exceptionOrNull()?.localizedMessage
+                        tr.copy(originalAudioSlicePath = sliceFile.absolutePath)
+                    }
+                }
             }
         } else {
-            val detectedRanges = AudioDspEngine.detectSpeechSegmentsDsp(vocalBuffer)
-            if (detectedRanges.isEmpty()) {
-                val msg = "No speech activity detected in '${vocalStemFile.name}'. Verify the audio volume or add dialogue segments manually in Transcript."
-                recordAgentJob(
-                    episodeId = episode.id,
-                    agentNumber = 1,
-                    stageNumber = 4,
-                    agentName = "Agent 1 — Japanese Transcription",
-                    operation = "No vocal speech activity detected",
-                    modelUsed = "On-Device Energy VAD",
-                    runtimeMode = "ON_DEVICE_ANDROID",
-                    inputSummary = "${vocalStemFile.name} (${vocalBuffer.durationMs} ms)",
-                    outputSummary = "0 speech segments detected",
-                    completed = 0,
-                    total = 1,
-                    status = "FAILED",
-                    errorDetails = msg,
-                    startedAt = startedAt
-                )
-                throw IllegalStateException(msg)
+            // Try Remote Whisper Large V3 Turbo worker first when configured
+            val remoteAsr = if (remoteWorkerUrl.isNotBlank()) {
+                workerClient.transcribeJapaneseRemote(remoteWorkerUrl, vocalStemFile)
+            } else {
+                Result.failure(IllegalStateException("Remote worker not configured"))
             }
 
-            detectedRanges.mapIndexed { idx, (startMs, endMs) ->
-                val segIndex = idx + 1
-                val sliceBuf = AudioDspEngine.sliceBuffer(vocalBuffer, startMs, endMs)
-                val sliceFile = AudioDspEngine.writeWavFile(
-                    File(slicesDir, "jp_seg_%03d.wav".format(segIndex)),
-                    sliceBuf
-                )
-                TranscriptSegmentEntity(
-                    episodeId = episode.id,
-                    segmentIndex = segIndex,
-                    japaneseText = "",
-                    romajiReading = "",
-                    preliminaryStartMs = startMs,
-                    preliminaryEndMs = endMs,
-                    confidenceScore = 0f,
-                    asrModelUsed = "On-Device VAD Slice (Awaiting Faster-Whisper Worker or Manual Japanese Text)",
-                    originalAudioSlicePath = sliceFile.absolutePath
-                )
+            if (remoteAsr.isSuccess) {
+                usedRuntimeMode = "REMOTE_GPU_WORKER"
+                usedModelLabel = "Whisper Large V3 Turbo (Remote GPU Worker)"
+                remoteAsr.getOrThrow().mapIndexed { idx, seg ->
+                    val segIndex = idx + 1
+                    val sliceBuf = AudioDspEngine.sliceBuffer(vocalBuffer, seg.startMs, seg.endMs)
+                    val sliceFile = AudioDspEngine.writeWavFile(
+                        File(slicesDir, "jp_seg_%03d.wav".format(segIndex)),
+                        sliceBuf
+                    )
+                    TranscriptSegmentEntity(
+                        episodeId = episode.id,
+                        segmentIndex = segIndex,
+                        japaneseText = seg.japaneseText,
+                        romajiReading = seg.romajiReading,
+                        preliminaryStartMs = seg.startMs,
+                        preliminaryEndMs = seg.endMs,
+                        confidenceScore = seg.confidenceScore,
+                        asrModelUsed = usedModelLabel,
+                        originalAudioSlicePath = sliceFile.absolutePath
+                    )
+                }
+            } else {
+                val detectedRanges = AudioDspEngine.detectSpeechSegmentsDsp(vocalBuffer)
+                if (detectedRanges.isEmpty()) {
+                    val msg = "No speech activity detected in '${vocalStemFile.name}'. Verify the audio volume or add dialogue segments manually in Transcript."
+                    recordAgentJob(
+                        episodeId = episode.id,
+                        agentNumber = 1,
+                        stageNumber = 4,
+                        agentName = "Agent 1 — Japanese Transcription",
+                        operation = "No vocal speech activity detected",
+                        modelUsed = "On-Device Energy VAD",
+                        runtimeMode = "ON_DEVICE_ANDROID",
+                        inputSummary = "${vocalStemFile.name} (${vocalBuffer.durationMs} ms)",
+                        outputSummary = "0 speech segments detected",
+                        completed = 0,
+                        total = 1,
+                        status = "FAILED",
+                        errorDetails = msg,
+                        startedAt = startedAt
+                    )
+                    throw IllegalStateException(msg)
+                }
+
+                detectedRanges.mapIndexed { idx, (startMs, endMs) ->
+                    val segIndex = idx + 1
+                    val sliceBuf = AudioDspEngine.sliceBuffer(vocalBuffer, startMs, endMs)
+                    val sliceFile = AudioDspEngine.writeWavFile(
+                        File(slicesDir, "jp_seg_%03d.wav".format(segIndex)),
+                        sliceBuf
+                    )
+                    val asrRes = transcribeSliceWithGeminiAudio(sliceFile)
+                    if (asrRes.isSuccess) {
+                        val parsed = asrRes.getOrThrow()
+                        TranscriptSegmentEntity(
+                            episodeId = episode.id,
+                            segmentIndex = segIndex,
+                            japaneseText = parsed.japaneseText,
+                            romajiReading = parsed.romajiReading,
+                            preliminaryStartMs = startMs,
+                            preliminaryEndMs = endMs,
+                            confidenceScore = parsed.asrConfidence,
+                            asrModelUsed = usedModelLabel,
+                            originalAudioSlicePath = sliceFile.absolutePath
+                        )
+                    } else {
+                        asrErrorNote = asrRes.exceptionOrNull()?.localizedMessage
+                        usedRuntimeMode = "ON_DEVICE_ANDROID"
+                        TranscriptSegmentEntity(
+                            episodeId = episode.id,
+                            segmentIndex = segIndex,
+                            japaneseText = "",
+                            romajiReading = "",
+                            preliminaryStartMs = startMs,
+                            preliminaryEndMs = endMs,
+                            confidenceScore = 0f,
+                            asrModelUsed = "VAD Slice (ASR Error: ${asrErrorNote?.take(60) ?: "Unavailable"})",
+                            originalAudioSlicePath = sliceFile.absolutePath
+                        )
+                    }
+                }
             }
         }
 
@@ -538,10 +697,10 @@ class SevenSpecialistAgentsCoordinator(
         dao.insertTranscriptSegments(segmentsToSave)
 
         val transcribedCount = segmentsToSave.count { it.japaneseText.isNotBlank() }
-        val note = if (transcribedCount == segmentsToSave.size) {
-            "${segmentsToSave.size} Japanese transcript segments verified."
+        val note = if (transcribedCount > 0) {
+            "Transcribed $transcribedCount / ${segmentsToSave.size} Japanese dialogue segment(s) via $usedModelLabel."
         } else {
-            "Detected ${segmentsToSave.size} speech audio slices (${transcribedCount} with Japanese text). Enter Japanese lines in Transcript or connect a Faster-Whisper worker before Stage 8."
+            "Detected ${segmentsToSave.size} speech slices, but automatic ASR returned 0 transcripts (${asrErrorNote ?: "check network or Whisper worker"}). Enter or retry in Transcript."
         }
 
         recordAgentJob(
@@ -549,25 +708,83 @@ class SevenSpecialistAgentsCoordinator(
             agentNumber = 1,
             stageNumber = 4,
             agentName = "Agent 1 — Japanese Transcription",
-            operation = "Extracted ${segmentsToSave.size} speech audio slices",
-            modelUsed = if (transcribedCount > 0) "Transcript Verified + VAD Audio Slicer" else "On-Device VAD Slicer (Remote Faster-Whisper Optional)",
-            runtimeMode = "ON_DEVICE_ANDROID",
+            operation = "Transcribed $transcribedCount / ${segmentsToSave.size} speech slice(s)",
+            modelUsed = usedModelLabel,
+            runtimeMode = usedRuntimeMode,
             inputSummary = vocalStemFile.name,
             outputSummary = note,
-            completed = segmentsToSave.size,
+            completed = transcribedCount,
             total = segmentsToSave.size,
-            status = "COMPLETED",
+            status = if (transcribedCount > 0) "COMPLETED" else "FAILED",
+            errorDetails = if (transcribedCount == 0) asrErrorNote else null,
             startedAt = startedAt
         )
 
         val updated = episode.copy(
             currentStageNumber = 4,
-            currentStageName = "Stage 4 — ${segmentsToSave.size} Speech Slices Ready",
+            currentStageName = if (transcribedCount > 0) {
+                "Stage 4 — $transcribedCount/${segmentsToSave.size} Japanese Lines Transcribed"
+            } else {
+                "Stage 4 — ${segmentsToSave.size} Slices (ASR Retry Needed)"
+            },
             completedStagesMask = episode.completedStagesMask or (1 shl 4),
             updatedAt = System.currentTimeMillis()
         )
         dao.updateEpisode(updated)
         return updated
+    }
+
+    private data class GeminiAsrResult(
+        val japaneseText: String,
+        val romajiReading: String,
+        val asrConfidence: Float,
+        val emotion: String,
+        val emotionConfidence: Float
+    )
+
+    private suspend fun transcribeSliceWithGeminiAudio(wavFile: File): Result<GeminiAsrResult> {
+        if (!wavFile.exists() || wavFile.length() <= 44L) {
+            return Result.failure(IllegalArgumentException("Audio slice WAV missing or empty."))
+        }
+        // Keep well under Firebase AI Logic 20 MB inlineData limit
+        if (wavFile.length() > 15L * 1024L * 1024L) {
+            return Result.failure(IllegalArgumentException("Audio slice exceeds 15 MB inlineData limit."))
+        }
+        return try {
+            val wavBytes = wavFile.readBytes()
+            val promptContent = content {
+                inlineData(wavBytes, "audio/wav")
+                text(
+                    """
+                    Listen carefully to this Japanese anime dialogue audio clip.
+                    Transcribe the exact spoken Japanese dialogue (kanji/kana) and its Romaji reading.
+                    Also identify the speaker's vocal emotion and provide honest confidence scores (0.0 to 1.0).
+                    If the clip contains only background music, sound effects, or silence with no speech, return empty strings and confidence 0.0.
+                    Never invent dialogue that is not spoken in the audio.
+                    """.trimIndent()
+                )
+            }
+            val response = withTimeout(45_000L) {
+                geminiAsrModel.generateContent(promptContent)
+            }
+            val rawJson = response.text?.trim()
+                ?: return Result.failure(IllegalStateException("Gemini ASR returned empty response."))
+            val json = JSONObject(rawJson)
+            Result.success(
+                GeminiAsrResult(
+                    japaneseText = json.optString("japaneseText", "").trim(),
+                    romajiReading = json.optString("romajiReading", "").trim(),
+                    asrConfidence = json.optDouble("asrConfidence", 0.0).toFloat().coerceIn(0f, 1f),
+                    emotion = json.optString("emotion", "NEUTRAL").trim().uppercase(),
+                    emotionConfidence = json.optDouble("emotionConfidence", 0.0).toFloat().coerceIn(0f, 1f)
+                )
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Gemini multimodal ASR failed for ${wavFile.name}: ${e.localizedMessage}")
+            Result.failure(e)
+        }
     }
 
     /**
@@ -739,7 +956,7 @@ class SevenSpecialistAgentsCoordinator(
                     label = newLabel,
                     characterName = defaultCharName,
                     featuresList = mutableListOf(acoustic),
-                    similarityScores = mutableListOf(1.0f),
+                    similarityScores = mutableListOf(0.85f),
                     centroidEmbedding = acoustic.embedding,
                     representativeSlicePath = dlg.originalAudioSlicePath
                 )
@@ -747,10 +964,15 @@ class SevenSpecialistAgentsCoordinator(
                 created
             }
 
+            val assignedSim = (if (bestCluster != null && bestScore >= 0.84f) bestScore else 0.85f).coerceIn(0f, 1f)
+            val charId = "CHAR-${episode.projectId}-${assignedCluster.label}"
             updatedDialogues.add(
                 dlg.copy(
                     speakerLabel = assignedCluster.label,
-                    emotion = acoustic.estimatedEmotion,
+                    characterId = charId,
+                    speakerConfidence = (assignedSim * 100f).roundToInt() / 100f,
+                    emotion = if (dlg.emotion == "NEUTRAL") acoustic.estimatedEmotion else dlg.emotion,
+                    emotionConfidence = if (dlg.emotionConfidence > 0f) dlg.emotionConfidence else 0.55f,
                     speakingStyle = acoustic.speakingStyle,
                     peakDbfs = acoustic.peakDbfs
                 )
@@ -772,6 +994,7 @@ class SevenSpecialistAgentsCoordinator(
             val firstFeat = cluster.featuresList.first()
             val embJson = cluster.centroidEmbedding.joinToString(prefix = "[", postfix = "]") { "%.4f".format(it) }
             val confirmedConsent = existingConsentByLabel[cluster.label] ?: false
+            val charId = "CHAR-${episode.projectId}-${cluster.label}"
 
             SpeakerProfileEntity(
                 projectId = episode.projectId,
@@ -794,9 +1017,12 @@ class SevenSpecialistAgentsCoordinator(
                 voiceReferenceId = "VREF-${episode.projectId}-${cluster.label}",
                 rightsConsentConfirmed = confirmedConsent,
                 useConsentedGenericVoiceFallback = !confirmedConsent,
-                preferredTtsEngine = "XTTS-v2",
+                preferredTtsEngine = "F5-Hindi-24KHz",
                 dialogueCount = count,
-                voiceConsistencyScore = (avgSim * 100f).roundToInt() / 100f
+                voiceConsistencyScore = (avgSim * 100f).roundToInt() / 100f,
+                characterId = charId,
+                visualIdentityNote = "Audio-Only Mode (No visual recognition)",
+                profileConfidence = (avgSim * 100f).roundToInt() / 100f
             )
         }
         dao.insertSpeakerProfiles(speakerEntities)
@@ -948,21 +1174,31 @@ class SevenSpecialistAgentsCoordinator(
         }
 
         val fullPrompt = """
-You are Agent 4 — The Anime Dubbing Translation and Dictionary Agent.
+You are Agent 4 — Context Understanding, Japanese-to-Hindi Translation, and Dialogue Adaptation Specialist.
 Translate each Japanese anime dialogue segment into natural spoken Roman Hinglish (Hindi written strictly in Latin alphabet mixed naturally with English).
 
 STRICT RULES:
 1. Visible output MUST use Roman Hinglish ONLY. NEVER output Devanagari script.
-2. Match natural spoken Hindi-English anime dubbing tone; avoid overly formal Sanskritised phrasing or rigid literal translations.
-3. Fit naturally within each line's original DurationWindow in seconds.
-4. Enforce these saved Dictionary terms (Project > Anime > Global):
+2. Preserve character relationships, honorific intent (-san, -sama, -kun, senpai), emotional subtext, and anime personality.
+3. Adapt dialogue length naturally to fit each line's original DurationWindow in seconds without dropping key meaning.
+4. Provide honest confidence scores (0.0 to 1.0) for emotionConfidence and translationConfidence, plus a concise sceneContextNote.
+5. Enforce these saved Dictionary terms (Project > Anime > Global):
 $dictPromptBlock
 
 DIALOGUES IN CHRONOLOGICAL ORDER:
 $dialogueLinesPrompt
 """.trimIndent()
 
-        val translatedMap = mutableMapOf<String, Triple<String, String, String>>()
+        data class ParsedTranslationLine(
+            val romanHinglish: String,
+            val speakingStyle: String,
+            val emotion: String,
+            val emotionConfidence: Float,
+            val translationConfidence: Float,
+            val sceneContextNote: String
+        )
+
+        val translatedMap = mutableMapOf<String, ParsedTranslationLine>()
         try {
             val response = withTimeout(60_000L) {
                 geminiTranslationModel.generateContent(fullPrompt)
@@ -976,9 +1212,12 @@ $dialogueLinesPrompt
                 val dId = item.getString("dialogueId").trim()
                 val hinglish = item.getString("romanHinglish").trim()
                 val style = item.optString("speakingStyle", "Natural").trim()
-                val emo = item.optString("emotion", "NEUTRAL").trim()
+                val emo = item.optString("emotion", "NEUTRAL").trim().uppercase()
+                val emoConf = item.optDouble("emotionConfidence", 0.75).toFloat().coerceIn(0f, 1f)
+                val trConf = item.optDouble("translationConfidence", 0.85).toFloat().coerceIn(0f, 1f)
+                val ctxNote = item.optString("sceneContextNote", "").trim()
                 if (hinglish.isNotBlank()) {
-                    translatedMap[dId] = Triple(hinglish, style, emo)
+                    translatedMap[dId] = ParsedTranslationLine(hinglish, style, emo, emoConf, trConf, ctxNote)
                 }
             }
             if (translatedMap.isEmpty()) {
@@ -1027,14 +1266,17 @@ $dialogueLinesPrompt
         }
 
         val updatedDialogues = dialogues.map { dlg ->
-            val triple = translatedMap[dlg.dialogueId] ?: return@map dlg
-            val enforcedHinglish = applyDictionariesToLine(triple.first, applicableEntries)
+            val parsed = translatedMap[dlg.dialogueId] ?: return@map dlg
+            val enforcedHinglish = applyDictionariesToLine(parsed.romanHinglish, applicableEntries)
             val internalNormalized = HinglishTtsNormalizer.normalizeForTtsPronunciation(enforcedHinglish, applicableEntries)
             dlg.copy(
                 romanHinglishText = enforcedHinglish,
                 ttsNormalizedText = internalNormalized,
-                speakingStyle = triple.second,
-                emotion = triple.third,
+                speakingStyle = parsed.speakingStyle,
+                emotion = parsed.emotion,
+                emotionConfidence = parsed.emotionConfidence,
+                translationConfidence = parsed.translationConfidence,
+                sceneContextNote = parsed.sceneContextNote,
                 generationStatus = if (dlg.generatedAudioPath != null) dlg.generationStatus else "TRANSLATED",
                 errorNote = null
             )
@@ -1135,12 +1377,16 @@ $dialogueLinesPrompt
     }
 
     /**
-     * Stage 10 — Agent 5: Character-Wise Batch Voice Generation (All A -> All B -> All C).
-     * Never fabricates text for empty Roman Hinglish lines; requires translated or edited lines.
+     * Stage 10 — Agent 5 (Voice Generation & Pronunciation):
+     * Executes character-wise batches (All A -> All B -> All C) using REAL spoken speech synthesis:
+     * 1. Remote GPU Worker `SPRINGLab/F5-Hindi-24KHz` (`POST /v1/synthesize`) when configured & reachable.
+     * 2. On-Device `AndroidSpeechTtsEngine` (`android.speech.tts.TextToSpeech.synthesizeToFile()` `hi-IN`/`en-IN`).
+     * Never falls back to fake sine-wave oscillators; failed lines are marked FAILED for single-line retry.
      */
     suspend fun runStage10Agent5CharacterWiseVoiceGeneration(
         episode: EpisodeEntity,
-        selectedTtsEngine: String
+        selectedTtsEngine: String,
+        remoteWorkerUrl: String = ""
     ): EpisodeEntity {
         val startedAt = System.currentTimeMillis()
         val epDir = getEpisodeWorkspaceDir(episode.id)
@@ -1158,7 +1404,7 @@ $dialogueLinesPrompt
                 stageNumber = 10,
                 agentName = "Agent 5 — Voice Generation",
                 operation = "Blocked: no Roman Hinglish text",
-                modelUsed = "$selectedTtsEngine (On-Device DSP Synthesis)",
+                modelUsed = "$selectedTtsEngine / Android Speech TTS",
                 runtimeMode = "ON_DEVICE_ANDROID",
                 inputSummary = "${characterWiseDialogues.size} dialogues (0 translated)",
                 outputSummary = "0 audio files generated",
@@ -1174,6 +1420,10 @@ $dialogueLinesPrompt
         val distinctSpeakerLabels = readyDialogues.map { it.speakerLabel }.distinct().sorted()
         val batchExecutionSummary = mutableListOf<String>()
         var generatedCount = 0
+        var failedCount = 0
+        var lastEngineUsed = selectedTtsEngine
+        var lastRuntimeMode = "ON_DEVICE_ANDROID"
+        var lastError: String? = null
 
         for ((batchIdx, speakerLabel) in distinctSpeakerLabels.withIndex()) {
             val batchNumber = batchIdx + 1
@@ -1201,13 +1451,14 @@ $dialogueLinesPrompt
                 voiceReferencePath = "",
                 voiceReferenceId = "VREF-${episode.projectId}-$speakerLabel",
                 rightsConsentConfirmed = false,
-                useConsentedGenericVoiceFallback = true
+                useConsentedGenericVoiceFallback = true,
+                characterId = "CHAR-${episode.projectId}-$speakerLabel"
             )
 
             val batchIds = mutableListOf<String>()
             for ((idxInBatch, dlg) in batchDialogues.withIndex()) {
                 val orderInBatch = idxInBatch + 1
-                val synthResult = HinglishTtsNormalizer.synthesizeCharacterDialogue(
+                val synthOutcome = synthesizeSingleLineReal(
                     dialogueId = dlg.dialogueId,
                     speakerProfile = speakerProfile,
                     visibleRomanHinglish = dlg.romanHinglishText,
@@ -1215,82 +1466,228 @@ $dialogueLinesPrompt
                     emotion = dlg.emotion,
                     targetDurationMs = dlg.originalDurationMs,
                     selectedEngineId = selectedTtsEngine,
+                    remoteWorkerUrl = remoteWorkerUrl,
                     outputDir = genDir,
                     sampleRateHz = episode.audioSampleRateHz
                 )
 
-                val deviationMs = synthResult.actualDurationMs - dlg.originalDurationMs
-                val updatedDlg = dlg.copy(
-                    ttsNormalizedText = synthResult.internalNormalizedPhonetic,
-                    previousGeneratedAudioPath = dlg.generatedAudioPath,
-                    generatedAudioPath = synthResult.outputFile.absolutePath,
-                    actualGeneratedDurationMs = synthResult.actualDurationMs,
-                    durationDeviationMs = deviationMs,
-                    timeStretchRatio = synthResult.timeStretchRatio,
-                    voiceReferenceId = speakerProfile.voiceReferenceId,
-                    ttsEngineUsed = synthResult.engineUsed,
-                    characterBatchNumber = batchNumber,
-                    orderInCharacterBatch = orderInBatch,
-                    generationStatus = "GENERATED",
-                    peakDbfs = synthResult.peakDbfs,
-                    generationVersion = dlg.generationVersion + 1,
-                    errorNote = null
-                )
-                dao.updateDialogue(updatedDlg)
+                if (synthOutcome.isSuccess) {
+                    val synthResult = synthOutcome.getOrThrow()
+                    lastEngineUsed = synthResult.engineUsed
+                    lastRuntimeMode = if (synthResult.engineUsed.contains("Remote", ignoreCase = true)) {
+                        "REMOTE_GPU_WORKER"
+                    } else {
+                        "ON_DEVICE_ANDROID"
+                    }
 
-                dao.insertVoiceGenerationRecord(
-                    VoiceGenerationRecordEntity(
-                        episodeId = episode.id,
-                        dialogueId = dlg.dialogueId,
-                        speakerLabel = speakerLabel,
+                    val deviationMs = synthResult.actualDurationMs - dlg.originalDurationMs
+                    val updatedDlg = dlg.copy(
+                        ttsNormalizedText = synthResult.internalNormalizedPhonetic,
+                        previousGeneratedAudioPath = dlg.generatedAudioPath,
+                        generatedAudioPath = synthResult.outputFile.absolutePath,
+                        actualGeneratedDurationMs = synthResult.actualDurationMs,
+                        durationDeviationMs = deviationMs,
+                        timeStretchRatio = synthResult.timeStretchRatio,
+                        voiceReferenceId = speakerProfile.voiceReferenceId,
+                        ttsEngineUsed = synthResult.engineUsed,
                         characterBatchNumber = batchNumber,
                         orderInCharacterBatch = orderInBatch,
-                        ttsEngine = synthResult.engineUsed,
-                        modelVersion = synthResult.modelVersion,
-                        voiceReferenceId = speakerProfile.voiceReferenceId,
-                        visibleRomanHinglish = dlg.romanHinglishText,
-                        internalPhoneticText = synthResult.internalNormalizedPhonetic,
-                        emotionRequested = dlg.emotion,
-                        emotionControlSupported = true,
-                        targetDurationMs = dlg.originalDurationMs,
-                        actualDurationMs = synthResult.actualDurationMs,
-                        timeStretchRatio = synthResult.timeStretchRatio,
-                        outputFilePath = synthResult.outputFile.absolutePath,
-                        sampleRateHz = episode.audioSampleRateHz,
-                        status = "SUCCESS"
+                        generationStatus = "GENERATED",
+                        syncStatus = synthResult.syncStatus,
+                        peakDbfs = synthResult.peakDbfs,
+                        generationVersion = dlg.generationVersion + 1,
+                        errorNote = null
                     )
-                )
+                    dao.updateDialogue(updatedDlg)
 
-                batchIds.add(dlg.dialogueId)
-                generatedCount++
+                    dao.insertVoiceGenerationRecord(
+                        VoiceGenerationRecordEntity(
+                            episodeId = episode.id,
+                            dialogueId = dlg.dialogueId,
+                            speakerLabel = speakerLabel,
+                            characterBatchNumber = batchNumber,
+                            orderInCharacterBatch = orderInBatch,
+                            ttsEngine = synthResult.engineUsed,
+                            modelVersion = synthResult.modelVersion,
+                            voiceReferenceId = speakerProfile.voiceReferenceId,
+                            visibleRomanHinglish = dlg.romanHinglishText,
+                            internalPhoneticText = synthResult.internalNormalizedPhonetic,
+                            emotionRequested = dlg.emotion,
+                            emotionControlSupported = true,
+                            targetDurationMs = dlg.originalDurationMs,
+                            actualDurationMs = synthResult.actualDurationMs,
+                            timeStretchRatio = synthResult.timeStretchRatio,
+                            outputFilePath = synthResult.outputFile.absolutePath,
+                            sampleRateHz = episode.audioSampleRateHz,
+                            status = "SUCCESS"
+                        )
+                    )
+                    batchIds.add(dlg.dialogueId)
+                    generatedCount++
+                } else {
+                    val errMsg = synthOutcome.exceptionOrNull()?.localizedMessage ?: "Real speech synthesis failed."
+                    lastError = errMsg
+                    failedCount++
+                    dao.updateDialogue(
+                        dlg.copy(
+                            characterBatchNumber = batchNumber,
+                            orderInCharacterBatch = orderInBatch,
+                            generationStatus = "FAILED",
+                            syncStatus = "PENDING",
+                            errorNote = errMsg
+                        )
+                    )
+                    dao.insertVoiceGenerationRecord(
+                        VoiceGenerationRecordEntity(
+                            episodeId = episode.id,
+                            dialogueId = dlg.dialogueId,
+                            speakerLabel = speakerLabel,
+                            characterBatchNumber = batchNumber,
+                            orderInCharacterBatch = orderInBatch,
+                            ttsEngine = selectedTtsEngine,
+                            modelVersion = "FAILED",
+                            voiceReferenceId = speakerProfile.voiceReferenceId,
+                            visibleRomanHinglish = dlg.romanHinglishText,
+                            internalPhoneticText = HinglishTtsNormalizer.normalizeForTtsPronunciation(dlg.romanHinglishText, dictionaries),
+                            emotionRequested = dlg.emotion,
+                            emotionControlSupported = false,
+                            targetDurationMs = dlg.originalDurationMs,
+                            actualDurationMs = 0L,
+                            timeStretchRatio = 1.0f,
+                            outputFilePath = "",
+                            sampleRateHz = episode.audioSampleRateHz,
+                            status = "FAILED"
+                        )
+                    )
+                }
             }
-            batchExecutionSummary.add("Batch $batchNumber ($speakerLabel): [${batchIds.joinToString(", ")}]")
+            if (batchIds.isNotEmpty()) {
+                batchExecutionSummary.add("Batch $batchNumber ($speakerLabel): [${batchIds.joinToString(", ")}]")
+            }
         }
 
+        val jobStatus = if (generatedCount > 0 && failedCount == 0) "COMPLETED" else "FAILED"
         recordAgentJob(
             episodeId = episode.id,
             agentNumber = 5,
             stageNumber = 10,
             agentName = "Agent 5 — Voice Generation",
-            operation = "Generated $generatedCount line(s) across ${distinctSpeakerLabels.size} character batch(es)",
-            modelUsed = "$selectedTtsEngine (On-Device Formant Synthesis + WSOLA)",
-            runtimeMode = "ON_DEVICE_ANDROID",
+            operation = "Synthesized $generatedCount / ${readyDialogues.size} line(s) ($failedCount failed)",
+            modelUsed = "$lastEngineUsed + WSOLA Sync",
+            runtimeMode = lastRuntimeMode,
             inputSummary = "${readyDialogues.size} translated lines grouped A → B → C",
-            outputSummary = batchExecutionSummary.joinToString(" | "),
+            outputSummary = if (batchExecutionSummary.isNotEmpty()) batchExecutionSummary.joinToString(" | ") else (lastError ?: "0 generated"),
             completed = generatedCount,
             total = readyDialogues.size,
-            status = "COMPLETED",
+            status = jobStatus,
+            errorDetails = lastError,
             startedAt = startedAt
         )
 
+        if (generatedCount == 0) {
+            throw IllegalStateException(
+                lastError ?: "Voice synthesis produced 0 audio clips. Ensure Android Speech Services (hi-IN) is installed or connect a Remote GPU Worker."
+            )
+        }
+
         val updated = episode.copy(
             currentStageNumber = 10,
-            currentStageName = "Stage 10 — Character Batches Generated",
-            completedStagesMask = episode.completedStagesMask or (1 shl 10),
+            currentStageName = if (failedCount == 0) {
+                "Stage 10 — $generatedCount Lines Synthesized"
+            } else {
+                "Stage 10 — $generatedCount OK, $failedCount Failed (Retry)"
+            },
+            completedStagesMask = if (failedCount == 0) episode.completedStagesMask or (1 shl 10) else episode.completedStagesMask,
             updatedAt = System.currentTimeMillis()
         )
         dao.updateEpisode(updated)
         return updated
+    }
+
+    /**
+     * Real Speech Synthesis Dispatcher (Agent 15 + Agent 16 Pronunciation + Agent 17 WSOLA Sync):
+     * 1. Attempts Remote GPU Worker `SPRINGLab/F5-Hindi-24KHz` when configured.
+     * 2. Falls back to real On-Device `AndroidSpeechTtsEngine` (`TextToSpeech.synthesizeToFile`).
+     * Never synthesizes fake sine-wave tones.
+     */
+    private suspend fun synthesizeSingleLineReal(
+        dialogueId: String,
+        speakerProfile: SpeakerProfileEntity,
+        visibleRomanHinglish: String,
+        dictionaries: List<DictionaryEntryEntity>,
+        emotion: String,
+        targetDurationMs: Long,
+        selectedEngineId: String,
+        remoteWorkerUrl: String,
+        outputDir: File,
+        sampleRateHz: Int
+    ): Result<SynthesizedDialogueResult> {
+        val internalPhonetic = HinglishTtsNormalizer.normalizeForTtsPronunciation(visibleRomanHinglish, dictionaries)
+        val speakableText = HinglishTtsNormalizer.prepareSpeakableText(visibleRomanHinglish, dictionaries)
+        val outFile = File(outputDir, "dlg_${dialogueId.lowercase().replace('-', '_')}.wav")
+
+        // Path 1: Remote GPU Worker F5-Hindi-24KHz
+        if (selectedEngineId == "F5-Hindi-24KHz" && remoteWorkerUrl.isNotBlank()) {
+            val refFile = speakerProfile.voiceReferencePath
+                .takeIf { it.isNotBlank() && speakerProfile.rightsConsentConfirmed }
+                ?.let { File(it) }
+                ?.takeIf { it.exists() && it.length() > 44L }
+            val rawRemoteFile = File(outputDir, "remote_${dialogueId.lowercase().replace('-', '_')}.wav")
+            val remoteRes = workerClient.synthesizeHindiSpeechRemote(
+                baseUrl = remoteWorkerUrl,
+                text = speakableText,
+                referenceWav = refFile,
+                speakerLabel = speakerProfile.speakerLabel,
+                emotion = emotion,
+                targetDurationMs = targetDurationMs,
+                outputWavFile = rawRemoteFile
+            )
+            if (remoteRes.isSuccess) {
+                val rawBuf = AudioDspEngine.readWavFile(rawRemoteFile)
+                rawRemoteFile.delete()
+                if (rawBuf.samples.isNotEmpty() && AudioDspEngine.computeRmsDbfs(rawBuf) > -55.0f) {
+                    val resampled = AudioDspEngine.resampleMono(rawBuf, sampleRateHz)
+                    val (stretched, stretchRatio) = AudioDspEngine.timeStretchPcm(resampled, targetDurationMs)
+                    AudioDspEngine.writeWavFile(outFile, stretched)
+                    val devMs = abs(stretched.durationMs - targetDurationMs)
+                    val syncStatus = when {
+                        devMs <= 120L && abs(stretchRatio - 1.0f) <= 0.03f -> "ALIGNED"
+                        devMs <= 350L -> "TIME_STRETCHED"
+                        else -> "NEEDS_ADAPTATION"
+                    }
+                    return Result.success(
+                        SynthesizedDialogueResult(
+                            outputFile = outFile,
+                            visibleRomanHinglish = visibleRomanHinglish,
+                            internalNormalizedPhonetic = internalPhonetic,
+                            actualDurationMs = stretched.durationMs,
+                            timeStretchRatio = stretchRatio,
+                            peakDbfs = AudioDspEngine.computePeakDbfs(stretched),
+                            engineUsed = "F5-Hindi-24KHz (Remote GPU)",
+                            modelVersion = "SPRINGLab/F5-Hindi-24KHz",
+                            syncStatus = syncStatus
+                        )
+                    )
+                }
+            }
+        }
+
+        // Path 2: Genuine On-Device Android Speech TTS (hi-IN / en-IN)
+        val androidRes = androidTtsEngine.synthesizeSpokenDialogueToWav(
+            dialogueId = dialogueId,
+            textToSpeak = speakableText,
+            speakerProfile = speakerProfile,
+            emotion = emotion,
+            targetDurationMs = targetDurationMs,
+            outputDir = outputDir,
+            targetSampleRateHz = sampleRateHz
+        )
+        return androidRes.map { res ->
+            res.copy(
+                visibleRomanHinglish = visibleRomanHinglish,
+                internalNormalizedPhonetic = internalPhonetic
+            )
+        }
     }
 
     /**
@@ -1803,14 +2200,15 @@ $dialogueLinesPrompt
             outputSummary = "$passedCount / 13 PASSED",
             completed = passedCount,
             total = 13,
-            status = if (failedOrBlocked == 0) "COMPLETED" else "COMPLETED",
+            status = if (failedOrBlocked == 0) "COMPLETED" else "FAILED",
+            errorDetails = if (failedOrBlocked > 0) "$failedOrBlocked QC check(s) failed or blocked." else null,
             startedAt = startedAt
         )
 
         val updated = episode.copy(
             currentStageNumber = 13,
             currentStageName = "Stage 13 — QC Audited ($passedCount/13)",
-            completedStagesMask = episode.completedStagesMask or (1 shl 13),
+            completedStagesMask = if (failedOrBlocked == 0) episode.completedStagesMask or (1 shl 13) else episode.completedStagesMask,
             updatedAt = System.currentTimeMillis()
         )
         dao.updateEpisode(updated)
@@ -1900,6 +2298,79 @@ $dialogueLinesPrompt
             throw IllegalStateException("Export verification failed: output file was not written to disk.")
         }
 
+        // Agent 21 — Generate & validate Japanese, Hindi/Hinglish, Bilingual SRT + Styled ASS subtitles
+        val dialogues = dao.getDialoguesChronologicalOnce(episode.id)
+        val speakersByLabel = dao.getSpeakersForEpisodeOnce(episode.id).associateBy { it.speakerLabel }
+        val subtitlesDir = File(exportsDir, "subtitles").apply { mkdirs() }
+        val subtitleBundle = if (dialogues.isNotEmpty()) {
+            SubtitleGenerator.generateAllSubtitles(
+                episodeTitle = episode.episodeTitle,
+                dialogues = dialogues,
+                speakersByLabel = speakersByLabel,
+                outputDir = subtitlesDir,
+                baseFileName = cleanName
+            )
+        } else null
+
+        val subtitleFiles = if (subtitleBundle != null) {
+            listOf(
+                subtitleBundle.japaneseSrtFile,
+                subtitleBundle.hindiHinglishSrtFile,
+                subtitleBundle.bilingualSrtFile,
+                subtitleBundle.styledAssFile
+            )
+        } else emptyList()
+
+        if (subtitleBundle != null) {
+            recordAgentJob(
+                episodeId = episode.id,
+                agentNumber = 7,
+                stageNumber = 14,
+                agentName = "Agent 21 — Subtitle Generator",
+                operation = "Generated 4 subtitle tracks (${subtitleBundle.cueCount} cues)",
+                modelUsed = "SRT & Styled ASS v4+ Subtitle Engine",
+                runtimeMode = "ON_DEVICE_ANDROID",
+                inputSummary = "${dialogues.size} chronological dialogue segments",
+                outputSummary = subtitleFiles.joinToString(", ") { it.name },
+                completed = if (subtitleBundle.validationPassed) 4 else 0,
+                total = 4,
+                status = if (subtitleBundle.validationPassed) "COMPLETED" else "FAILED",
+                errorDetails = subtitleBundle.validationIssues.takeIf { it.isNotEmpty() }?.joinToString("; "),
+                startedAt = startedAt
+            )
+        }
+
+        // Agent 22 — Final Verification Agent (inspects actual written WAV/MP4, RMS, headroom, duration, dialogues, subtitles)
+        val verification = FinalVerificationAgent.verifyExportedOutput(
+            outputFile = outFile,
+            exportFormat = exportFormat,
+            expectedDurationMs = episode.durationMs,
+            dialogues = dialogues,
+            subtitleFiles = subtitleFiles
+        )
+
+        recordAgentJob(
+            episodeId = episode.id,
+            agentNumber = 7,
+            stageNumber = 14,
+            agentName = "Agent 22 — Final Verification",
+            operation = verification.summary,
+            modelUsed = "MediaExtractor / PCM RMS & Subtitle Verifier",
+            runtimeMode = "ON_DEVICE_ANDROID",
+            inputSummary = "${outFile.name} + ${subtitleFiles.size} subtitle file(s)",
+            outputSummary = verification.checks.joinToString(" | ") { "${it.checkName}: ${if (it.passed) "PASS" else "FAIL"}" },
+            completed = verification.checks.count { it.passed },
+            total = verification.checks.size,
+            status = if (verification.passed) "COMPLETED" else "FAILED",
+            errorDetails = if (verification.passed) null else verification.summary,
+            startedAt = startedAt
+        )
+
+        val subtitlePathsSummary = subtitleFiles.joinToString(" | ") { it.name }
+        val verificationDetailsText = verification.checks.joinToString("\n") {
+            "[${if (it.passed) "PASS" else "FAIL"}] ${it.checkName}: ${it.detail}"
+        }
+
         dao.insertExportRecord(
             ExportRecordEntity(
                 episodeId = episode.id,
@@ -1912,46 +2383,84 @@ $dialogueLinesPrompt
                 outputFilePath = outFile.absolutePath,
                 fileSizeBytes = outFile.length(),
                 durationMs = actualDurationMs,
-                status = "VERIFIED"
+                status = if (verification.passed) "VERIFIED" else "VERIFICATION_FAILED",
+                subtitlePathsSummary = subtitlePathsSummary,
+                verificationReport = verificationDetailsText
             )
         )
 
-        recordAgentJob(
-            episodeId = episode.id,
-            agentNumber = 7,
-            stageNumber = 14,
-            agentName = "Agent 7 — Final Export",
-            operation = "Exported ${if (exportFormat == "MP4_VIDEO") "MP4 Video" else "WAV Audio"} (${outFile.name})",
-            modelUsed = if (exportFormat == "MP4_VIDEO") "Android MediaMuxer + AAC Encoder" else "16-bit PCM WAV Exporter",
-            runtimeMode = "ON_DEVICE_ANDROID",
-            inputSummary = mixedSource.name,
-            outputSummary = "${outFile.name} (${outFile.length() / 1024} KB, ${actualDurationMs} ms)",
-            completed = 1,
-            total = 1,
-            status = "COMPLETED",
-            startedAt = startedAt
-        )
+        if (verification.passed && dialogues.isNotEmpty()) {
+            dao.insertDialogues(dialogues.map { it.copy(verificationStatus = "VERIFIED") })
+        }
 
         val updated = episode.copy(
             exportedVideoPath = outFile.absolutePath,
             currentStageNumber = 14,
-            currentStageName = "Stage 14 — Exported (${outFile.extension.uppercase()})",
-            completedStagesMask = episode.completedStagesMask or (1 shl 14),
-            pipelineStatus = "COMPLETED",
+            currentStageName = if (verification.passed) {
+                "Stage 14 — Verified Export (${outFile.extension.uppercase()})"
+            } else {
+                "Stage 14 — Export Verification Failed"
+            },
+            completedStagesMask = if (verification.passed) episode.completedStagesMask or (1 shl 14) else episode.completedStagesMask,
+            pipelineStatus = if (verification.passed) "COMPLETED" else "ERROR",
+            lastErrorMessage = if (verification.passed) null else verification.summary,
             updatedAt = System.currentTimeMillis()
         )
         dao.updateEpisode(updated)
+        if (!verification.passed) {
+            throw IllegalStateException(verification.summary)
+        }
         return updated
     }
 
     /**
-     * Dependency-Aware Single Dialogue Regeneration.
+     * Standalone Agent 21 — Export Subtitles (Japanese SRT, Hindi/Hinglish SRT, Bilingual SRT, Styled ASS).
+     */
+    suspend fun generateSubtitlesOnly(episode: EpisodeEntity, customBaseName: String? = null): GeneratedSubtitleBundle {
+        val startedAt = System.currentTimeMillis()
+        val dialogues = dao.getDialoguesChronologicalOnce(episode.id)
+        if (dialogues.isEmpty()) {
+            throw IllegalStateException("No dialogue segments exist yet to generate subtitles.")
+        }
+        val speakersByLabel = dao.getSpeakersForEpisodeOnce(episode.id).associateBy { it.speakerLabel }
+        val epDir = getEpisodeWorkspaceDir(episode.id)
+        val subtitlesDir = File(epDir, "exports/subtitles").apply { mkdirs() }
+        val baseName = customBaseName?.takeIf { it.isNotBlank() } ?: "AnimeDub_Ep${episode.episodeNumber}_Subtitles"
+        val bundle = SubtitleGenerator.generateAllSubtitles(
+            episodeTitle = episode.episodeTitle,
+            dialogues = dialogues,
+            speakersByLabel = speakersByLabel,
+            outputDir = subtitlesDir,
+            baseFileName = baseName
+        )
+        recordAgentJob(
+            episodeId = episode.id,
+            agentNumber = 7,
+            stageNumber = 14,
+            agentName = "Agent 21 — Subtitle Generator",
+            operation = "Exported 4 subtitle files (${bundle.cueCount} cues)",
+            modelUsed = "SRT & Styled ASS v4+ Subtitle Engine",
+            runtimeMode = "ON_DEVICE_ANDROID",
+            inputSummary = "${dialogues.size} chronological dialogues",
+            outputSummary = "${bundle.japaneseSrtFile.name}, ${bundle.hindiHinglishSrtFile.name}, ${bundle.bilingualSrtFile.name}, ${bundle.styledAssFile.name}",
+            completed = if (bundle.validationPassed) 4 else 0,
+            total = 4,
+            status = if (bundle.validationPassed) "COMPLETED" else "FAILED",
+            errorDetails = bundle.validationIssues.takeIf { it.isNotEmpty() }?.joinToString("; "),
+            startedAt = startedAt
+        )
+        return bundle
+    }
+
+    /**
+     * Dependency-Aware Single Dialogue Regeneration & Failure Retry.
      */
     suspend fun regenerateSingleDialogueOnly(
         dialogueId: Long,
         newRomanHinglishText: String? = null,
         newEmotion: String? = null,
-        selectedTtsEngine: String = "XTTS-v2"
+        selectedTtsEngine: String = "F5-Hindi-24KHz",
+        remoteWorkerUrl: String = ""
     ): Result<DialogueSegmentEntity> = withContext(Dispatchers.IO) {
         val dlg = dao.getDialogueById(dialogueId)
             ?: return@withContext Result.failure(IllegalArgumentException("Dialogue not found."))
@@ -1985,13 +2494,14 @@ $dialogueLinesPrompt
             voiceReferencePath = "",
             voiceReferenceId = "VREF-${episode.projectId}-${dlg.speakerLabel.ifBlank { "A" }}",
             rightsConsentConfirmed = false,
-            useConsentedGenericVoiceFallback = true
+            useConsentedGenericVoiceFallback = true,
+            characterId = "CHAR-${episode.projectId}-${dlg.speakerLabel.ifBlank { "A" }}"
         )
 
         val epDir = getEpisodeWorkspaceDir(episode.id)
         val genDir = File(epDir, "generated_dialogues").apply { mkdirs() }
 
-        val synthResult = HinglishTtsNormalizer.synthesizeCharacterDialogue(
+        val synthOutcome = synthesizeSingleLineReal(
             dialogueId = dlg.dialogueId,
             speakerProfile = speakerProfile,
             visibleRomanHinglish = updatedHinglish,
@@ -1999,10 +2509,25 @@ $dialogueLinesPrompt
             emotion = updatedEmotion,
             targetDurationMs = dlg.originalDurationMs,
             selectedEngineId = selectedTtsEngine,
+            remoteWorkerUrl = remoteWorkerUrl,
             outputDir = genDir,
             sampleRateHz = episode.audioSampleRateHz
         )
 
+        if (synthOutcome.isFailure) {
+            val errMsg = synthOutcome.exceptionOrNull()?.localizedMessage ?: "Real speech synthesis failed."
+            dao.updateDialogue(
+                dlg.copy(
+                    romanHinglishText = updatedHinglish,
+                    emotion = updatedEmotion,
+                    generationStatus = "FAILED",
+                    errorNote = errMsg
+                )
+            )
+            return@withContext Result.failure(IllegalStateException(errMsg, synthOutcome.exceptionOrNull()))
+        }
+
+        val synthResult = synthOutcome.getOrThrow()
         val updatedDlg = dlg.copy(
             romanHinglishText = updatedHinglish,
             ttsNormalizedText = synthResult.internalNormalizedPhonetic,
@@ -2014,6 +2539,7 @@ $dialogueLinesPrompt
             timeStretchRatio = synthResult.timeStretchRatio,
             ttsEngineUsed = synthResult.engineUsed,
             generationStatus = "SYNCED",
+            syncStatus = synthResult.syncStatus,
             peakDbfs = synthResult.peakDbfs,
             translationVersion = if (newRomanHinglishText != null) dlg.translationVersion + 1 else dlg.translationVersion,
             generationVersion = dlg.generationVersion + 1,
@@ -2061,7 +2587,8 @@ $dialogueLinesPrompt
         newRomanHinglishTerm: String,
         pronunciationGuidance: String,
         scope: String,
-        selectedTtsEngine: String = "XTTS-v2"
+        selectedTtsEngine: String = "F5-Hindi-24KHz",
+        remoteWorkerUrl: String = ""
     ): Int = withContext(Dispatchers.IO) {
         val episode = dao.getEpisodeById(episodeId) ?: return@withContext 0
         val project = dao.getProjectById(episode.projectId)
@@ -2111,7 +2638,8 @@ $dialogueLinesPrompt
             regenerateSingleDialogueOnly(
                 dialogueId = dlg.id,
                 newRomanHinglishText = updatedText,
-                selectedTtsEngine = selectedTtsEngine
+                selectedTtsEngine = selectedTtsEngine,
+                remoteWorkerUrl = remoteWorkerUrl
             )
             affectedCount++
         }

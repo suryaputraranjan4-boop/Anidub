@@ -6,6 +6,8 @@ import com.example.data.local.AnimeDubDao
 import com.example.data.local.ModelManifestEntity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -17,18 +19,32 @@ import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
+/**
+ * Multi-file, resumable, integrity-verified AI model download manager.
+ *
+ * Guarantees:
+ * - Saves every artifact under its actual official relative filename in
+ *   filesDir/verified_models/<modelId>/<relativePath> (never verified_artifact.bin).
+ * - Downloads ALL required files (weights + tokenizers + configs + manifests).
+ * - Uses real server Content-Length (never fake KB placeholders or invented sizes for gated repos).
+ * - Supports HTTP Range resume via per-file .part files.
+ * - Verifies SHA-256 checksums against official Hugging Face LFS SHA-256 hashes.
+ * - Marks INSTALLED only when every required file exists, is non-empty, and passes verification.
+ * - Prevents duplicate concurrent downloads and supports cancellation + retry.
+ */
 class ModelDownloadManager(
     private val context: Context,
     private val dao: AnimeDubDao
 ) {
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
-    private val activeDownloads = ConcurrentHashMap<String, Boolean>()
+    private val activeDownloads = ConcurrentHashMap<String, Job>()
     private val mutex = Mutex()
 
     fun getModelsDirectory(): File {
@@ -37,170 +53,474 @@ class ModelDownloadManager(
         return dir
     }
 
+    fun getModelDirectory(modelId: String): File {
+        return File(getModelsDirectory(), modelId)
+    }
+
     fun getAvailableStorageBytes(): Long {
         return try {
             val stat = StatFs(context.filesDir.absolutePath)
             stat.availableBlocksLong * stat.blockSizeLong
-        } catch (e: Exception) {
-            500L * 1024L * 1024L
+        } catch (_: Exception) {
+            0L
         }
     }
 
     fun getModelsStorageUsedBytes(): Long {
         val dir = getModelsDirectory()
+        if (!dir.exists()) return 0L
         return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
     }
 
+    fun inspectLocalFiles(model: ModelManifestEntity): List<ModelArtifactDiskStatus> {
+        val artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
+        val modelDir = getModelDirectory(model.modelId)
+        return artifacts.map { artifact ->
+            val targetFile = File(modelDir, artifact.relativePath)
+            val partFile = File(modelDir, "${artifact.relativePath}.part")
+            val actualLen = if (targetFile.exists() && targetFile.isFile) targetFile.length() else 0L
+            val partLen = if (partFile.exists() && partFile.isFile) partFile.length() else 0L
+            val isSized = actualLen > 0L && (artifact.expectedBytes <= 0L || actualLen == artifact.expectedBytes)
+            ModelArtifactDiskStatus(
+                artifact = artifact,
+                actualBytesOnDisk = actualLen,
+                partialBytesOnDisk = partLen,
+                isPresentAndSized = isSized,
+                localPath = targetFile.absolutePath
+            )
+        }
+    }
+
     /**
-     * Downloads the verified manifest/checkpoint files for a model with:
-     * - Duplicate download prevention
-     * - Storage capacity verification before download
-     * - Resumable HTTP Range support where supported by the host
-     * - Real SHA-256 checksum calculation and verification
+     * Reconciles the Room catalog with VerifiedModelCatalog on app startup:
+     * - Removes obsolete fake/placeholder KB entries from earlier builds.
+     * - Removes any legacy verified_artifact.bin files on disk.
+     * - Preserves genuine on-disk verified files if all required artifacts are present.
+     */
+    suspend fun reconcileCatalogWithDisk() = withContext(Dispatchers.IO) {
+        val catalog = VerifiedModelCatalog.buildVerifiedModelCatalog()
+        val validIds = catalog.map { it.modelId }
+        val existingById = dao.getAllModelsOnce().associateBy { it.modelId }
+
+        // Clean legacy obsolete directories & fake verified_artifact.bin files
+        val rootDir = getModelsDirectory()
+        rootDir.listFiles()?.forEach { child ->
+            if (child.isDirectory) {
+                if (child.name !in validIds) {
+                    child.deleteRecursively()
+                } else {
+                    File(child, "verified_artifact.bin").takeIf { it.exists() }?.delete()
+                    File(child, "verified_artifact.part").takeIf { it.exists() }?.delete()
+                }
+            }
+        }
+
+        dao.deleteObsoleteModels(validIds)
+
+        val reconciled = catalog.map { spec ->
+            if (!VerifiedModelCatalog.isDownloadablePackage(spec)) {
+                spec
+            } else {
+                val existing = existingById[spec.modelId]
+                val diskStatuses = inspectLocalFiles(spec)
+                val completeBytes = diskStatuses.sumOf { it.actualBytesOnDisk }
+                val partialBytes = diskStatuses.sumOf { it.partialBytesOnDisk }
+                val totalOnDisk = completeBytes + partialBytes
+                val presentCount = diskStatuses.count { it.isPresentAndSized }
+
+                // Keep probed gated manifest if user already resolved real sizes via HF token
+                val effectiveSpec = if (
+                    spec.isGatedHuggingFace &&
+                    existing != null &&
+                    existing.isSizeKnown &&
+                    existing.expectedSizeBytes > 0L
+                ) {
+                    spec.copy(
+                        filesManifestJson = existing.filesManifestJson,
+                        expectedSizeBytes = existing.expectedSizeBytes,
+                        isSizeKnown = true
+                    )
+                } else {
+                    spec
+                }
+
+                when {
+                    presentCount == diskStatuses.size && diskStatuses.isNotEmpty() && existing?.downloadState == "INSTALLED" -> {
+                        effectiveSpec.copy(
+                            downloadState = "INSTALLED",
+                            downloadProgressPercent = 100,
+                            downloadedBytes = completeBytes,
+                            verifiedFilesCount = presentCount,
+                            installedVersion = existing.installedVersion,
+                            localFilePath = getModelDirectory(spec.modelId).absolutePath,
+                            sha256Checksum = existing.sha256Checksum,
+                            statusNote = "All $presentCount/${diskStatuses.size} verified files present on disk."
+                        )
+                    }
+                    totalOnDisk > 0L -> {
+                        val pct = if (effectiveSpec.isSizeKnown && effectiveSpec.expectedSizeBytes > 0L) {
+                            ((totalOnDisk * 100L) / effectiveSpec.expectedSizeBytes).toInt().coerceIn(1, 99)
+                        } else 0
+                        effectiveSpec.copy(
+                            downloadState = "NOT_DOWNLOADED",
+                            downloadProgressPercent = pct,
+                            downloadedBytes = totalOnDisk,
+                            verifiedFilesCount = presentCount,
+                            localFilePath = getModelDirectory(spec.modelId).absolutePath,
+                            statusNote = "Incomplete download ($presentCount/${diskStatuses.size} files complete). Tap Download to resume."
+                        )
+                    }
+                    else -> effectiveSpec
+                }
+            }
+        }
+        dao.insertModels(reconciled)
+    }
+
+    fun cancelDownload(modelId: String) {
+        activeDownloads[modelId]?.cancel()
+    }
+
+    /**
+     * Queries real HTTP HEAD Content-Length for gated Hugging Face files using the user's
+     * authorized read-only HF token. Never invents or guesses sizes!
+     */
+    suspend fun probeGatedModelSizes(
+        modelId: String,
+        hfAccessToken: String
+    ): Result<ModelManifestEntity> = withContext(Dispatchers.IO) {
+        val token = hfAccessToken.trim()
+        if (token.isEmpty()) {
+            return@withContext Result.failure(IllegalArgumentException("Enter a read-only Hugging Face Access Token first."))
+        }
+        val model = dao.getModelById(modelId)
+            ?: return@withContext Result.failure(IllegalArgumentException("Model $modelId not found."))
+        val artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
+        if (artifacts.isEmpty()) {
+            return@withContext Result.failure(IllegalStateException("No downloadable files declared for ${model.modelName}."))
+        }
+
+        val resolved = mutableListOf<ModelArtifactFile>()
+        for (file in artifacts) {
+            if (file.expectedBytes > 0L) {
+                resolved.add(file)
+                continue
+            }
+            val sizeResult = queryRemoteContentLength(file.downloadUrl, token)
+            if (sizeResult.isFailure) {
+                val msg = sizeResult.exceptionOrNull()?.localizedMessage ?: "Authorization failed"
+                val failed = model.copy(
+                    statusNote = "Could not query gated file ${file.relativePath}: $msg"
+                )
+                dao.updateModel(failed)
+                return@withContext Result.failure(IllegalStateException(failed.statusNote))
+            }
+            resolved.add(file.copy(expectedBytes = sizeResult.getOrThrow()))
+        }
+
+        val exactTotal = resolved.sumOf { it.expectedBytes }
+        val updated = model.copy(
+            filesManifestJson = VerifiedModelCatalog.serializeManifest(resolved),
+            expectedSizeBytes = exactTotal,
+            isSizeKnown = exactTotal > 0L,
+            statusNote = "Verified real server total size with HF token: ${resolved.size} files (${exactTotal} bytes). Ready to download."
+        )
+        dao.updateModel(updated)
+        Result.success(updated)
+    }
+
+    /**
+     * Downloads ALL required files for a model into actual official filenames, supports HTTP Range resume,
+     * verifies exact byte counts & SHA-256 hashes, and marks INSTALLED only after every file passes.
      */
     suspend fun downloadAndVerifyModel(
         modelId: String,
         hfAccessToken: String? = null
     ): Result<ModelManifestEntity> = withContext(Dispatchers.IO) {
-        val model = dao.getModelById(modelId)
+        var model = dao.getModelById(modelId)
             ?: return@withContext Result.failure(IllegalArgumentException("Model $modelId not found in catalog."))
 
+        if (!VerifiedModelCatalog.isDownloadablePackage(model)) {
+            return@withContext Result.success(model)
+        }
+
+        val currentJob = coroutineContext[Job]
         mutex.withLock {
-            if (activeDownloads[modelId] == true) {
-                return@withContext Result.failure(IllegalStateException("Download already in progress for ${model.modelName}."))
+            if (activeDownloads[modelId]?.isActive == true) {
+                return@withContext Result.failure(IllegalStateException("Download already running for ${model.modelName}."))
             }
-            activeDownloads[modelId] = true
+            if (currentJob != null) {
+                activeDownloads[modelId] = currentJob
+            }
         }
 
         try {
-            if (model.isGatedHuggingFace && hfAccessToken.isNullOrBlank()) {
-                val updated = model.copy(
-                    downloadState = "FAILED",
-                    statusNote = "Gated Hugging Face model: Requires accepting user conditions at ${model.sourceUrl} and providing a read-only HF Access Token."
-                )
-                dao.updateModel(updated)
-                return@withContext Result.failure(IllegalStateException(updated.statusNote))
+            val token = hfAccessToken?.trim().orEmpty()
+            if (model.isGatedHuggingFace && token.isEmpty()) {
+                val gatedMsg = "Gated Hugging Face model: Accept user terms at ${model.sourceUrl} (and pyannote/segmentation-3.0) and provide a read-only HF Access Token."
+                val failed = model.copy(downloadState = "FAILED", statusNote = gatedMsg)
+                dao.updateModel(failed)
+                return@withContext Result.failure(IllegalStateException(gatedMsg))
             }
 
-            // 1. Check available storage
-            val freeBytes = getAvailableStorageBytes()
-            if (freeBytes < model.expectedSizeBytes + 10L * 1024L * 1024L) {
-                val updated = model.copy(
-                    downloadState = "FAILED",
-                    statusNote = "Insufficient storage: Requires ${model.expectedSizeBytes / 1024} KB, available ${freeBytes / (1024 * 1024)} MB."
-                )
-                dao.updateModel(updated)
-                return@withContext Result.failure(IllegalStateException(updated.statusNote))
+            var artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
+            if (artifacts.isEmpty()) {
+                return@withContext Result.failure(IllegalStateException("Model manifest contains no downloadable files."))
             }
 
-            val modelDir = File(getModelsDirectory(), model.modelId)
-            if (!modelDir.exists()) modelDir.mkdirs()
-            val targetFile = File(modelDir, "verified_artifact.bin")
-            val partialFile = File(modelDir, "verified_artifact.part")
-
-            dao.updateModel(
-                model.copy(
-                    downloadState = "DOWNLOADING",
-                    downloadProgressPercent = 5,
-                    statusNote = "Connecting to ${model.downloadArtifactUrl}..."
-                )
-            )
-
-            // 2. Resumable HTTP request with Range header if partial file exists
-            val existingBytes = if (partialFile.exists()) partialFile.length() else 0L
-            val reqBuilder = Request.Builder().url(model.downloadArtifactUrl)
-            if (existingBytes > 0L) {
-                reqBuilder.header("Range", "bytes=$existingBytes-")
-            }
-            if (!hfAccessToken.isNullOrBlank()) {
-                reqBuilder.header("Authorization", "Bearer ${hfAccessToken.trim()}")
-            }
-
-            var downloadedTotal = existingBytes
-            httpClient.newCall(reqBuilder.build()).execute().use { response ->
-                if (!response.isSuccessful && response.code != 416) {
-                    val failNote = "HTTP ${response.code} from ${model.downloadArtifactUrl}"
-                    val failed = model.copy(
-                        downloadState = "FAILED",
-                        statusNote = failNote
+            // 1. Resolve any unknown remote file sizes via real HTTP HEAD Content-Length (e.g. gated models)
+            if (!model.isSizeKnown || artifacts.any { it.expectedBytes <= 0L }) {
+                dao.updateModel(
+                    model.copy(
+                        downloadState = "DOWNLOADING",
+                        downloadProgressPercent = 0,
+                        statusNote = "Querying real server Content-Length for ${artifacts.size} files..."
                     )
-                    dao.updateModel(failed)
-                    return@withContext Result.failure(IllegalStateException(failNote))
-                }
-
-                val isResumed = response.code == 206
-                val contentLen = response.body?.contentLength() ?: -1L
-                val totalExpected = if (contentLen > 0) {
-                    if (isResumed) existingBytes + contentLen else contentLen
-                } else {
-                    model.expectedSizeBytes.coerceAtLeast(1024L)
-                }
-
-                val bodyStream = response.body?.byteStream()
-                if (bodyStream != null) {
-                    FileOutputStream(partialFile, isResumed).use { fos ->
-                        val buffer = ByteArray(8192)
-                        var bytesRead: Int
-                        if (!isResumed) downloadedTotal = 0L
-                        while (bodyStream.read(buffer).also { bytesRead = it } != -1) {
-                            fos.write(buffer, 0, bytesRead)
-                            downloadedTotal += bytesRead
-                            val pct = ((downloadedTotal * 90L) / totalExpected.coerceAtLeast(1L))
-                                .toInt().coerceIn(5, 92)
-                            dao.updateModel(
-                                model.copy(
-                                    downloadState = "DOWNLOADING",
-                                    downloadProgressPercent = pct,
-                                    downloadedBytes = downloadedTotal,
-                                    statusNote = "Downloaded ${downloadedTotal / 1024} KB..."
-                                )
+                )
+                val resolvedList = mutableListOf<ModelArtifactFile>()
+                for (artifact in artifacts) {
+                    coroutineContext.ensureActive()
+                    if (artifact.expectedBytes > 0L) {
+                        resolvedList.add(artifact)
+                    } else {
+                        val lenRes = queryRemoteContentLength(artifact.downloadUrl, token.ifEmpty { null })
+                        if (lenRes.isFailure) {
+                            val err = lenRes.exceptionOrNull()?.localizedMessage ?: "Failed to query remote size"
+                            val failed = model.copy(
+                                downloadState = "FAILED",
+                                statusNote = "Cannot inspect ${artifact.relativePath}: $err"
                             )
+                            dao.updateModel(failed)
+                            return@withContext Result.failure(IllegalStateException(failed.statusNote))
                         }
-                        fos.flush()
+                        resolvedList.add(artifact.copy(expectedBytes = lenRes.getOrThrow()))
                     }
                 }
+                artifacts = resolvedList
+                model = model.copy(
+                    filesManifestJson = VerifiedModelCatalog.serializeManifest(artifacts),
+                    expectedSizeBytes = artifacts.sumOf { it.expectedBytes },
+                    isSizeKnown = true,
+                    totalFilesCount = artifacts.size
+                )
+                dao.updateModel(model)
             }
 
-            if (!partialFile.exists() || partialFile.length() == 0L) {
-                val corrupted = model.copy(
-                    downloadState = "CORRUPTED",
-                    statusNote = "Downloaded file is empty or incomplete."
+            val totalExpectedBytes = artifacts.sumOf { it.expectedBytes.coerceAtLeast(0L) }
+            val modelDir = getModelDirectory(model.modelId).apply { mkdirs() }
+
+            // 2. Calculate remaining bytes needed and verify available device storage
+            val alreadyCompleteBytes = artifacts.sumOf { art ->
+                val f = File(modelDir, art.relativePath)
+                if (f.exists() && f.length() == art.expectedBytes) f.length() else 0L
+            }
+            val remainingToDownload = (totalExpectedBytes - alreadyCompleteBytes).coerceAtLeast(0L)
+            val freeBytes = getAvailableStorageBytes()
+            val safetyMarginBytes = 25L * 1000L * 1000L // 25 MB safety margin
+            if (freeBytes < remainingToDownload + safetyMarginBytes) {
+                val msg = "Insufficient device storage: Needs ${formatCompactSize(remainingToDownload)} remaining (+25 MB headroom), available ${formatCompactSize(freeBytes)}."
+                val failed = model.copy(
+                    downloadState = "FAILED",
+                    statusNote = msg
                 )
-                dao.updateModel(corrupted)
-                return@withContext Result.failure(IllegalStateException(corrupted.statusNote))
+                dao.updateModel(failed)
+                return@withContext Result.failure(IllegalStateException(msg))
             }
 
-            // 3. Verify integrity via SHA-256 hash
-            dao.updateModel(
-                model.copy(
-                    downloadState = "VERIFYING",
-                    downloadProgressPercent = 96,
-                    downloadedBytes = partialFile.length(),
-                    statusNote = "Computing SHA-256 cryptographic checksum..."
+            // 3. Download every required file with HTTP Range resume support
+            var cumulativeVerifiedBytes = 0L
+            var verifiedCount = 0
+            var primarySha256 = ""
+
+            for ((index, artifact) in artifacts.withIndex()) {
+                coroutineContext.ensureActive()
+
+                val targetFile = File(modelDir, artifact.relativePath)
+                targetFile.parentFile?.mkdirs()
+                val partialFile = File(modelDir, "${artifact.relativePath}.part")
+
+                // Skip file if already on disk with exact size & verified SHA-256
+                if (targetFile.exists() && targetFile.length() == artifact.expectedBytes) {
+                    val existingSha = computeSha256Hex(targetFile)
+                    val hashMatches = artifact.expectedSha256.isBlank() ||
+                        existingSha.equals(artifact.expectedSha256, ignoreCase = true)
+                    if (hashMatches) {
+                        if (artifact.role == "WEIGHTS" && primarySha256.isEmpty()) primarySha256 = existingSha
+                        cumulativeVerifiedBytes += targetFile.length()
+                        verifiedCount++
+                        continue
+                    } else {
+                        targetFile.delete()
+                    }
+                }
+
+                var existingPartBytes = if (partialFile.exists()) partialFile.length() else 0L
+                if (artifact.expectedBytes > 0L && existingPartBytes > artifact.expectedBytes) {
+                    partialFile.delete()
+                    existingPartBytes = 0L
+                }
+
+                dao.updateModel(
+                    model.copy(
+                        downloadState = "DOWNLOADING",
+                        downloadedBytes = cumulativeVerifiedBytes + existingPartBytes,
+                        downloadProgressPercent = computePct(cumulativeVerifiedBytes + existingPartBytes, totalExpectedBytes),
+                        verifiedFilesCount = verifiedCount,
+                        localFilePath = modelDir.absolutePath,
+                        statusNote = "Downloading (${index + 1}/${artifacts.size}): ${artifact.relativePath}"
+                    )
                 )
-            )
 
-            val sha256 = computeSha256Hex(partialFile)
-            if (targetFile.exists()) targetFile.delete()
-            partialFile.renameTo(targetFile)
+                val reqBuilder = Request.Builder()
+                    .url(artifact.downloadUrl)
+                    .header("User-Agent", "AnimeDubStudio-Android/1.0")
+                if (existingPartBytes > 0L) {
+                    reqBuilder.header("Range", "bytes=$existingPartBytes-")
+                }
+                if (token.isNotEmpty()) {
+                    reqBuilder.header("Authorization", "Bearer $token")
+                }
 
-            val verifiedModel = model.copy(
+                httpClient.newCall(reqBuilder.build()).execute().use { response ->
+                    if (response.code == 401 || response.code == 403) {
+                        val authMsg = "HTTP ${response.code} for ${artifact.relativePath}. Accept model terms on Hugging Face and check your read-only HF Access Token."
+                        val failed = model.copy(downloadState = "FAILED", statusNote = authMsg)
+                        dao.updateModel(failed)
+                        return@withContext Result.failure(IllegalStateException(authMsg))
+                    }
+                    if (!response.isSuccessful && response.code != 416) {
+                        val httpMsg = "HTTP ${response.code} downloading ${artifact.relativePath}"
+                        val failed = model.copy(downloadState = "FAILED", statusNote = httpMsg)
+                        dao.updateModel(failed)
+                        return@withContext Result.failure(IllegalStateException(httpMsg))
+                    }
+
+                    if (response.code != 416) {
+                        val isResumed = response.code == 206 && existingPartBytes > 0L
+                        var fileDownloaded = if (isResumed) existingPartBytes else 0L
+                        val bodyStream = response.body?.byteStream()
+                            ?: throw IllegalStateException("Empty HTTP body for ${artifact.relativePath}")
+
+                        FileOutputStream(partialFile, isResumed).use { fos ->
+                            val buffer = ByteArray(64 * 1024)
+                            var bytesRead: Int
+                            var lastProgressUpdateMs = 0L
+                            while (bodyStream.read(buffer).also { bytesRead = it } != -1) {
+                                coroutineContext.ensureActive()
+                                fos.write(buffer, 0, bytesRead)
+                                fileDownloaded += bytesRead
+
+                                val now = System.currentTimeMillis()
+                                if (now - lastProgressUpdateMs >= 250L) {
+                                    lastProgressUpdateMs = now
+                                    val totalNow = cumulativeVerifiedBytes + fileDownloaded
+                                    val remainingNow = (totalExpectedBytes - totalNow).coerceAtLeast(0L)
+                                    dao.updateModel(
+                                        model.copy(
+                                            downloadState = "DOWNLOADING",
+                                            downloadedBytes = totalNow,
+                                            downloadProgressPercent = computePct(totalNow, totalExpectedBytes),
+                                            verifiedFilesCount = verifiedCount,
+                                            localFilePath = modelDir.absolutePath,
+                                            statusNote = "File ${index + 1}/${artifacts.size} (${artifact.filename}): ${formatCompactSize(totalNow)} / ${formatCompactSize(totalExpectedBytes)} (${formatCompactSize(remainingNow)} left)"
+                                        )
+                                    )
+                                }
+                            }
+                            fos.flush()
+                        }
+                    }
+                }
+
+                // 4. Verify downloaded file size & SHA-256 checksum
+                if (!partialFile.exists() || partialFile.length() == 0L) {
+                    val corrupted = model.copy(
+                        downloadState = "CORRUPTED",
+                        statusNote = "Downloaded file ${artifact.relativePath} is empty or missing."
+                    )
+                    dao.updateModel(corrupted)
+                    return@withContext Result.failure(IllegalStateException(corrupted.statusNote))
+                }
+
+                if (artifact.expectedBytes > 0L && partialFile.length() != artifact.expectedBytes) {
+                    val actual = partialFile.length()
+                    val corrupted = model.copy(
+                        downloadState = "CORRUPTED",
+                        downloadedBytes = cumulativeVerifiedBytes + actual,
+                        statusNote = "Size mismatch on ${artifact.relativePath}: got $actual bytes, expected ${artifact.expectedBytes} bytes. Retry to resume."
+                    )
+                    dao.updateModel(corrupted)
+                    return@withContext Result.failure(IllegalStateException(corrupted.statusNote))
+                }
+
+                dao.updateModel(
+                    model.copy(
+                        downloadState = "VERIFYING",
+                        downloadedBytes = cumulativeVerifiedBytes + partialFile.length(),
+                        downloadProgressPercent = computePct(cumulativeVerifiedBytes + partialFile.length(), totalExpectedBytes),
+                        verifiedFilesCount = verifiedCount,
+                        localFilePath = modelDir.absolutePath,
+                        statusNote = "Verifying SHA-256 (${index + 1}/${artifacts.size}): ${artifact.filename}..."
+                    )
+                )
+
+                val actualSha256 = computeSha256Hex(partialFile)
+                if (artifact.expectedSha256.isNotBlank() && !actualSha256.equals(artifact.expectedSha256, ignoreCase = true)) {
+                    partialFile.delete()
+                    val corrupted = model.copy(
+                        downloadState = "CORRUPTED",
+                        statusNote = "SHA-256 checksum mismatch on ${artifact.relativePath}! Expected ${artifact.expectedSha256.take(12)}…, got ${actualSha256.take(12)}…. Corrupted file removed."
+                    )
+                    dao.updateModel(corrupted)
+                    return@withContext Result.failure(IllegalStateException(corrupted.statusNote))
+                }
+
+                if (targetFile.exists()) targetFile.delete()
+                if (!partialFile.renameTo(targetFile)) {
+                    partialFile.copyTo(targetFile, overwrite = true)
+                    partialFile.delete()
+                }
+
+                if (artifact.role == "WEIGHTS" && primarySha256.isEmpty()) {
+                    primarySha256 = actualSha256
+                }
+                cumulativeVerifiedBytes += targetFile.length()
+                verifiedCount++
+            }
+
+            // 5. Final check: mark INSTALLED ONLY when all required files exist & match
+            val finalModel = model.copy(
                 downloadState = "INSTALLED",
                 downloadProgressPercent = 100,
-                downloadedBytes = targetFile.length(),
-                installedVersion = "Verified-${sha256.take(8)}",
-                localFilePath = targetFile.absolutePath,
-                sha256Checksum = sha256,
-                statusNote = "Verified SHA-256 (${sha256.take(16)}...) • ${targetFile.length()} bytes on disk"
+                downloadedBytes = cumulativeVerifiedBytes,
+                verifiedFilesCount = verifiedCount,
+                totalFilesCount = artifacts.size,
+                installedVersion = model.modelVersion.ifBlank { "Verified" },
+                localFilePath = modelDir.absolutePath,
+                sha256Checksum = primarySha256,
+                statusNote = "Verified all $verifiedCount/${artifacts.size} files (${formatCompactSize(cumulativeVerifiedBytes)}) on disk."
             )
-            dao.updateModel(verifiedModel)
-            Result.success(verifiedModel)
+            dao.updateModel(finalModel)
+            Result.success(finalModel)
         } catch (e: CancellationException) {
+            val diskBytes = inspectLocalFiles(model).sumOf { it.actualBytesOnDisk + it.partialBytesOnDisk }
+            val completeCount = inspectLocalFiles(model).count { it.isPresentAndSized }
+            dao.updateModel(
+                model.copy(
+                    downloadState = "NOT_DOWNLOADED",
+                    downloadedBytes = diskBytes,
+                    downloadProgressPercent = if (model.isSizeKnown && model.expectedSizeBytes > 0L) {
+                        computePct(diskBytes, model.expectedSizeBytes)
+                    } else 0,
+                    verifiedFilesCount = completeCount,
+                    statusNote = "Download paused/cancelled at ${formatCompactSize(diskBytes)}. Partial files retained for HTTP Range resume."
+                )
+            )
             throw e
         } catch (e: Exception) {
             val failed = model.copy(
                 downloadState = "FAILED",
-                statusNote = "Download failed: ${e.localizedMessage ?: "Network error"}"
+                statusNote = "Download error: ${e.localizedMessage ?: "Network interruption"}. Tap Retry to resume."
             )
             dao.updateModel(failed)
             Result.failure(e)
@@ -209,9 +529,76 @@ class ModelDownloadManager(
         }
     }
 
+    /**
+     * Re-verifies all required files on disk and their SHA-256 hashes.
+     */
+    suspend fun verifyInstalledModelIntegrity(modelId: String): Result<ModelManifestEntity> = withContext(Dispatchers.IO) {
+        val model = dao.getModelById(modelId)
+            ?: return@withContext Result.failure(IllegalArgumentException("Model $modelId not found."))
+        val artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
+        if (artifacts.isEmpty()) return@withContext Result.success(model)
+
+        val modelDir = getModelDirectory(model.modelId)
+        var verifiedCount = 0
+        var verifiedBytes = 0L
+        var primarySha = ""
+
+        for (art in artifacts) {
+            val file = File(modelDir, art.relativePath)
+            if (!file.exists() || file.length() == 0L) {
+                val missing = model.copy(
+                    downloadState = "CORRUPTED",
+                    verifiedFilesCount = verifiedCount,
+                    downloadedBytes = verifiedBytes,
+                    statusNote = "Missing required file: ${art.relativePath}. Re-download required."
+                )
+                dao.updateModel(missing)
+                return@withContext Result.failure(IllegalStateException(missing.statusNote))
+            }
+            if (art.expectedBytes > 0L && file.length() != art.expectedBytes) {
+                val mismatch = model.copy(
+                    downloadState = "CORRUPTED",
+                    verifiedFilesCount = verifiedCount,
+                    downloadedBytes = verifiedBytes,
+                    statusNote = "Size mismatch on ${art.relativePath} (${file.length()} vs ${art.expectedBytes} B)."
+                )
+                dao.updateModel(mismatch)
+                return@withContext Result.failure(IllegalStateException(mismatch.statusNote))
+            }
+            val sha = computeSha256Hex(file)
+            if (art.expectedSha256.isNotBlank() && !sha.equals(art.expectedSha256, ignoreCase = true)) {
+                val bad = model.copy(
+                    downloadState = "CORRUPTED",
+                    verifiedFilesCount = verifiedCount,
+                    downloadedBytes = verifiedBytes,
+                    statusNote = "SHA-256 verification failed on ${art.relativePath}."
+                )
+                dao.updateModel(bad)
+                return@withContext Result.failure(IllegalStateException(bad.statusNote))
+            }
+            if (art.role == "WEIGHTS" && primarySha.isEmpty()) primarySha = sha
+            verifiedCount++
+            verifiedBytes += file.length()
+        }
+
+        val verified = model.copy(
+            downloadState = "INSTALLED",
+            downloadProgressPercent = 100,
+            downloadedBytes = verifiedBytes,
+            verifiedFilesCount = verifiedCount,
+            totalFilesCount = artifacts.size,
+            localFilePath = modelDir.absolutePath,
+            sha256Checksum = primarySha,
+            statusNote = "Integrity check passed: all $verifiedCount/${artifacts.size} files verified via SHA-256."
+        )
+        dao.updateModel(verified)
+        Result.success(verified)
+    }
+
     suspend fun deleteInstalledModel(modelId: String): ModelManifestEntity? = withContext(Dispatchers.IO) {
+        cancelDownload(modelId)
         val model = dao.getModelById(modelId) ?: return@withContext null
-        val modelDir = File(getModelsDirectory(), model.modelId)
+        val modelDir = getModelDirectory(model.modelId)
         if (modelDir.exists()) {
             modelDir.deleteRecursively()
         }
@@ -219,19 +606,50 @@ class ModelDownloadManager(
             downloadState = "NOT_DOWNLOADED",
             downloadProgressPercent = 0,
             downloadedBytes = 0L,
+            verifiedFilesCount = 0,
             installedVersion = "",
             localFilePath = "",
             sha256Checksum = "",
-            statusNote = "Deleted from device storage. Ready to redownload."
+            statusNote = "Deleted all files from device storage. Ready to download."
         )
         dao.updateModel(reset)
         reset
     }
 
+    private fun queryRemoteContentLength(url: String, bearerToken: String?): Result<Long> {
+        return try {
+            val req = Request.Builder()
+                .url(url)
+                .head()
+                .header("User-Agent", "AnimeDubStudio-Android/1.0")
+                .apply {
+                    if (!bearerToken.isNullOrBlank()) {
+                        header("Authorization", "Bearer $bearerToken")
+                    }
+                }
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return Result.failure(IllegalStateException("HTTP ${resp.code} (check HF license terms & token)"))
+                }
+                val contentLength = resp.header("X-Linked-Size")?.toLongOrNull()
+                    ?: resp.header("Content-Length")?.toLongOrNull()
+                    ?: -1L
+                if (contentLength <= 0L) {
+                    Result.failure(IllegalStateException("Server did not return a valid Content-Length header."))
+                } else {
+                    Result.success(contentLength)
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     fun computeSha256Hex(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         FileInputStream(file).use { fis ->
-            val buf = ByteArray(8192)
+            val buf = ByteArray(64 * 1024)
             var r: Int
             while (fis.read(buf).also { r = it } != -1) {
                 digest.update(buf, 0, r)
@@ -240,244 +658,29 @@ class ModelDownloadManager(
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
+    private fun computePct(downloaded: Long, total: Long): Int {
+        if (total <= 0L) return 0
+        return ((downloaded * 100L) / total).toInt().coerceIn(0, 99)
+    }
+
+    private fun formatCompactSize(bytes: Long): String {
+        if (bytes <= 0L) return "0 B"
+        return when {
+            bytes >= 1_000_000_000L -> "%.2f GB".format(bytes / 1_000_000_000.0)
+            bytes >= 1_000_000L -> "%.2f MB".format(bytes / 1_000_000.0)
+            bytes >= 1_000L -> "%.1f KB".format(bytes / 1_000.0)
+            else -> "$bytes B"
+        }
+    }
+
     companion object {
-        fun isLocalRuntime(runtimeCompatibility: String): Boolean {
-            return runtimeCompatibility in setOf("ANDROID_LOCAL", "ONNX_ANDROID", "NATIVE_CPP_DSP")
-        }
+        fun isLocalRuntime(runtimeCompatibility: String): Boolean =
+            VerifiedModelCatalog.isLocalOrBuiltIn(runtimeCompatibility)
 
-        fun providerForModel(modelId: String): String = when (modelId) {
-            "faster_whisper_large_v3" -> "SYSTRAN / OpenAI"
-            "silero_vad_onnx" -> "Silero Team"
-            "whisperx_ja_align" -> "m-bain / Hugging Face"
-            "pyannote_diarization_community_1" -> "pyannoteAI"
-            "librosa_pyin_native_dsp" -> "Built-in Android DSP"
-            "firebase_ai_gemini_3_8_flash" -> "Google / Firebase AI Logic"
-            "coqui_xtts_v2" -> "Coqui AI"
-            "f5_tts_hindi_24khz" -> "SPRINGLab / SWivid"
-            "chatterbox_multilingual_v3" -> "ResembleAI (Archived)"
-            "uvr_mdx_net_demucs" -> "UVR / Meta Demucs + Local DSP"
-            "ffmpeg_native_timeline_dsp" -> "Android MediaCodec / Native PCM"
-            else -> "Open Source"
-        }
+        fun providerForModel(modelId: String): String =
+            VerifiedModelCatalog.providerForModel(modelId)
 
-        fun buildVerifiedModelCatalog(): List<ModelManifestEntity> = listOf(
-            ModelManifestEntity(
-                modelId = "faster_whisper_large_v3",
-                modelName = "Faster-Whisper Large-v3 (Japanese ASR)",
-                specialistAgentNumber = 1,
-                category = "Speech Recognition (Agent 1)",
-                purpose = "Transcribes spoken Japanese anime dialogue into segment-level Japanese transcripts without overwriting source text.",
-                sourceUrl = "https://huggingface.co/Systran/faster-whisper-large-v3",
-                actualFilesNeededJson = "config.json, tokenizer.json, preprocessor_config.json, vocabulary.json, model.bin (CTranslate2 FP16/INT8)",
-                downloadArtifactUrl = "https://huggingface.co/Systran/faster-whisper-large-v3/resolve/main/config.json",
-                expectedSizeBytes = 4096L,
-                licenseName = "MIT License",
-                licenseNotes = "OpenAI Whisper / SYSTRAN Faster-Whisper MIT License. Not an English-only checkpoint; full multilingual Japanese support.",
-                runtimeCompatibility = "REMOTE_PYTHON_GPU_WORKER",
-                requiredDependencies = "faster-whisper >= 1.0.0, ctranslate2, CUDA / CPU Worker",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "NOT_DOWNLOADED",
-                statusNote = "CTranslate2 Large-v3 model manifest & config ready for verification."
-            ),
-            ModelManifestEntity(
-                modelId = "silero_vad_onnx",
-                modelName = "Silero VAD v5 (ONNX Voice Activity Detector)",
-                specialistAgentNumber = 2,
-                category = "Voice Activity Detection (Agent 2)",
-                purpose = "Detects precise Japanese speech boundaries, natural internal pauses, and silence regions.",
-                sourceUrl = "https://github.com/snakers4/silero-vad",
-                actualFilesNeededJson = "silero_vad.onnx (ONNX Runtime Mobile compatible), utils_vad.py",
-                downloadArtifactUrl = "https://raw.githubusercontent.com/snakers4/silero-vad/master/README.md",
-                expectedSizeBytes = 12288L,
-                licenseName = "MIT License",
-                licenseNotes = "Silero VAD MIT License. Compatible with ONNX Runtime Mobile on Android and Python worker.",
-                runtimeCompatibility = "ONNX_ANDROID",
-                requiredDependencies = "ONNX Runtime Mobile / Android NDK PCM DSP",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "NOT_DOWNLOADED",
-                statusNote = "Supports local Android execution for dialogue pause & boundary segmentation."
-            ),
-            ModelManifestEntity(
-                modelId = "whisperx_ja_align",
-                modelName = "WhisperX + Japanese Wav2Vec2 Forced Alignment",
-                specialistAgentNumber = 2,
-                category = "Dialogue Alignment (Agent 2)",
-                purpose = "Refines ASR timestamps into dialogue-level boundaries using Japanese phoneme alignment with VAD fallback.",
-                sourceUrl = "https://github.com/m-bain/whisperX",
-                actualFilesNeededJson = "preprocessor_config.json, config.json (jonatasgrosman/wav2vec2-large-xlsr-53-japanese)",
-                downloadArtifactUrl = "https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-japanese/resolve/main/config.json",
-                expectedSizeBytes = 2048L,
-                licenseName = "BSD-4-Clause / Apache-2.0",
-                licenseNotes = "WhisperX BSD-4-Clause; Japanese Wav2Vec2 alignment checkpoint verified on Hugging Face.",
-                runtimeCompatibility = "REMOTE_PYTHON_GPU_WORKER",
-                requiredDependencies = "whisperx, transformers, torchaudio (Falls back to Silero VAD + ASR boundaries offline)",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "NOT_DOWNLOADED",
-                statusNote = "Verified Japanese forced-alignment config (wav2vec2-large-xlsr-53-japanese)."
-            ),
-            ModelManifestEntity(
-                modelId = "pyannote_diarization_community_1",
-                modelName = "pyannote speaker-diarization-community-1",
-                specialistAgentNumber = 3,
-                category = "Audio-Only Speaker Diarization (Agent 3)",
-                purpose = "Audio-only speaker diarization and voice embedding clustering. Zero visual/facial recognition.",
-                sourceUrl = "https://huggingface.co/pyannote/speaker-diarization-community-1",
-                actualFilesNeededJson = "config.yaml, segmentation pytorch_model.bin, embedding pytorch_model.bin",
-                downloadArtifactUrl = "https://raw.githubusercontent.com/pyannote/pyannote-audio/develop/README.md",
-                expectedSizeBytes = 16384L,
-                licenseName = "MIT License (Gated Model Card)",
-                licenseNotes = "Requires Hugging Face account, accepting pyannote conditions, and passing an HF read token.",
-                runtimeCompatibility = "REMOTE_PYTHON_GPU_WORKER",
-                requiredDependencies = "pyannote.audio >= 3.1, speechbrain/spkrec-ecapa-voxceleb",
-                isGatedHuggingFace = true,
-                isExperimentalArchived = false,
-                downloadState = "NOT_DOWNLOADED",
-                statusNote = "Gated Hugging Face model: Accept license on HF and provide token to download."
-            ),
-            ModelManifestEntity(
-                modelId = "librosa_pyin_native_dsp",
-                modelName = "Librosa pYIN & Native C++/Kotlin Acoustic Analyzer",
-                specialistAgentNumber = 3,
-                category = "Voice & Pitch Analysis (Agent 3)",
-                purpose = "Extracts F0 pitch range, mean/std variation, spectral centroid, timbre, speaking speed, and 16-D speaker embeddings.",
-                sourceUrl = "https://librosa.org/doc/latest/generated/librosa.pyin.html",
-                actualFilesNeededJson = "Built-in Android Acoustic Autocorrelation/YIN & 16-D Harmonic Embedding Engine",
-                downloadArtifactUrl = "https://raw.githubusercontent.com/librosa/librosa/main/README.md",
-                expectedSizeBytes = 4096L,
-                licenseName = "ISC License",
-                licenseNotes = "Librosa ISC License. Full local Android PCM acoustic feature extraction active.",
-                runtimeCompatibility = "ANDROID_LOCAL",
-                requiredDependencies = "Android Local PCM DSP Engine (Pre-installed)",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "INSTALLED",
-                downloadProgressPercent = 100,
-                installedVersion = "v1.0-Android-DSP",
-                statusNote = "Active locally on Android: F0 pitch, timbre, spectral centroid & 16-D speaker embeddings."
-            ),
-            ModelManifestEntity(
-                modelId = "firebase_ai_gemini_3_8_flash",
-                modelName = "Gemini 3.8 Flash via Firebase AI Logic",
-                specialistAgentNumber = 4,
-                category = "Roman Hinglish Translation & Dictionary (Agent 4)",
-                purpose = "Translates Japanese dialogue into natural Roman Hinglish (never Devanagari) enforcing 3-level dictionaries and duration windows.",
-                sourceUrl = "https://firebase.google.com/docs/ai-logic",
-                actualFilesNeededJson = "Provisioned via Firebase AI Logic + App Check Attestation (No client API key exposed)",
-                downloadArtifactUrl = "https://firebase.google.com/docs/ai-logic",
-                expectedSizeBytes = 0L,
-                licenseName = "Google APIs / Firebase Terms of Service",
-                licenseNotes = "Secured by Firebase App Check Debug & reCAPTCHA Enterprise providers.",
-                runtimeCompatibility = "EXTERNAL_API",
-                requiredDependencies = "com.google.firebase:firebase-ai, firebase-appcheck",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "INSTALLED",
-                downloadProgressPercent = 100,
-                installedVersion = "gemini-3.8-flash",
-                statusNote = "Provisioned & active via Firebase AI Logic with App Check attestation."
-            ),
-            ModelManifestEntity(
-                modelId = "coqui_xtts_v2",
-                modelName = "Coqui XTTS-v2 (Cross-Language Voice Cloning)",
-                specialistAgentNumber = 5,
-                category = "Voice Cloning & Synthesis (Agent 5)",
-                purpose = "Primary evaluation candidate for Japanese-reference-to-Hindi/Hinglish character-wise batch voice cloning.",
-                sourceUrl = "https://huggingface.co/coqui/XTTS-v2",
-                actualFilesNeededJson = "config.json, vocab.json, model.pth, speakers_xtts.pth, hash.md5",
-                downloadArtifactUrl = "https://huggingface.co/coqui/XTTS-v2/resolve/main/config.json",
-                expectedSizeBytes = 4096L,
-                licenseName = "Coqui Public Model License 1.0.0 (CPML)",
-                licenseNotes = "Non-commercial CPML license by default. Review license terms before commercial redistribution.",
-                runtimeCompatibility = "REMOTE_PYTHON_GPU_WORKER",
-                requiredDependencies = "coqui-tts / PyTorch GPU Worker + Android Local Formant Voice Cloner",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "NOT_DOWNLOADED",
-                statusNote = "Verified XTTS-v2 configuration manifest available for download."
-            ),
-            ModelManifestEntity(
-                modelId = "f5_tts_hindi_24khz",
-                modelName = "F5-TTS Hindi 24KHz (SPRINGLab Baseline)",
-                specialistAgentNumber = 5,
-                category = "Hindi TTS Baseline (Agent 5)",
-                purpose = "Research-oriented Hindi 24kHz TTS baseline checkpoint for Hindi pronunciation comparison.",
-                sourceUrl = "https://huggingface.co/SPRINGLab/F5-Hindi-24KHz",
-                actualFilesNeededJson = "vocab.txt, model_2500000.safetensors (SPRINGLab/F5-Hindi-24KHz)",
-                downloadArtifactUrl = "https://huggingface.co/SPRINGLab/F5-Hindi-24KHz/resolve/main/vocab.txt",
-                expectedSizeBytes = 2048L,
-                licenseName = "MIT Code / CC-BY-NC-4.0 Weights",
-                licenseNotes = "Research Hindi checkpoint; does not guarantee identical cross-language Japanese cloning as XTTS-v2.",
-                runtimeCompatibility = "REMOTE_PYTHON_GPU_WORKER",
-                requiredDependencies = "f5-tts, safetensors, torchaudio",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "NOT_DOWNLOADED",
-                statusNote = "Verified SPRINGLab/F5-Hindi-24KHz vocabulary & manifest available."
-            ),
-            ModelManifestEntity(
-                modelId = "chatterbox_multilingual_v3",
-                modelName = "Chatterbox Multilingual V3 (Archived Research)",
-                specialistAgentNumber = 5,
-                category = "Experimental Benchmark TTS (Agent 5)",
-                purpose = "Experimental voice cloning benchmark. Marked as archived research (August 2026) and not a production dependency.",
-                sourceUrl = "https://huggingface.co/ResembleAI/chatterbox",
-                actualFilesNeededJson = "README.md, conds.pt, ve.safetensors (Archived Research Benchmark)",
-                downloadArtifactUrl = "https://huggingface.co/ResembleAI/chatterbox/resolve/main/README.md",
-                expectedSizeBytes = 2048L,
-                licenseName = "MIT License (Archived Research Aug 2026)",
-                licenseNotes = "IMPORTANT: Repository archived as of August 2026. Included strictly as an optional experimental benchmark.",
-                runtimeCompatibility = "REMOTE_PYTHON_GPU_WORKER",
-                requiredDependencies = "chatterbox-tts (Experimental / Unmaintained)",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = true,
-                downloadState = "NOT_DOWNLOADED",
-                statusNote = "ARCHIVED RESEARCH (Aug 2026): Do not treat as a guaranteed production dependency."
-            ),
-            ModelManifestEntity(
-                modelId = "uvr_mdx_net_demucs",
-                modelName = "UVR MDX-Net & Demucs Hybrid Stem Separator",
-                specialistAgentNumber = 6,
-                category = "Background Audio Separation (Agent 6)",
-                purpose = "Separates Dialogue/Vocal stem from Background/Accompaniment stem while preserving lossless Original Master.",
-                sourceUrl = "https://github.com/Anjok07/ultimatevocalremovergui",
-                actualFilesNeededJson = "UVR-MDX-Net-Voc_FT.onnx / Demucs htdemucs + Android Local Formant/Residual Stem Separator",
-                downloadArtifactUrl = "https://raw.githubusercontent.com/facebookresearch/demucs/main/README.md",
-                expectedSizeBytes = 8192L,
-                licenseName = "MIT License (UVR / Demucs)",
-                licenseNotes = "Honest 2-stem vocal + accompaniment separation on-device; multi-pass BGM/SFX separation via UVR worker.",
-                runtimeCompatibility = "ANDROID_LOCAL",
-                requiredDependencies = "Android Local Residual DSP + Optional UVR ONNX/PyTorch Worker",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "INSTALLED",
-                downloadProgressPercent = 100,
-                installedVersion = "v2.4-Hybrid-DSP",
-                statusNote = "Honest 2-stem Vocal + Residual Background Separator active locally."
-            ),
-            ModelManifestEntity(
-                modelId = "ffmpeg_native_timeline_dsp",
-                modelName = "FFmpeg & Native PCM Multitrack Timeline Mixer",
-                specialistAgentNumber = 7,
-                category = "Timeline, Mixing & QC Engine (Agent 7)",
-                purpose = "Restores character-wise generated batches to chronological timestamps, preserves overlaps, mixes stems, and runs 13 QC checks.",
-                sourceUrl = "https://ffmpeg.org/documentation.html",
-                actualFilesNeededJson = "Android MediaExtractor/MediaMuxer + 16-bit PCM WSOLA & Soft-Limiter Multitrack Engine",
-                downloadArtifactUrl = "https://ffmpeg.org/legal.html",
-                expectedSizeBytes = 0L,
-                licenseName = "LGPLv2.1+ / Android Media Framework",
-                licenseNotes = "Lossless intermediate 16-bit PCM WAV pipeline with soft-knee clipping protection.",
-                runtimeCompatibility = "NATIVE_CPP_DSP",
-                requiredDependencies = "Built-in Android Native PCM & MediaMuxer Engine",
-                isGatedHuggingFace = false,
-                isExperimentalArchived = false,
-                downloadState = "INSTALLED",
-                downloadProgressPercent = 100,
-                installedVersion = "v1.0-Native-PCM",
-                statusNote = "Active locally: Lossless 16-bit PCM timeline placement, WSOLA & 13-point QC."
-            )
-        )
+        fun buildVerifiedModelCatalog(): List<ModelManifestEntity> =
+            VerifiedModelCatalog.buildVerifiedModelCatalog()
     }
 }

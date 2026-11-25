@@ -143,16 +143,16 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
                 ) {
                     Text("Voice Synthesis Engine", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                     StatusPill(
-                        text = if (workerHealth?.reachable == true) "REMOTE GPU READY" else "ON-DEVICE DSP",
+                        text = if (workerHealth?.reachable == true) "REMOTE GPU READY" else "ANDROID SPEECH TTS",
                         color = if (workerHealth?.reachable == true) StudioEmerald else StudioCyan
                     )
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = if (workerHealth?.reachable == true) {
-                        "Remote worker reachable at ${config.remoteWorkerBaseUrl}. Selected profile: ${selectedEngine.displayName}."
+                        "Remote worker reachable at ${config.remoteWorkerBaseUrl}. Selected engine: ${selectedEngine.displayName}."
                     } else {
-                        "No remote PyTorch GPU worker connected. Local on-device PCM formant synthesis + WSOLA timing runs locally using ${selectedEngine.engineId} profile parameters."
+                        "No remote PyTorch GPU worker connected. Genuine spoken Hindi/Hinglish audio is synthesized on-device via Android Speech TTS (hi-IN / en-IN) + WSOLA synchronization."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = StudioTextSecondary
@@ -307,10 +307,14 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
                         if (hasAudio) {
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Target ${dlg.originalDurationMs}ms • Actual ${dlg.actualGeneratedDurationMs}ms • Δ ${if (dlg.durationDeviationMs >= 0) "+" else ""}${dlg.durationDeviationMs}ms • Stretch ${dlg.timeStretchRatio}x",
+                                text = "Target ${dlg.originalDurationMs}ms • Actual ${dlg.actualGeneratedDurationMs}ms • Δ ${if (dlg.durationDeviationMs >= 0) "+" else ""}${dlg.durationDeviationMs}ms • Stretch ${dlg.timeStretchRatio}x • Sync: ${dlg.syncStatus}",
                                 style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
                                 color = StudioTextMuted
                             )
+                        }
+                        if (!dlg.errorNote.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            WarningBanner(message = dlg.errorNote, isError = true)
                         }
                     }
                 }

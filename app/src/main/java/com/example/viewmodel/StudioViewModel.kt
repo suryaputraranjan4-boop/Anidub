@@ -35,6 +35,7 @@ import com.example.engine.ModelDownloadManager
 import com.example.engine.StudioAudioPlayer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -111,7 +112,7 @@ data class GuidedImportState(
     val projectTitle: String = "",
     val animeSeriesName: String = "",
     val sampleRateHz: Int = 24000,
-    val preferredTtsEngine: String = "XTTS-v2",
+    val preferredTtsEngine: String = "F5-Hindi-24KHz",
     val episodeNumber: Int = 1,
     val episodeTitle: String = "",
     val mediaStatus: MediaInspectionStatus = MediaInspectionStatus.IDLE,
@@ -171,6 +172,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _pipelineBanner = MutableStateFlow(PipelineBannerState())
     val pipelineBanner: StateFlow<PipelineBannerState> = _pipelineBanner.asStateFlow()
+
+    private var activePipelineJob: Job? = null
 
     private val _workerHealth = MutableStateFlow<WorkerHealthStatus?>(null)
     val workerHealth: StateFlow<WorkerHealthStatus?> = _workerHealth.asStateFlow()
@@ -269,10 +272,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
      */
     private fun initializeCatalogAndRestoreActiveEpisode() {
         viewModelScope.launch(Dispatchers.IO) {
-            val existingModels = dao.getAllModelsOnce()
-            if (existingModels.isEmpty()) {
-                dao.insertModels(ModelDownloadManager.buildVerifiedModelCatalog())
-            }
+            modelDownloadManager.reconcileCatalogWithDisk()
 
             val savedConfig = prefsRepo.configFlow.first()
             val savedEp = if (savedConfig.activeEpisodeId > 0L) dao.getEpisodeById(savedConfig.activeEpisodeId) else null
@@ -712,7 +712,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Runs a range of pipeline stages (e.g. 2..7 or single stage N..N) with live progress updates.
+     * Runs a range of pipeline stages (e.g. 2..7 or single stage N..N) with live progress updates,
+     * duplicate-run prevention, remote worker routing, and explicit cancellation support.
      */
     fun runPipelineStages(startStage: Int = 2, endStage: Int = 13) {
         val epId = _activeEpisodeId.value
@@ -723,19 +724,29 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             )
             return
         }
-        val ttsEngine = studioConfig.value.selectedTtsEngine
-        viewModelScope.launch {
+        if (activePipelineJob?.isActive == true) {
+            _pipelineBanner.value = _pipelineBanner.value.copy(
+                statusBannerMessage = "A pipeline task is already running. Wait or tap Cancel first.",
+                isError = false
+            )
+            return
+        }
+        val cfg = studioConfig.value
+        val ttsEngine = cfg.selectedTtsEngine
+        val workerUrl = cfg.remoteWorkerBaseUrl
+        activePipelineJob = viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = startStage,
                 activeStageTitle = "Starting Stage $startStage…",
-                activeDetail = "Initializing deterministic 7-agent coordinator…"
+                activeDetail = "Initializing multi-agent coordinator…"
             )
             val result = coordinator.executePipelineFromStage(
                 episodeId = epId,
                 startStage = startStage,
                 endStage = endStage,
-                selectedTtsEngine = ttsEngine
+                selectedTtsEngine = ttsEngine,
+                remoteWorkerUrl = workerUrl
             ) { stageNum, stageTitle, detail ->
                 _pipelineBanner.value = PipelineBannerState(
                     isRunning = true,
@@ -760,6 +771,19 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         isError = true
                     )
                 }
+            )
+        }
+    }
+
+    fun cancelPipeline() {
+        val job = activePipelineJob
+        if (job != null && job.isActive) {
+            job.cancel()
+            activePipelineJob = null
+            _pipelineBanner.value = PipelineBannerState(
+                isRunning = false,
+                statusBannerMessage = "Pipeline cancelled. Completed stages remain saved for resume.",
+                isError = false
             )
         }
     }
@@ -950,9 +974,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             )
             dao.updateDialogue(updated)
             if (updated.romanHinglishText.isNotBlank() && !updated.generatedAudioPath.isNullOrBlank()) {
+                val cfg = studioConfig.value
                 coordinator.regenerateSingleDialogueOnly(
                     dialogueId = updated.id,
-                    selectedTtsEngine = studioConfig.value.selectedTtsEngine
+                    selectedTtsEngine = cfg.selectedTtsEngine,
+                    remoteWorkerUrl = cfg.remoteWorkerBaseUrl
                 )
             }
         }
@@ -963,24 +989,26 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         newRomanHinglish: String,
         newEmotion: String
     ) {
+        val cfg = studioConfig.value
         viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = 10,
                 activeStageTitle = "Synthesizing Dialogue Line",
-                activeDetail = "Updating audio clip and refreshing multitrack mix…"
+                activeDetail = "Generating real spoken Hindi/Hinglish clip & refreshing mix…"
             )
             val res = coordinator.regenerateSingleDialogueOnly(
                 dialogueId = dialogueId,
                 newRomanHinglishText = newRomanHinglish,
                 newEmotion = newEmotion,
-                selectedTtsEngine = studioConfig.value.selectedTtsEngine
+                selectedTtsEngine = cfg.selectedTtsEngine,
+                remoteWorkerUrl = cfg.remoteWorkerBaseUrl
             )
             _pipelineBanner.value = res.fold(
                 onSuccess = { dlg ->
                     PipelineBannerState(
                         isRunning = false,
-                        statusBannerMessage = "Updated ${dlg.dialogueId} (${dlg.actualGeneratedDurationMs} ms, stretch ${dlg.timeStretchRatio}x)."
+                        statusBannerMessage = "Updated ${dlg.dialogueId} (${dlg.actualGeneratedDurationMs} ms, ${dlg.syncStatus}, ${dlg.ttsEngineUsed})."
                     )
                 },
                 onFailure = { err ->
@@ -1004,6 +1032,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     ) {
         val epId = _activeEpisodeId.value
         if (epId <= 0L) return
+        val cfg = studioConfig.value
         viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
@@ -1019,7 +1048,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 newRomanHinglishTerm = newRomanHinglishTerm,
                 pronunciationGuidance = pronunciationGuidance,
                 scope = scope,
-                selectedTtsEngine = studioConfig.value.selectedTtsEngine
+                selectedTtsEngine = cfg.selectedTtsEngine,
+                remoteWorkerUrl = cfg.remoteWorkerBaseUrl
             )
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = false,
@@ -1175,6 +1205,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun cancelModelDownload(modelId: String) {
+        modelDownloadManager.cancelDownload(modelId)
+    }
+
+    fun probeGatedModelSizes(modelId: String, hfToken: String) {
+        viewModelScope.launch {
+            modelDownloadManager.probeGatedModelSizes(modelId, hfToken)
+        }
+    }
+
+    fun verifyModelIntegrity(modelId: String) {
+        viewModelScope.launch {
+            modelDownloadManager.verifyInstalledModelIntegrity(modelId)
+        }
+    }
+
     fun deleteModel(modelId: String) {
         viewModelScope.launch {
             modelDownloadManager.deleteInstalledModel(modelId)
@@ -1214,12 +1260,45 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 )
                 _pipelineBanner.value = PipelineBannerState(
                     isRunning = false,
-                    statusBannerMessage = "Export verified: ${exportedEp.exportedVideoPath?.substringAfterLast('/')}"
+                    statusBannerMessage = "Export & subtitles verified: ${exportedEp.exportedVideoPath?.substringAfterLast('/')}"
                 )
             } catch (e: Exception) {
                 _pipelineBanner.value = PipelineBannerState(
                     isRunning = false,
                     statusBannerMessage = e.localizedMessage ?: "Export failed.",
+                    isError = true
+                )
+            }
+        }
+    }
+
+    fun exportSubtitlesOnly(customFileName: String) {
+        val epId = _activeEpisodeId.value
+        if (epId <= 0L) return
+        viewModelScope.launch {
+            _pipelineBanner.value = PipelineBannerState(
+                isRunning = true,
+                activeStageNumber = 14,
+                activeStageTitle = "Generating Subtitles (Agent 21)",
+                activeDetail = "Writing & validating Japanese SRT, Hinglish SRT, Bilingual SRT, and Styled ASS…"
+            )
+            try {
+                val ep = dao.getEpisodeById(epId)
+                    ?: throw IllegalStateException("Active episode not found.")
+                val bundle = coordinator.generateSubtitlesOnly(ep, customFileName)
+                _pipelineBanner.value = PipelineBannerState(
+                    isRunning = false,
+                    statusBannerMessage = if (bundle.validationPassed) {
+                        "Validated 4 subtitle files (${bundle.cueCount} cues): ${bundle.hindiHinglishSrtFile.name} & ${bundle.styledAssFile.name}"
+                    } else {
+                        "Subtitle validation warnings: ${bundle.validationIssues.joinToString("; ")}"
+                    },
+                    isError = !bundle.validationPassed
+                )
+            } catch (e: Exception) {
+                _pipelineBanner.value = PipelineBannerState(
+                    isRunning = false,
+                    statusBannerMessage = e.localizedMessage ?: "Subtitle export failed.",
                     isError = true
                 )
             }

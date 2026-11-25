@@ -287,6 +287,22 @@ fun ProductionPipelineView(viewModel: StudioViewModel) {
                         Text("Dub & QC (8–13)", color = StudioTextPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
+                if (banner.isRunning) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { viewModel.cancelPipeline() },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("pipeline_cancel_btn"),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, StudioCrimson.copy(alpha = 0.6f))
+                    ) {
+                        Icon(Icons.Default.ErrorOutline, contentDescription = null, tint = StudioCrimson, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Cancel Active Pipeline Stage", color = StudioCrimson)
+                    }
+                }
             }
         }
 

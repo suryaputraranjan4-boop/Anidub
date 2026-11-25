@@ -21,7 +21,7 @@ import androidx.room.RoomDatabase
         AgentJobRecordEntity::class,
         ExportRecordEntity::class
     ],
-    version = 1,
+    version = 3,
     exportSchema = false
 )
 abstract class AnimeDubDatabase : RoomDatabase() {

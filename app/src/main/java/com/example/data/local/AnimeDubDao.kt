@@ -190,6 +190,9 @@ interface AnimeDubDao {
     @Update
     suspend fun updateModel(model: ModelManifestEntity)
 
+    @Query("DELETE FROM model_manifests WHERE modelId NOT IN (:validIds)")
+    suspend fun deleteObsoleteModels(validIds: List<String>)
+
     // Agent Job Records (Processing Center & History)
     @Query("SELECT * FROM agent_job_records WHERE episodeId = :episodeId ORDER BY stageNumber ASC, id DESC")
     fun observeAgentJobsForEpisode(episodeId: Long): Flow<List<AgentJobRecordEntity>>
