@@ -1,0 +1,6 @@
+{
+  "name": "AnimeDub Studio",
+  "description": "Professional Android Anime Dubbing Studio with 7 specialist agents, audio-only speaker analysis, Roman Hinglish Gemini translation, voice cloning batches, and multitrack timeline mixing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
