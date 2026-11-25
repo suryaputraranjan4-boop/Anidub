@@ -1,22 +1,22 @@
 package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -28,521 +28,322 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.VolumeOff
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.example.data.local.AudioStemEntity
 import com.example.data.local.DialogueSegmentEntity
-import com.example.data.local.EpisodeEntity
-import com.example.data.local.SpeakerProfileEntity
 import com.example.data.local.TimelineTrackEntity
-import com.example.data.local.VoiceGenerationRecordEntity
-import com.example.engine.AudioPlaybackState
 import com.example.engine.HinglishTtsNormalizer
-import com.example.ui.components.AudioPlayPreviewButton
+import com.example.ui.components.ActiveContextBar
+import com.example.ui.components.AudioPlayPauseButton
 import com.example.ui.components.AudioWaveformCanvas
+import com.example.ui.components.MetadataChipRow
+import com.example.ui.components.StatusPill
+import com.example.ui.components.StudioCard
+import com.example.ui.components.StudioEmptyState
 import com.example.ui.components.StudioSectionHeader
-import com.example.ui.components.formatTimecodeMs
+import com.example.ui.components.WarningBanner
+import com.example.ui.components.formatShortDate
+import com.example.ui.components.formatTimeMs
+import com.example.ui.components.speakerAccentColor
+import com.example.ui.components.statusColorFor
+import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.StudioAmber
-import com.example.ui.theme.StudioAmberContainer
-import com.example.ui.theme.StudioBackground
 import com.example.ui.theme.StudioBorder
+import com.example.ui.theme.StudioBorderSubtle
 import com.example.ui.theme.StudioCrimson
 import com.example.ui.theme.StudioCyan
-import com.example.ui.theme.StudioCyanContainer
 import com.example.ui.theme.StudioEmerald
-import com.example.ui.theme.StudioEmeraldContainer
 import com.example.ui.theme.StudioSurface
 import com.example.ui.theme.StudioSurfaceElevated
 import com.example.ui.theme.StudioTextMuted
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioViolet
-import com.example.ui.theme.StudioVioletContainer
-import com.example.ui.theme.speakerColorFor
+import com.example.ui.theme.TrackMusic
+import com.example.ui.theme.TrackOriginal
+import com.example.ui.theme.TrackAmbience
+import com.example.viewmodel.MainTab
+import com.example.viewmodel.ProductionSection
+import com.example.viewmodel.StudioViewModel
+import kotlinx.coroutines.launch
+import java.io.File
 
 /**
- * Screen 18 — Agent 5: Voice Generation Studio
+ * VOICE GENERATION STUDIO (AGENT 5)
+ * Displays honest TTS engine availability, character-wise batch queue (All A -> All B -> All C),
+ * authorized voice reference status, measured duration & ms deviation, real playback, and history.
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun VoiceGenerationStudioScreen(
-    dialogues: List<DialogueSegmentEntity>,
-    speakers: List<SpeakerProfileEntity>,
-    generationHistory: List<VoiceGenerationRecordEntity>,
-    selectedTtsEngineId: String,
-    playbackState: AudioPlaybackState,
-    onSelectTtsEngine: (String) -> Unit,
-    onPlayAudio: (String, String) -> Unit,
-    onStopAudio: () -> Unit,
-    onRunAllCharacterBatches: () -> Unit,
-    onRegenerateSingleDialogue: (Long, String, String) -> Unit,
-    onOpenBatchQueue: () -> Unit
-) {
-    var selectedSpeakerFilter by remember { mutableStateOf("ALL") }
-    val engineDescriptor = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.find { it.engineId == selectedTtsEngineId }
+fun VoiceGenerationView(viewModel: StudioViewModel) {
+    val batchDialogues by viewModel.dialoguesCharacterWiseBatches.collectAsState()
+    val speakers by viewModel.speakers.collectAsState()
+    val history by viewModel.voiceGenerationRecords.collectAsState()
+    val config by viewModel.studioConfig.collectAsState()
+    val workerHealth by viewModel.workerHealth.collectAsState()
+    val playback by viewModel.playbackState.collectAsState()
+    val banner by viewModel.pipelineBanner.collectAsState()
+    val scope = rememberCoroutineScope()
+
+    val speakersByLabel = remember(speakers) { speakers.associateBy { it.speakerLabel } }
+    val groupedBatches = remember(batchDialogues) {
+        batchDialogues.groupBy { it.speakerLabel }.toSortedMap()
+    }
+    val selectedEngine = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.find { it.engineId == config.selectedTtsEngine }
         ?: HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.first()
 
-    val filteredDialogues = dialogues.filter {
-        selectedSpeakerFilter == "ALL" || it.speakerLabel == selectedSpeakerFilter
-    }
-
     LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("voice_gen_list"),
+        contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // Honest Engine Availability & Profile Selector
         item {
-            StudioSectionHeader(
-                title = "Agent 5 — Voice Cloning & Generation Studio",
-                subtitle = "Pluggable TTS synthesis with Roman Hinglish pronunciation normalizer & reusable character voice references",
-                badgeText = engineDescriptor.engineId
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = onRunAllCharacterBatches,
-                    colors = ButtonDefaults.buttonColors(containerColor = StudioViolet),
-                    modifier = Modifier.weight(1f).testTag("voice_gen_run_batches_btn")
+            StudioCard(elevated = true) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Default.PlayArrow, contentDescription = null)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Run Character Batches (A → B → C)")
-                }
-                OutlinedButton(onClick = onOpenBatchQueue) {
-                    Text("Batch Queue")
-                }
-            }
-        }
-
-        // Pluggable TTS Engine Selector with Honest Licensing & Experimental Status
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, StudioBorder),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "PLUGGABLE TTS ENGINE INTERFACE",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = StudioCyan
+                    Text("Voice Synthesis Engine", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+                    StatusPill(
+                        text = if (workerHealth?.reachable == true) "REMOTE GPU READY" else "ON-DEVICE DSP",
+                        color = if (workerHealth?.reachable == true) StudioEmerald else StudioCyan
                     )
-                    HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.forEach { engine ->
-                        val isSelected = engine.engineId == engineDescriptor.engineId
-                        Surface(
-                            color = if (isSelected) StudioVioletContainer else StudioSurfaceElevated,
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, if (isSelected) StudioViolet else StudioBorder),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onSelectTtsEngine(engine.engineId) }
-                        ) {
-                            Column(modifier = Modifier.padding(10.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = engine.displayName,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = StudioTextPrimary,
-                                        modifier = Modifier.weight(1f)
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = if (workerHealth?.reachable == true) {
+                        "Remote worker reachable at ${config.remoteWorkerBaseUrl}. Selected profile: ${selectedEngine.displayName}."
+                    } else {
+                        "No remote PyTorch GPU worker connected. Local on-device PCM formant synthesis + WSOLA timing runs locally using ${selectedEngine.engineId} profile parameters."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = StudioTextSecondary
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.forEach { eng ->
+                        FilterChip(
+                            selected = config.selectedTtsEngine == eng.engineId,
+                            onClick = {
+                                scope.launch {
+                                    viewModel.prefsRepo.updateModelSelections(
+                                        asrVariant = config.selectedAsrVariant,
+                                        ttsEngine = eng.engineId,
+                                        separationModel = config.selectedSeparationModel
                                     )
-                                    if (engine.isExperimentalArchived) {
-                                        Surface(color = StudioAmberContainer, shape = RoundedCornerShape(6.dp)) {
-                                            Text(
-                                                text = "ARCHIVED AUG 2026",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = StudioAmber,
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                    }
                                 }
+                            },
+                            label = {
                                 Text(
-                                    text = "License: ${engine.licenseName} • Supported Emotions: ${engine.supportedEmotions.joinToString()}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = StudioTextSecondary
+                                    text = if (eng.isExperimentalArchived) "${eng.engineId} (Archived)" else eng.engineId,
+                                    style = MaterialTheme.typography.labelSmall
                                 )
-                                if (!engine.statusWarning.isNullOrBlank()) {
-                                    Text(
-                                        text = engine.statusWarning,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (engine.isExperimentalArchived) StudioAmber else StudioCyan
-                                    )
-                                }
                             }
-                        }
+                        )
                     }
                 }
-            }
-        }
-
-        // Character Filter
-        item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(
-                    selected = selectedSpeakerFilter == "ALL",
-                    onClick = { selectedSpeakerFilter = "ALL" },
-                    label = { Text("All (${dialogues.size})") }
-                )
-                speakers.forEach { sp ->
-                    FilterChip(
-                        selected = selectedSpeakerFilter == sp.speakerLabel,
-                        onClick = { selectedSpeakerFilter = sp.speakerLabel },
-                        label = { Text("Speaker ${sp.speakerLabel} (${sp.dialogueCount})") }
-                    )
+                if (!selectedEngine.statusWarning.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    WarningBanner(message = selectedEngine.statusWarning)
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = { viewModel.runPipelineStages(9, 12) },
+                    enabled = !banner.isRunning && batchDialogues.any { it.romanHinglishText.isNotBlank() },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("voice_gen_run_batches_btn"),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = StudioViolet,
+                        contentColor = Color(0xFF0A0B0F)
+                    ),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.Default.RecordVoiceOver, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Generate Character Batches (A → B → C) & Mix")
                 }
             }
         }
 
-        // Individual Dialogue Generation Cards (Exposing ONLY model-supported emotion controls!)
-        items(filteredDialogues) { dlg ->
-            val spColor = speakerColorFor(dlg.speakerLabel)
-            var selectedEmotion by remember(dlg.id, dlg.emotion) { mutableStateOf(dlg.emotion) }
+        if (batchDialogues.isEmpty()) {
+            item {
+                StudioEmptyState(
+                    icon = Icons.Default.RecordVoiceOver,
+                    title = "No Dialogues Queued for Voice Generation",
+                    description = "Segment and translate dialogues into Roman Hinglish first to populate the character-wise voice batch queue.",
+                    primaryActionLabel = "Go to Translation",
+                    onPrimaryAction = { viewModel.selectProductionSection(ProductionSection.TRANSLATION) },
+                    testTagPrefix = "voice_gen_empty"
+                )
+            }
+        } else {
+            item {
+                StudioSectionHeader(
+                    title = "Character-Wise Batch Queue",
+                    subtitle = "Executes all Speaker A lines, then Speaker B, then Speaker C while keeping global IDs"
+                )
+            }
 
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, spColor.copy(alpha = 0.55f)),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
+            groupedBatches.entries.forEachIndexed { batchIdx, (speakerLabel, lines) ->
+                val sp = speakersByLabel[speakerLabel]
+                val accent = speakerAccentColor(speakerLabel)
+                item(key = "batch_header_$speakerLabel") {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 6.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "${dlg.dialogueId} • Batch #${dlg.characterBatchNumber} (Item #${dlg.orderInCharacterBatch})",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = spColor,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "Ref: ${dlg.voiceReferenceId}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioCyan
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "Visible Roman Hinglish: \"${dlg.romanHinglishText}\"",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = StudioTextPrimary
-                    )
-                    Text(
-                        text = "Internal TTS Phonetic Layer: ${dlg.ttsNormalizedText}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = StudioCyan
-                    )
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "Original Duration: %.3fs (%d ms)".format(dlg.originalDurationMs / 1000.0, dlg.originalDurationMs),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioTextSecondary
-                        )
-                        Text(
-                            text = "Generated: %.3fs (%d ms, Δ %+d ms)".format(
-                                dlg.actualGeneratedDurationMs / 1000.0,
-                                dlg.actualGeneratedDurationMs,
-                                dlg.durationDeviationMs
-                            ),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioEmerald
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Supported Emotion Controls for ${engineDescriptor.engineId} (No Fake Unsupported Controls Shown):",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = StudioTextMuted
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        engineDescriptor.supportedEmotions.forEach { emo ->
-                            FilterChip(
-                                selected = selectedEmotion == emo,
-                                onClick = { selectedEmotion = emo },
-                                label = { Text(emo) }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            StatusPill(text = "Batch ${batchIdx + 1}", color = accent)
+                            Text(
+                                text = "${sp?.characterName ?: "Speaker $speakerLabel"} (${lines.size} lines)",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = StudioTextPrimary
                             )
                         }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    AudioWaveformCanvas(
-                        audioFilePath = dlg.generatedAudioPath,
-                        accentColor = spColor,
-                        height = 46.dp
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        AudioPlayPreviewButton(
-                            filePath = dlg.generatedAudioPath,
-                            label = "Play ${dlg.dialogueId}",
-                            playbackState = playbackState,
-                            onPlayClick = onPlayAudio,
-                            onStopClick = onStopAudio,
-                            accentColor = spColor
-                        )
-                        if (!dlg.previousGeneratedAudioPath.isNullOrBlank()) {
-                            AudioPlayPreviewButton(
-                                filePath = dlg.previousGeneratedAudioPath,
-                                label = "Compare Prev",
-                                playbackState = playbackState,
-                                onPlayClick = onPlayAudio,
-                                onStopClick = onStopAudio,
-                                accentColor = StudioAmber
-                            )
-                        }
-                        Spacer(modifier = Modifier.weight(1f))
-                        Button(
-                            onClick = { onRegenerateSingleDialogue(dlg.id, dlg.romanHinglishText, selectedEmotion) },
-                            colors = ButtonDefaults.buttonColors(containerColor = StudioViolet)
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Regenerate")
-                        }
-                    }
-                }
-            }
-        }
-
-        if (generationHistory.isNotEmpty()) {
-            item {
-                StudioSectionHeader(
-                    title = "Voice Generation History (${generationHistory.size} Runs)",
-                    subtitle = "Recorded generation passes with engine version, duration & stretch ratio"
-                )
-            }
-            items(generationHistory.take(8)) { rec ->
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                    border = BorderStroke(1.dp, StudioBorder),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(10.dp)) {
-                        Text(
-                            text = "${rec.dialogueId} (Batch ${rec.characterBatchNumber}.${rec.orderInCharacterBatch}) • ${rec.ttsEngine} • ${rec.status}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = StudioCyan
-                        )
-                        Text(
-                            text = "Target: ${rec.targetDurationMs} ms → Actual: ${rec.actualDurationMs} ms (Ratio ${rec.timeStretchRatio}x) • Ref: ${rec.voiceReferenceId}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioTextSecondary
+                        StatusPill(
+                            text = if (sp?.rightsConsentConfirmed == true) "Source Ref" else "Generic Ref",
+                            color = if (sp?.rightsConsentConfirmed == true) StudioEmerald else StudioAmber
                         )
                     }
                 }
-            }
-        }
-    }
-}
 
-/**
- * Screen 19 — Character-Wise Generation Queue (Mandatory Section 4 & Section 12 Comparison)
- * Shows Character-Wise Generation Batches separately from the Final Chronological Timeline!
- */
-@Composable
-fun CharacterWiseGenerationQueueScreen(
-    dialoguesChronological: List<DialogueSegmentEntity>,
-    dialoguesCharacterWise: List<DialogueSegmentEntity>,
-    playbackState: AudioPlaybackState,
-    onPlayAudio: (String, String) -> Unit,
-    onStopAudio: () -> Unit,
-    onRunBatchGeneration: () -> Unit,
-    onRetrySingleDialogue: (DialogueSegmentEntity) -> Unit,
-    onOpenChronologicalTimeline: () -> Unit
-) {
-    val batchesBySpeaker = dialoguesCharacterWise.groupBy { it.speakerLabel }.toSortedMap()
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        item {
-            StudioSectionHeader(
-                title = "Character-Wise Batch Queue vs. Chronological Timeline",
-                subtitle = "Mandatory Rule: Voice synthesis runs character-by-character (All A → All B → All C) while preserving global sequential dialogue IDs",
-                badgeText = "BATCH A → B → C"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = onRunBatchGeneration,
-                    colors = ButtonDefaults.buttonColors(containerColor = StudioViolet),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Re-Run Character-Wise Batches")
-                }
-                OutlinedButton(onClick = onOpenChronologicalTimeline) {
-                    Text("Open Timeline")
-                }
-            }
-        }
-
-        // 1. Character-Wise Generation Batches View
-        batchesBySpeaker.entries.forEachIndexed { index, (speakerLabel, batchList) ->
-            val batchNumber = index + 1
-            val spColor = speakerColorFor(speakerLabel)
-            val sortedBatch = batchList.sortedBy { it.globalOrderNumber }
-
-            item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                    border = BorderStroke(1.dp, spColor),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
+                items(lines.sortedBy { it.globalOrderNumber }, key = { it.id }) { dlg ->
+                    val hasAudio = !dlg.generatedAudioPath.isNullOrBlank() && File(dlg.generatedAudioPath).exists()
+                    StudioCard(padding = 12.dp) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = "PROCESSING BATCH $batchNumber — CHARACTER $speakerLabel",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = spColor,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Surface(color = spColor.copy(alpha = 0.2f), shape = RoundedCornerShape(6.dp)) {
-                                Text(
-                                    text = sortedBatch.joinToString(", ") { it.dialogueId },
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = spColor,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                StatusPill(text = dlg.dialogueId, color = accent)
+                                StatusPill(text = dlg.emotion, color = StudioCyan)
+                                StatusPill(text = dlg.generationStatus, color = statusColorFor(dlg.generationStatus))
+                            }
+                            IconButton(
+                                onClick = {
+                                    if (dlg.romanHinglishText.isNotBlank()) {
+                                        viewModel.updateAndRegenerateSingleDialogue(dlg.id, dlg.romanHinglishText, dlg.emotion)
+                                    }
+                                },
+                                enabled = dlg.romanHinglishText.isNotBlank() && !banner.isRunning,
+                                modifier = Modifier.size(48.dp)
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = "Regenerate ${dlg.dialogueId}", tint = StudioViolet)
                             }
                         }
-                        Spacer(modifier = Modifier.height(10.dp))
 
-                        sortedBatch.forEach { dlg ->
-                            Surface(
-                                color = StudioSurfaceElevated,
-                                shape = RoundedCornerShape(10.dp),
-                                border = BorderStroke(1.dp, StudioBorder),
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = "${dlg.dialogueId} (Original Time: ${formatTimecodeMs(dlg.originalStartMs)} - ${formatTimecodeMs(dlg.originalEndMs)})",
-                                            style = MaterialTheme.typography.labelLarge,
-                                            color = StudioTextPrimary,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Text(
-                                            text = "\"${dlg.romanHinglishText}\"",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = StudioTextSecondary
-                                        )
-                                        Text(
-                                            text = "Actual: ${dlg.actualGeneratedDurationMs} ms • Ref: ${dlg.voiceReferenceId} • Status: ${dlg.generationStatus}",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = StudioEmerald
-                                        )
-                                    }
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        AudioPlayPreviewButton(
-                                            filePath = dlg.generatedAudioPath,
-                                            label = dlg.dialogueId,
-                                            playbackState = playbackState,
-                                            onPlayClick = onPlayAudio,
-                                            onStopClick = onStopAudio,
-                                            accentColor = spColor
-                                        )
-                                        IconButton(onClick = { onRetrySingleDialogue(dlg) }) {
-                                            Icon(Icons.Default.Refresh, contentDescription = "Retry ${dlg.dialogueId}", tint = StudioCyan)
-                                        }
-                                    }
-                                }
-                            }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = dlg.romanHinglishText.ifBlank { "Missing Roman Hinglish translation" },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (dlg.romanHinglishText.isNotBlank()) StudioTextPrimary else StudioAmber
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            AudioPlayPauseButton(
+                                filePath = dlg.generatedAudioPath,
+                                label = "${dlg.dialogueId} Dub",
+                                playbackState = playback,
+                                onTogglePlay = { path, lbl -> viewModel.audioPlayer.togglePlayPause(path, lbl) },
+                                accentColor = accent
+                            )
+                            AudioWaveformCanvas(
+                                audioFilePath = dlg.generatedAudioPath,
+                                accentColor = accent,
+                                modifier = Modifier.weight(1f),
+                                barCount = 44
+                            )
+                        }
+
+                        if (hasAudio) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Target ${dlg.originalDurationMs}ms • Actual ${dlg.actualGeneratedDurationMs}ms • Δ ${if (dlg.durationDeviationMs >= 0) "+" else ""}${dlg.durationDeviationMs}ms • Stretch ${dlg.timeStretchRatio}x",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                color = StudioTextMuted
+                            )
                         }
                     }
                 }
             }
         }
 
-        // 2. Final Reconstructed Chronological Timeline Order Card
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioEmeraldContainer),
-                border = BorderStroke(1.dp, StudioEmerald),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "FINAL RECONSTRUCTED CHRONOLOGICAL TIMELINE (STAGE 11)",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = StudioEmerald,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = dialoguesChronological.joinToString(" → ") { it.dialogueId },
-                        style = MaterialTheme.typography.titleMedium,
-                        color = StudioTextPrimary,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "All generated audio files retain their original global sequential IDs and are restored to their original episode start timestamps.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextSecondary
-                    )
+        // Genuine Generation History
+        if (history.isNotEmpty()) {
+            item {
+                Spacer(modifier = Modifier.height(4.dp))
+                StudioSectionHeader(title = "Generation History", subtitle = "${history.size} recorded take(s)")
+            }
+            items(history.take(6), key = { it.id }) { rec ->
+                StudioCard(padding = 12.dp) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "${rec.dialogueId} • ${rec.ttsEngine} (${rec.emotionRequested})",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = StudioTextPrimary
+                            )
+                            Text(
+                                text = "${rec.actualDurationMs}ms / ${rec.targetDurationMs}ms • ${formatShortDate(rec.createdAt)}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                color = StudioTextMuted
+                            )
+                        }
+                        StatusPill(text = rec.status, color = statusColorFor(rec.status))
+                    }
                 }
             }
         }
@@ -550,644 +351,682 @@ fun CharacterWiseGenerationQueueScreen(
 }
 
 /**
- * Screen 20 — Agent 6: Background Audio Studio
+ * AUDIO STEMS MANAGER (AGENT 6)
+ * Shows only real extracted stems (Protected Original Master, Vocal Stem, Residual Background Accompaniment)
+ * with honest waveforms, play/pause, and real Mute/Solo/Gain controls.
  */
 @Composable
-fun BackgroundAudioStudioScreen(
-    stems: List<AudioStemEntity>,
-    playbackState: AudioPlaybackState,
-    onPlayAudio: (String, String) -> Unit,
-    onStopAudio: () -> Unit,
-    onReRunSeparation: () -> Unit,
-    onOpenStemMixer: () -> Unit
-) {
+fun AudioStemsView(viewModel: StudioViewModel) {
+    val stems by viewModel.audioStems.collectAsState()
+    val playback by viewModel.playbackState.collectAsState()
+    val banner by viewModel.pipelineBanner.collectAsState()
+
     LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("audio_stems_list"),
+        contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
             StudioSectionHeader(
-                title = "Agent 6 — Background Audio Separation Studio",
-                subtitle = "Executed at Stage 3 immediately after extraction and before speaker identification. Lossless Original Master is permanently protected.",
-                badgeText = "UVR MDX-NET / HYBRID"
+                title = "Audio Stems & Separation",
+                subtitle = "Protected lossless master + honest 2-stem vocal & background separation",
+                trailing = {
+                    OutlinedButton(
+                        onClick = { viewModel.runPipelineStages(3, 3) },
+                        enabled = !banner.isRunning,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("Re-Separate", color = StudioCyan)
+                    }
+                }
             )
-            Spacer(modifier = Modifier.height(6.dp))
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioCyanContainer),
-                border = BorderStroke(1.dp, StudioCyan),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    text = "Honest Stem Reporting: Displaying the actual tracks produced by the separator (Protected Lossless Original Master + Dialogue/Vocal Stem + Residual Background/Accompaniment Stem preserving BGM, SFX, footsteps, wind, explosions & ambience).",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = StudioTextPrimary,
-                    modifier = Modifier.padding(12.dp)
+        }
+
+        if (stems.isEmpty()) {
+            item {
+                StudioEmptyState(
+                    icon = Icons.Default.Layers,
+                    title = "No Audio Stems Separated Yet",
+                    description = "Run Stage 3 Background Audio Separation to isolate the vocal track for speaker analysis while preserving music, footsteps, and ambience.",
+                    primaryActionLabel = "Separate Stems (Stage 3)",
+                    onPrimaryAction = { if (!banner.isRunning) viewModel.runPipelineStages(3, 3) },
+                    testTagPrefix = "stems_empty"
                 )
             }
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = onReRunSeparation,
-                    colors = ButtonDefaults.buttonColors(containerColor = StudioViolet),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = null)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Re-Run Stage 3 Stem Separation")
+        } else {
+            items(stems, key = { it.id }) { stem ->
+                val accent = when (stem.stemType) {
+                    "ORIGINAL_MASTER" -> TrackOriginal
+                    "DIALOGUE_VOCAL" -> StudioViolet
+                    "BACKGROUND_ACCOMPANIMENT" -> TrackMusic
+                    else -> TrackAmbience
                 }
-                OutlinedButton(onClick = onOpenStemMixer) {
-                    Text("Stem Mixer")
-                }
-            }
-        }
 
-        items(stems) { stem ->
-            val accent = when (stem.stemType) {
-                "ORIGINAL_MASTER" -> StudioEmerald
-                "DIALOGUE_VOCAL" -> StudioViolet
-                else -> StudioCyan
-            }
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, accent.copy(alpha = 0.6f)),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = stem.displayName,
-                            style = MaterialTheme.typography.titleMedium,
-                            color = StudioTextPrimary,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Surface(color = accent.copy(alpha = 0.16f), shape = RoundedCornerShape(6.dp)) {
-                            Text(
-                                text = "SDR ${(stem.separationQualityScore * 100).toInt()}%",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = accent,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                            )
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Model: ${stem.separatorModelUsed}  •  Peak: ${stem.peakDbfs} dBFS  •  ${stem.sampleRateHz} Hz",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = StudioTextSecondary
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    AudioWaveformCanvas(
-                        audioFilePath = stem.filePath,
-                        accentColor = accent,
-                        height = 54.dp
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    AudioPlayPreviewButton(
-                        filePath = stem.filePath,
-                        label = "Preview ${stem.stemType.replace('_', ' ')}",
-                        playbackState = playbackState,
-                        onPlayClick = onPlayAudio,
-                        onStopClick = onStopAudio,
-                        accentColor = accent
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * Screen 21 — Audio Stem Manager (Gain, Mute & Solo Controls)
- */
-@Composable
-fun AudioStemManagerScreen(
-    stems: List<AudioStemEntity>,
-    playbackState: AudioPlaybackState,
-    onPlayAudio: (String, String) -> Unit,
-    onStopAudio: () -> Unit,
-    onUpdateStemControls: (AudioStemEntity, Float, Boolean, Boolean) -> Unit
-) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            StudioSectionHeader(
-                title = "Audio Stem Mixer & Volume Manager",
-                subtitle = "Independent volume faders, Mute/Solo toggles, and dependency-aware Stage 12 re-mixing (Never reruns TTS voice generation)",
-                badgeText = "${stems.size} STEMS"
-            )
-        }
-
-        items(stems) { stem ->
-            var sliderGain by remember(stem.id, stem.volumeGain) { mutableStateOf(stem.volumeGain) }
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, StudioBorder),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+                StudioCard(padding = 14.dp) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(text = stem.displayName, style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
+                            Text(stem.displayName, style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
                             Text(
-                                text = "Gain: ${(sliderGain * 100).toInt()}% • Peak: ${stem.peakDbfs} dBFS",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = StudioCyan
+                                text = "${stem.separatorModelUsed} • ${stem.sampleRateHz} Hz • Peak ${stem.peakDbfs} dBFS",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                color = StudioTextMuted
                             )
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            FilterChip(
-                                selected = stem.isMuted,
-                                onClick = {
-                                    onUpdateStemControls(stem, sliderGain, !stem.isMuted, stem.isSolo)
-                                },
-                                label = { Text("MUTE") }
-                            )
-                            FilterChip(
-                                selected = stem.isSolo,
-                                onClick = {
-                                    onUpdateStemControls(stem, sliderGain, stem.isMuted, !stem.isSolo)
-                                },
-                                label = { Text("SOLO") }
-                            )
+                        if (stem.stemType == "ORIGINAL_MASTER") {
+                            StatusPill(text = "PROTECTED", color = StudioEmerald)
                         }
                     }
 
-                    Slider(
-                        value = sliderGain,
-                        onValueChange = { sliderGain = it },
-                        onValueChangeFinished = {
-                            onUpdateStemControls(stem, sliderGain, stem.isMuted, stem.isSolo)
-                        },
-                        valueRange = 0f..1.4f
-                    )
-
-                    AudioPlayPreviewButton(
-                        filePath = stem.filePath,
-                        label = "Solo Preview ${stem.stemType}",
-                        playbackState = playbackState,
-                        onPlayClick = onPlayAudio,
-                        onStopClick = onStopAudio
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * Screen 22 — Agent 7: Multitrack Timeline Editor (Flagship Studio Screen)
- */
-@Composable
-fun MultitrackTimelineEditorScreen(
-    activeEpisode: EpisodeEntity?,
-    dialoguesChronological: List<DialogueSegmentEntity>,
-    tracks: List<TimelineTrackEntity>,
-    stems: List<AudioStemEntity>,
-    selectedDialogueId: Long?,
-    zoomLevel: Float,
-    canUndo: Boolean,
-    canRedo: Boolean,
-    playbackState: AudioPlaybackState,
-    onSelectDialogue: (Long?) -> Unit,
-    onZoomChange: (Float) -> Unit,
-    onUndo: () -> Unit,
-    onRedo: () -> Unit,
-    onNudgeDialogueMs: (DialogueSegmentEntity, Long) -> Unit,
-    onRestoreOriginalTimestamp: (DialogueSegmentEntity) -> Unit,
-    onUpdateTrackControls: (TimelineTrackEntity, Float, Boolean, Boolean) -> Unit,
-    onPlayMasterMix: (String, String) -> Unit,
-    onStopAudio: () -> Unit,
-    onRegenerateSingleDialogue: (Long, String, String) -> Unit
-) {
-    val episodeDurationMs = (activeEpisode?.durationMs ?: 32000L).coerceAtLeast(10000L)
-    val horizontalScrollState = rememberScrollState()
-    val pixelsPerSecondDp = (46f * zoomLevel).coerceIn(24f, 130f)
-    val totalTimelineWidthDp = ((episodeDurationMs / 1000f) * pixelsPerSecondDp).dp
-
-    val selectedDialogue = dialoguesChronological.find { it.id == selectedDialogueId }
-        ?: dialoguesChronological.firstOrNull()
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        // Top Transport & Timeline Controls Bar
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, StudioViolet.copy(alpha = 0.6f)),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "MULTITRACK TIMELINE STUDIO (CHRONOLOGICAL ORDER)",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = StudioCyan
-                            )
-                            Text(
-                                text = dialoguesChronological.joinToString(" → ") { it.dialogueId },
-                                style = MaterialTheme.typography.labelLarge,
-                                color = StudioTextPrimary,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            IconButton(
-                                onClick = onUndo,
-                                enabled = canUndo,
-                                modifier = Modifier.testTag("timeline_undo_btn")
-                            ) {
-                                Icon(
-                                    Icons.AutoMirrored.Filled.Undo,
-                                    contentDescription = "Undo Timing Edit",
-                                    tint = if (canUndo) StudioCyan else StudioTextMuted
-                                )
-                            }
-                            IconButton(
-                                onClick = onRedo,
-                                enabled = canRedo,
-                                modifier = Modifier.testTag("timeline_redo_btn")
-                            ) {
-                                Icon(
-                                    Icons.AutoMirrored.Filled.Redo,
-                                    contentDescription = "Redo Timing Edit",
-                                    tint = if (canRedo) StudioCyan else StudioTextMuted
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        val mixPath = activeEpisode?.mixedMasterAudioPath ?: activeEpisode?.originalMasterAudioPath
-                        val isPlayingMaster = playbackState.isPlaying && playbackState.activeFilePath == mixPath
+                        AudioPlayPauseButton(
+                            filePath = stem.filePath,
+                            label = stem.displayName,
+                            playbackState = playback,
+                            onTogglePlay = { path, lbl -> viewModel.audioPlayer.togglePlayPause(path, lbl) },
+                            accentColor = accent
+                        )
+                        AudioWaveformCanvas(
+                            audioFilePath = stem.filePath,
+                            accentColor = accent,
+                            modifier = Modifier.weight(1f),
+                            barCount = 52
+                        )
+                    }
 
-                        Button(
-                            onClick = {
-                                if (isPlayingMaster) {
-                                    onStopAudio()
-                                } else if (!mixPath.isNullOrBlank()) {
-                                    onPlayMasterMix(mixPath, "Synchronized Dubbed Master Mix")
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isPlayingMaster) StudioCrimson else StudioEmerald
-                            ),
-                            modifier = Modifier.testTag("timeline_play_master_btn")
+                    if (stem.stemType != "ORIGINAL_MASTER") {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Icon(
-                                imageVector = if (isPlayingMaster) Icons.Default.Stop else Icons.Default.PlayArrow,
-                                contentDescription = "Play Master Timeline"
+                            FilterChip(
+                                selected = stem.isMuted,
+                                onClick = { viewModel.updateStemControls(stem, stem.volumeGain, !stem.isMuted, stem.isSolo) },
+                                label = { Text("M", fontWeight = FontWeight.Bold) }
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            FilterChip(
+                                selected = stem.isSolo,
+                                onClick = { viewModel.updateStemControls(stem, stem.volumeGain, stem.isMuted, !stem.isSolo) },
+                                label = { Text("S", fontWeight = FontWeight.Bold) }
+                            )
+                            Slider(
+                                value = stem.volumeGain,
+                                onValueChange = { viewModel.updateStemControls(stem, it, stem.isMuted, stem.isSolo) },
+                                valueRange = 0f..1.5f,
+                                modifier = Modifier.weight(1f),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = accent,
+                                    activeTrackColor = accent
+                                )
+                            )
                             Text(
-                                if (isPlayingMaster) {
-                                    "Stop (${formatTimecodeMs(playbackState.currentPositionMs)})"
-                                } else {
-                                    "Play Synchronized Master Mix"
-                                }
+                                text = "${(stem.volumeGain * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                color = StudioTextSecondary
                             )
-                        }
-
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = { onZoomChange(zoomLevel - 0.25f) }) {
-                                Icon(Icons.Default.ZoomOut, contentDescription = "Zoom Out", tint = StudioTextSecondary)
-                            }
-                            Text(
-                                text = "%.1fx".format(zoomLevel),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = StudioCyan
-                            )
-                            IconButton(onClick = { onZoomChange(zoomLevel + 0.25f) }) {
-                                Icon(Icons.Default.ZoomIn, contentDescription = "Zoom In", tint = StudioTextSecondary)
-                            }
                         }
                     }
                 }
             }
         }
+    }
+}
 
-        // Scrollable Multi-Track Timeline Canvas & Character Tracks
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF0A0B10)),
-                border = BorderStroke(1.dp, StudioBorder),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(horizontalScrollState)
-                        .padding(12.dp)
+/**
+ * FLAGSHIP MOBILE DAW MULTITRACK TIMELINE SCREEN
+ * Responsive across portrait and landscape screens.
+ * Features: Transport Play/Pause/Stop + Playhead Scrubber, Zoom, Undo/Redo, Time Ruler,
+ * Character Tracks with Global ID blocks, Background & Original Audio Tracks, Real PCM Waveforms,
+ * Mute/Solo/Volume controls, and Selected Dialogue Timestamp Inspector.
+ */
+@Composable
+fun MultitrackTimelineScreen(viewModel: StudioViewModel) {
+    val activeEpisode by viewModel.activeEpisode.collectAsState()
+    val activeProject by viewModel.activeProject.collectAsState()
+    val tracks by viewModel.timelineTracks.collectAsState()
+    val dialogues by viewModel.dialoguesChronological.collectAsState()
+    val stems by viewModel.audioStems.collectAsState()
+    val selectedDialogueId by viewModel.selectedDialogueId.collectAsState()
+    val playback by viewModel.playbackState.collectAsState()
+    val zoom by viewModel.timelineZoom.collectAsState()
+    val canUndo by viewModel.canUndo.collectAsState()
+    val canRedo by viewModel.canRedo.collectAsState()
+    val banner by viewModel.pipelineBanner.collectAsState()
+
+    val ep = activeEpisode
+    if (ep == null) {
+        Box(modifier = Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
+            StudioEmptyState(
+                icon = Icons.Default.GraphicEq,
+                title = "No Active Timeline",
+                description = "Import an anime episode in Projects to arrange dialogue clips, adjust timestamps, and mix multitrack stems.",
+                primaryActionLabel = "Create Project & Import Episode",
+                onPrimaryAction = { viewModel.openGuidedNewProject() },
+                testTagPrefix = "timeline_empty_no_ep"
+            )
+        }
+        return
+    }
+
+    val mixedPath = ep.mixedMasterAudioPath?.takeIf { File(it).exists() }
+        ?: ep.originalMasterAudioPath.takeIf { File(it).exists() }
+    val totalDurMs = ep.durationMs.coerceAtLeast(1000L)
+    val selectedDialogue = dialogues.find { it.id == selectedDialogueId } ?: dialogues.firstOrNull()
+    val isMasterPlaying = playback.isPlaying && playback.activeFilePath == mixedPath
+
+    val bgStemPath = stems.find { it.stemType == "BACKGROUND_ACCOMPANIMENT" }?.filePath
+    val origStemPath = stems.find { it.stemType == "ORIGINAL_MASTER" }?.filePath ?: ep.originalMasterAudioPath
+    val sfxStemPath = stems.find { it.stemType == "SFX_AMBIENCE" }?.filePath
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("multitrack_timeline_screen")
+    ) {
+        // Active Context Strip
+        Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            ActiveContextBar(
+                project = activeProject,
+                episode = ep,
+                onSwitchProject = { viewModel.selectTab(MainTab.PROJECTS) }
+            )
+        }
+
+        // DAW Transport Bar + Zoom + Undo/Redo
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            color = StudioSurface,
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, StudioBorderSubtle)
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // 1. Horizontal Time Ruler (00:00.000 to 00:32.000)
-                    val totalSeconds = (episodeDurationMs / 1000L).toInt()
-                    Box(
-                        modifier = Modifier
-                            .width(totalTimelineWidthDp)
-                            .height(28.dp)
-                            .background(StudioSurfaceElevated, RoundedCornerShape(6.dp))
-                    ) {
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            val secWidthPx = size.width / totalSeconds.coerceAtLeast(1)
-                            for (sec in 0..totalSeconds) {
-                                val x = sec * secWidthPx
-                                drawLine(
-                                    color = if (sec % 5 == 0) StudioCyan else StudioBorder,
-                                    start = Offset(x, if (sec % 5 == 0) 0f else size.height * 0.5f),
-                                    end = Offset(x, size.height),
-                                    strokeWidth = if (sec % 5 == 0) 2.5f else 1f
-                                )
-                            }
-                        }
-                        for (sec in 0..totalSeconds step 2) {
-                            Text(
-                                text = "%02d:%02d.0".format(sec / 60, sec % 60),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = StudioTextSecondary,
-                                modifier = Modifier
-                                    .offset(x = (sec * pixelsPerSecondDp).dp + 3.dp, y = 2.dp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = {
+                                if (!mixedPath.isNullOrBlank()) {
+                                    viewModel.audioPlayer.togglePlayPause(
+                                        mixedPath,
+                                        "Master Mix",
+                                        playback.currentPositionMs
+                                    )
+                                }
+                            },
+                            enabled = !mixedPath.isNullOrBlank(),
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("timeline_play_pause_btn")
+                        ) {
+                            Icon(
+                                imageVector = if (isMasterPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = if (isMasterPlaying) "Pause master" else "Play master",
+                                tint = StudioViolet
                             )
                         }
+                        IconButton(
+                            onClick = { viewModel.audioPlayer.stop() },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(Icons.Default.Stop, contentDescription = "Stop playback", tint = StudioTextSecondary)
+                        }
+                        Text(
+                            text = "${formatTimeMs(playback.currentPositionMs)} / ${formatTimeMs(totalDurMs)}",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontFamily = JetBrainsMonoFamily,
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            color = StudioTextPrimary
+                        )
                     }
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = { viewModel.undoTimelineEdit() },
+                            enabled = canUndo,
+                            modifier = Modifier.size(48.dp).testTag("timeline_undo_btn")
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo", tint = if (canUndo) StudioCyan else StudioTextMuted)
+                        }
+                        IconButton(
+                            onClick = { viewModel.redoTimelineEdit() },
+                            enabled = canRedo,
+                            modifier = Modifier.size(48.dp).testTag("timeline_redo_btn")
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = "Redo", tint = if (canRedo) StudioCyan else StudioTextMuted)
+                        }
+                        IconButton(
+                            onClick = { viewModel.setTimelineZoom(zoom - 0.35f) },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(Icons.Default.ZoomOut, contentDescription = "Zoom out", tint = StudioTextSecondary)
+                        }
+                        IconButton(
+                            onClick = { viewModel.setTimelineZoom(zoom + 0.35f) },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(Icons.Default.ZoomIn, contentDescription = "Zoom in", tint = StudioTextSecondary)
+                        }
+                    }
+                }
 
-                    // 2. Character Dialogue Tracks (Speaker A, Speaker B, Speaker C)
-                    val distinctSpeakers = dialoguesChronological.map { it.speakerLabel }.distinct().sorted()
-                    distinctSpeakers.forEach { spLabel ->
-                        val spColor = speakerColorFor(spLabel)
-                        val spDialogues = dialoguesChronological.filter { it.speakerLabel == spLabel }
-                        val matchingTrack = tracks.find { it.speakerLabel == spLabel }
+                // Responsive Playhead Scrubber
+                Slider(
+                    value = playback.currentPositionMs.toFloat().coerceIn(0f, totalDurMs.toFloat()),
+                    onValueChange = { viewModel.audioPlayer.seekTo(it.toLong()) },
+                    valueRange = 0f..totalDurMs.toFloat(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(28.dp)
+                        .testTag("timeline_scrubber"),
+                    colors = SliderDefaults.colors(
+                        thumbColor = StudioCyan,
+                        activeTrackColor = StudioViolet,
+                        inactiveTrackColor = StudioBorder
+                    )
+                )
+            }
+        }
 
-                        Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(bottom = 3.dp)
-                            ) {
-                                Surface(
-                                    color = spColor.copy(alpha = 0.22f),
-                                    shape = RoundedCornerShape(4.dp)
-                                ) {
+        Spacer(modifier = Modifier.height(10.dp))
+
+        if (tracks.isEmpty()) {
+            Box(modifier = Modifier.weight(1f).padding(16.dp), contentAlignment = Alignment.Center) {
+                StudioEmptyState(
+                    icon = Icons.Default.GraphicEq,
+                    title = "Multitrack Timeline Not Built Yet",
+                    description = "Run Stage 11 Timeline Reconstruction after speaker identification and voice generation to lay out character dialogue and background audio lanes.",
+                    primaryActionLabel = "Build Timeline (Stage 11–12)",
+                    onPrimaryAction = { if (!banner.isRunning) viewModel.runPipelineStages(11, 12) },
+                    secondaryActionLabel = "Open Production Pipeline",
+                    onSecondaryAction = { viewModel.selectProductionSection(ProductionSection.PIPELINE) },
+                    testTagPrefix = "timeline_empty_tracks"
+                )
+            }
+            return
+        }
+
+        // Responsive Landscape (Side-by-Side Lanes + Inspector) vs Portrait (Stacked)
+        BoxWithConstraints(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+        ) {
+            val isLandscapeWide = maxWidth >= 660.dp
+            val timelineScroll = rememberScrollState()
+            val pxPerSecondDp = (46f * zoom).dp
+            val totalSeconds = ((totalDurMs + 999L) / 1000L).coerceAtLeast(10L)
+            val canvasWidthDp = pxPerSecondDp * totalSeconds.toInt()
+            val playheadFraction = (playback.currentPositionMs.toFloat() / totalDurMs.toFloat()).coerceIn(0f, 1f)
+
+            val lanesBlock: @Composable (Modifier) -> Unit = { mod ->
+                Surface(
+                    modifier = mod,
+                    color = StudioSurface,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, StudioBorderSubtle)
+                ) {
+                    LazyColumn(
+                        contentPadding = PaddingValues(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // Time Ruler Row
+                        item(key = "ruler") {
+                            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Box(modifier = Modifier.width(120.dp)) {
                                     Text(
-                                        text = matchingTrack?.trackTitle ?: "Character Track $spLabel",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = spColor,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                        text = "TRACKS (${tracks.size})",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                        color = StudioTextMuted
                                     )
                                 }
-                                if (matchingTrack != null) {
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Icon(
-                                        imageVector = if (matchingTrack.isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
-                                        contentDescription = "Mute Track $spLabel",
-                                        tint = if (matchingTrack.isMuted) StudioCrimson else StudioTextSecondary,
-                                        modifier = Modifier
-                                            .size(16.dp)
-                                            .clickable {
-                                                onUpdateTrackControls(
-                                                    matchingTrack,
-                                                    matchingTrack.volumeGain,
-                                                    !matchingTrack.isMuted,
-                                                    matchingTrack.isSolo
-                                                )
-                                            }
-                                    )
-                                }
-                            }
-
-                            Box(
-                                modifier = Modifier
-                                    .width(totalTimelineWidthDp)
-                                    .height(64.dp)
-                                    .background(StudioSurface, RoundedCornerShape(8.dp))
-                                    .border(1.dp, StudioBorder, RoundedCornerShape(8.dp))
-                            ) {
-                                spDialogues.forEach { dlg ->
-                                    val startOffsetDp = ((dlg.timelineStartMs / 1000f) * pixelsPerSecondDp).dp
-                                    val durMs = if (dlg.actualGeneratedDurationMs > 0) dlg.actualGeneratedDurationMs else dlg.originalDurationMs
-                                    val blockWidthDp = (((durMs / 1000f) * pixelsPerSecondDp).coerceAtLeast(52f)).dp
-                                    val isSelected = dlg.id == selectedDialogue?.id
-
-                                    // Check overlap with any dialogue on another track
-                                    val hasOverlap = dialoguesChronological.any { other ->
-                                        other.id != dlg.id &&
-                                            dlg.timelineStartMs < (other.timelineStartMs + other.originalDurationMs) &&
-                                            (dlg.timelineStartMs + durMs) > other.timelineStartMs
-                                    }
-
-                                    Box(
-                                        modifier = Modifier
-                                            .offset(x = startOffsetDp, y = 4.dp)
-                                            .width(blockWidthDp)
-                                            .height(56.dp)
-                                            .background(
-                                                spColor.copy(alpha = if (isSelected) 0.34f else 0.18f),
-                                                RoundedCornerShape(8.dp)
-                                            )
-                                            .border(
-                                                width = if (isSelected) 2.dp else 1.dp,
-                                                color = if (hasOverlap) StudioAmber else spColor,
-                                                shape = RoundedCornerShape(8.dp)
-                                            )
-                                            .clickable { onSelectDialogue(dlg.id) }
-                                            .padding(horizontal = 6.dp, vertical = 4.dp)
-                                    ) {
-                                        Column {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween
-                                            ) {
-                                                Text(
-                                                    text = dlg.dialogueId,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = spColor,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                                Text(
-                                                    text = "%.2fs".format(durMs / 1000.0),
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = StudioTextSecondary
-                                                )
-                                            }
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .horizontalScroll(timelineScroll)
+                                ) {
+                                    Row(modifier = Modifier.width(canvasWidthDp)) {
+                                        val stepSec = if (totalSeconds > 120L) 10 else if (totalSeconds > 40L) 5 else 2
+                                        var sec = 0L
+                                        while (sec <= totalSeconds) {
                                             Text(
-                                                text = dlg.romanHinglishText,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = StudioTextPrimary,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
+                                                text = formatTimeMs(sec * 1000L).substringBeforeLast('.'),
+                                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                                color = StudioTextMuted,
+                                                modifier = Modifier.width(pxPerSecondDp * stepSec)
                                             )
-                                            AudioWaveformCanvas(
-                                                audioFilePath = dlg.generatedAudioPath,
-                                                accentColor = spColor,
-                                                height = 18.dp,
-                                                barCount = 16
-                                            )
+                                            sec += stepSec
                                         }
                                     }
                                 }
                             }
+                            HorizontalDivider(color = StudioBorderSubtle, modifier = Modifier.padding(top = 6.dp))
                         }
-                    }
 
-                    // 3. Preserved Background Music & SFX/Ambience Stems Tracks
-                    val bgStem = stems.find { it.stemType == "BACKGROUND_ACCOMPANIMENT" }
-                    Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                        Text(
-                            text = "Track BGM + SFX + Ambience: Residual Background Accompaniment Stem (Preserved)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioCyan
-                        )
-                        Spacer(modifier = Modifier.height(3.dp))
-                        Box(
-                            modifier = Modifier
-                                .width(totalTimelineWidthDp)
-                                .height(46.dp)
-                                .background(StudioCyanContainer.copy(alpha = 0.35f), RoundedCornerShape(8.dp))
-                                .border(1.dp, StudioCyan.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
-                                .padding(4.dp)
-                        ) {
-                            AudioWaveformCanvas(
-                                audioFilePath = bgStem?.filePath ?: activeEpisode?.originalMasterAudioPath,
-                                accentColor = StudioCyan,
-                                height = 38.dp,
-                                barCount = 96
-                            )
+                        // Individual DAW Tracks
+                        items(tracks, key = { it.id }) { track ->
+                            val trackColor = when (track.trackType) {
+                                "CHARACTER" -> speakerAccentColor(track.speakerLabel ?: "A")
+                                "BGM_MUSIC" -> TrackMusic
+                                "SFX_AMBIENCE" -> TrackAmbience
+                                else -> TrackOriginal
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(72.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Left Track Control Header (Mute / Solo / Title)
+                                Column(
+                                    modifier = Modifier
+                                        .width(120.dp)
+                                        .fillMaxHeight()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(StudioSurfaceElevated)
+                                        .border(1.dp, StudioBorderSubtle, RoundedCornerShape(8.dp))
+                                        .padding(6.dp),
+                                    verticalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = track.trackTitle,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = StudioTextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        MiniDawToggle("M", track.isMuted, StudioCrimson) {
+                                            viewModel.updateTimelineTrackControls(track, track.volumeGain, !track.isMuted, track.isSolo)
+                                        }
+                                        MiniDawToggle("S", track.isSolo, StudioAmber) {
+                                            viewModel.updateTimelineTrackControls(track, track.volumeGain, track.isMuted, !track.isSolo)
+                                        }
+                                        Text(
+                                            text = "${(track.volumeGain * 100).toInt()}%",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                            color = StudioTextMuted
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.width(8.dp))
+
+                                // Right Scrollable Track Lane
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(StudioSurfaceElevated.copy(alpha = 0.55f))
+                                        .border(1.dp, StudioBorderSubtle, RoundedCornerShape(8.dp))
+                                        .horizontalScroll(timelineScroll)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(canvasWidthDp)
+                                            .fillMaxHeight()
+                                    ) {
+                                        if (track.trackType == "CHARACTER") {
+                                            val trackDialogues = dialogues.filter { it.speakerLabel == track.speakerLabel }
+                                            trackDialogues.forEach { dlg ->
+                                                val leftDp = pxPerSecondDp * (dlg.timelineStartMs / 1000f)
+                                                val durSec = ((dlg.actualGeneratedDurationMs.takeIf { it > 0L } ?: dlg.originalDurationMs) / 1000f).coerceAtLeast(0.5f)
+                                                val blockW = (pxPerSecondDp * durSec).coerceAtLeast(58.dp)
+                                                val isSel = selectedDialogue?.id == dlg.id
+
+                                                Surface(
+                                                    modifier = Modifier
+                                                        .offset(x = leftDp, y = 6.dp)
+                                                        .width(blockW)
+                                                        .height(60.dp)
+                                                        .clickable { viewModel.selectDialogue(dlg.id) }
+                                                        .testTag("timeline_clip_${dlg.dialogueId}"),
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    color = trackColor.copy(alpha = if (isSel) 0.34f else 0.18f),
+                                                    border = BorderStroke(
+                                                        width = if (isSel) 1.5.dp else 1.dp,
+                                                        color = if (isSel) trackColor else trackColor.copy(alpha = 0.55f)
+                                                    )
+                                                ) {
+                                                    Column(
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                                        verticalArrangement = Arrangement.SpaceBetween
+                                                    ) {
+                                                        Text(
+                                                            text = dlg.dialogueId,
+                                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                                fontFamily = JetBrainsMonoFamily,
+                                                                fontWeight = FontWeight.Bold
+                                                            ),
+                                                            color = StudioTextPrimary,
+                                                            maxLines = 1
+                                                        )
+                                                        Text(
+                                                            text = dlg.romanHinglishText.ifBlank { dlg.japaneseText.ifBlank { "Segment" } },
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = StudioTextSecondary,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            val stemFile = when (track.trackType) {
+                                                "BGM_MUSIC" -> bgStemPath
+                                                "SFX_AMBIENCE" -> sfxStemPath
+                                                else -> origStemPath
+                                            }
+                                            AudioWaveformCanvas(
+                                                audioFilePath = stemFile,
+                                                accentColor = trackColor,
+                                                barCount = 96,
+                                                playbackProgress = playheadFraction,
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .padding(horizontal = 4.dp, vertical = 14.dp)
+                                            )
+                                        }
+
+                                        // Playhead vertical line
+                                        Box(
+                                            modifier = Modifier
+                                                .offset(x = canvasWidthDp * playheadFraction)
+                                                .width(2.dp)
+                                                .fillMaxHeight()
+                                                .background(StudioCyan)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Selected Dialogue Block Inspector & Manual Timing Correction (Without shifting subsequent dialogues!)
-        if (selectedDialogue != null) {
-            val spColor = speakerColorFor(selectedDialogue.speakerLabel)
-            item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                    border = BorderStroke(1.dp, spColor),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth()
+            val inspectorBlock: @Composable (Modifier) -> Unit = { mod ->
+                SelectedDialogueInspectorCard(
+                    dialogue = selectedDialogue,
+                    tracks = tracks,
+                    playback = playback,
+                    viewModel = viewModel,
+                    modifier = mod
+                )
+            }
+
+            if (isLandscapeWide) {
+                Row(
+                    modifier = Modifier.fillMaxSize().padding(bottom = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Selected Block: ${selectedDialogue.dialogueId} (Speaker ${selectedDialogue.speakerLabel})",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = spColor,
-                                fontWeight = FontWeight.Bold
-                            )
-                            AudioPlayPreviewButton(
-                                filePath = selectedDialogue.generatedAudioPath,
-                                label = "Preview ${selectedDialogue.dialogueId}",
-                                playbackState = playbackState,
-                                onPlayClick = onPlayMasterMix,
-                                onStopClick = onStopAudio,
-                                accentColor = spColor
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "Original Timestamp: ${formatTimecodeMs(selectedDialogue.originalStartMs)} → ${formatTimecodeMs(selectedDialogue.originalEndMs)} (%.3fs)".format(
-                                selectedDialogue.originalDurationMs / 1000.0
-                            ),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = StudioTextSecondary
-                        )
-                        Text(
-                            text = "Current Timeline Position: ${formatTimecodeMs(selectedDialogue.timelineStartMs)}  •  Actual Generated Duration: %.3fs (%d ms)".format(
-                                selectedDialogue.actualGeneratedDurationMs / 1000.0,
-                                selectedDialogue.actualGeneratedDurationMs
-                            ),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = StudioEmerald
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "Roman Hinglish: \"${selectedDialogue.romanHinglishText}\"",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = StudioTextPrimary
-                        )
-                        Text(
-                            text = "Japanese Source: ${selectedDialogue.japaneseText}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = StudioTextMuted
-                        )
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Text(
-                            text = "Manual Timing Correction (Independent Placement — Never shifts subsequent dialogues forward):",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioCyan
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            OutlinedButton(
-                                onClick = { onNudgeDialogueMs(selectedDialogue, -100L) },
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("-100 ms")
-                            }
-                            OutlinedButton(
-                                onClick = { onNudgeDialogueMs(selectedDialogue, +100L) },
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("+100 ms")
-                            }
-                            OutlinedButton(
-                                onClick = { onRestoreOriginalTimestamp(selectedDialogue) },
-                                modifier = Modifier.weight(1.2f)
-                            ) {
-                                Icon(Icons.Default.Restore, contentDescription = null, modifier = Modifier.size(15.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Reset Orig")
-                            }
-                            Button(
-                                onClick = {
-                                    onRegenerateSingleDialogue(
-                                        selectedDialogue.id,
-                                        selectedDialogue.romanHinglishText,
-                                        selectedDialogue.emotion
-                                    )
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = StudioViolet)
-                            ) {
-                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
-                            }
-                        }
-                    }
+                    lanesBlock(Modifier.weight(1.5f).fillMaxHeight())
+                    inspectorBlock(Modifier.weight(1f).fillMaxHeight())
+                }
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    lanesBlock(Modifier.weight(1f).fillMaxWidth())
+                    inspectorBlock(Modifier.fillMaxWidth())
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MiniDawToggle(
+    label: String,
+    active: Boolean,
+    activeColor: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .size(width = 28.dp, height = 26.dp)
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(5.dp),
+        color = if (active) activeColor.copy(alpha = 0.25f) else StudioSurface,
+        border = BorderStroke(1.dp, if (active) activeColor else StudioBorderSubtle)
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                color = if (active) activeColor else StudioTextMuted
+            )
+        }
+    }
+}
+
+@Composable
+private fun SelectedDialogueInspectorCard(
+    dialogue: DialogueSegmentEntity?,
+    tracks: List<TimelineTrackEntity>,
+    playback: com.example.engine.AudioPlaybackState,
+    viewModel: StudioViewModel,
+    modifier: Modifier = Modifier
+) {
+    StudioCard(modifier = modifier, padding = 12.dp) {
+        if (dialogue == null) {
+            Text("Clip Inspector", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "Tap any dialogue clip on the timeline to inspect its audio waveform, adjust start timing, or preview playback.",
+                style = MaterialTheme.typography.bodySmall,
+                color = StudioTextSecondary
+            )
+        } else {
+            val accent = speakerAccentColor(dialogue.speakerLabel)
+            val clipAudio = dialogue.generatedAudioPath?.takeIf { File(it).exists() } ?: dialogue.originalAudioSlicePath
+            val matchingTrack = tracks.find { it.speakerLabel == dialogue.speakerLabel }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    StatusPill(text = dialogue.dialogueId, color = accent)
+                    Text(
+                        text = "${formatTimeMs(dialogue.timelineStartMs)} (Orig ${formatTimeMs(dialogue.originalStartMs)})",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                        color = StudioTextSecondary
+                    )
+                }
+                AudioPlayPauseButton(
+                    filePath = clipAudio,
+                    label = dialogue.dialogueId,
+                    playbackState = playback,
+                    onTogglePlay = { path, lbl -> viewModel.audioPlayer.togglePlayPause(path, lbl) },
+                    accentColor = accent
+                )
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = dialogue.romanHinglishText.ifBlank { dialogue.japaneseText.ifBlank { "No text" } },
+                style = MaterialTheme.typography.bodySmall,
+                color = StudioTextPrimary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+            AudioWaveformCanvas(audioFilePath = clipAudio, accentColor = accent, barCount = 48)
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { viewModel.adjustDialogueTimelinePosition(dialogue, -100L) },
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp)
+                ) {
+                    Text("-100ms", style = MaterialTheme.typography.labelSmall, color = StudioTextPrimary)
+                }
+                OutlinedButton(
+                    onClick = { viewModel.adjustDialogueTimelinePosition(dialogue, 100L) },
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp)
+                ) {
+                    Text("+100ms", style = MaterialTheme.typography.labelSmall, color = StudioTextPrimary)
+                }
+                OutlinedButton(
+                    onClick = { viewModel.restoreDialogueOriginalTimestamp(dialogue) },
+                    enabled = dialogue.timelineStartMs != dialogue.originalStartMs,
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp)
+                ) {
+                    Icon(Icons.Default.RestartAlt, contentDescription = "Reset start", tint = StudioCyan, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(2.dp))
+                    Text("Reset", style = MaterialTheme.typography.labelSmall, color = StudioTextPrimary)
+                }
+            }
+
+            if (matchingTrack != null) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Track Gain", style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
+                    Slider(
+                        value = matchingTrack.volumeGain,
+                        onValueChange = { viewModel.updateTimelineTrackControls(matchingTrack, it, matchingTrack.isMuted, matchingTrack.isSolo) },
+                        valueRange = 0f..1.5f,
+                        modifier = Modifier.weight(1f).height(24.dp),
+                        colors = SliderDefaults.colors(thumbColor = accent, activeTrackColor = accent)
+                    )
+                    Text(
+                        text = "${(matchingTrack.volumeGain * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                        color = StudioTextSecondary
+                    )
                 }
             }
         }

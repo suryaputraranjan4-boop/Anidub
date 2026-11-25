@@ -1,6 +1,8 @@
 package com.example.viewmodel
 
 import android.app.Application
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -27,6 +29,8 @@ import com.example.data.remote.RemoteWorkerClient
 import com.example.data.remote.WorkerHealthStatus
 import com.example.engine.AudioDspEngine
 import com.example.engine.AudioPlaybackState
+import com.example.engine.HinglishTtsNormalizer
+import com.example.engine.MediaExtractionResult
 import com.example.engine.ModelDownloadManager
 import com.example.engine.StudioAudioPlayer
 import kotlinx.coroutines.Dispatchers
@@ -35,45 +39,85 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
 
-/**
- * All 28 Required Screens in AnimeDub Studio.
- */
-enum class StudioScreen(val title: String, val sectionGroup: String) {
-    SPLASH("Splash Screen", "Core"),
-    ONBOARDING("Studio Onboarding", "Core"),
-    DASHBOARD("Production Dashboard", "Studio"),
-    PROJECT_LIBRARY("Project Library", "Studio"),
-    NEW_PROJECT("New Dubbing Project", "Studio"),
-    VIDEO_UPLOAD("Video Upload Studio", "Studio"),
-    MEDIA_INFORMATION("Media Information Inspector", "Studio"),
-    PROCESSING_CENTER("14-Stage Processing Center", "Pipeline"),
-    AGENT_PROCESSING_DETAILS("7 Specialist Agents Inspector", "Pipeline"),
-    JAPANESE_TRANSCRIPT_STUDIO("Agent 1: Japanese Transcript Studio", "Pipeline"),
-    DIALOGUE_SEGMENTATION_EDITOR("Agent 2: Dialogue Segmentation Editor", "Pipeline"),
-    SPEAKER_LIBRARY("Agent 3: Audio-Only Speaker Library", "Voices"),
-    CHARACTER_VOICE_PROFILES("Character Voice Profiles & Consent", "Voices"),
-    VOICE_ANALYSIS_DETAILS("Acoustic & F0 Voice Analysis Details", "Voices"),
-    TRANSLATION_STUDIO("Agent 4: Gemini Roman Hinglish Studio", "Voices"),
-    GLOBAL_DICTIONARY("Global Dubbing Dictionary", "Voices"),
-    ANIME_DICTIONARY("Anime & Project Dictionary", "Voices"),
-    VOICE_GENERATION_STUDIO("Agent 5: Voice Generation Studio", "Timeline"),
-    CHARACTER_WISE_GENERATION_QUEUE("Character-Wise Batch Queue (A → B → C)", "Timeline"),
-    BACKGROUND_AUDIO_STUDIO("Agent 6: Background Audio Studio", "Timeline"),
-    AUDIO_STEM_MANAGER("Audio Stem Mixer & Gain Manager", "Timeline"),
-    MULTITRACK_TIMELINE_EDITOR("Agent 7: Multitrack Timeline Studio", "Timeline"),
-    QUALITY_CONTROL_CENTER("13-Point Quality Control Center", "Models & QC"),
-    FINAL_EXPORT_STUDIO("Stage 14: Final Export Studio", "Models & QC"),
-    MODEL_MANAGER("Verified AI Model Manager", "Models & QC"),
-    MODEL_DOWNLOAD_DETAILS("Model Manifest & Checksum Inspector", "Models & QC"),
-    PROJECT_PROCESSING_HISTORY("Project Processing & Audit History", "Models & QC"),
-    SETTINGS("Studio & Self-Hosted Worker Settings", "Models & QC")
+enum class MainTab(val label: String) {
+    HOME("Home"),
+    PROJECTS("Projects"),
+    PRODUCTION("Production"),
+    TIMELINE("Timeline"),
+    MODELS("Models")
 }
+
+enum class ProductionSection(val label: String) {
+    PIPELINE("Pipeline"),
+    TRANSCRIPT("Transcript"),
+    SPEAKERS("Speakers"),
+    TRANSLATION("Translate"),
+    VOICE_GEN("Voice Gen"),
+    AUDIO_STEMS("Stems"),
+    QC_EXPORT("QC & Export")
+}
+
+enum class StudioOverlay {
+    NONE,
+    GUIDED_IMPORT,
+    MODEL_DETAIL,
+    PROCESSING_HISTORY,
+    SETTINGS
+}
+
+enum class ProjectSortOrder(val label: String) {
+    RECENT("Recently Updated"),
+    TITLE_ASC("Title A–Z"),
+    SERIES("Series Name")
+}
+
+enum class MediaInspectionStatus {
+    IDLE,
+    LOADING,
+    READY,
+    UNSUPPORTED,
+    MISSING_AUDIO,
+    EXTRACTION_FAILED
+}
+
+data class InspectedMediaInfo(
+    val fileName: String = "",
+    val formatLabel: String = "",
+    val fileSizeBytes: Long = 0L,
+    val durationMs: Long = 0L,
+    val resolution: String = "",
+    val frameRateFps: Float = 0f,
+    val hasVideoTrack: Boolean = false,
+    val hasAudioTrack: Boolean = false,
+    val audioCodec: String = "",
+    val audioSampleRateHz: Int = 24000,
+    val audioChannels: Int = 1,
+    val localSourcePath: String = "",
+    val extractedWavPath: String = "",
+    val errorMessage: String? = null
+)
+
+data class GuidedImportState(
+    val step: Int = 1, // 1..5
+    val existingProjectId: Long? = null,
+    val projectTitle: String = "",
+    val animeSeriesName: String = "",
+    val sampleRateHz: Int = 24000,
+    val preferredTtsEngine: String = "XTTS-v2",
+    val episodeNumber: Int = 1,
+    val episodeTitle: String = "",
+    val mediaStatus: MediaInspectionStatus = MediaInspectionStatus.IDLE,
+    val inspectedMedia: InspectedMediaInfo? = null,
+    val isCommitting: Boolean = false
+)
 
 data class PipelineBannerState(
     val isRunning: Boolean = false,
@@ -86,7 +130,7 @@ data class PipelineBannerState(
 
 data class UndoTimelineSnapshot(
     val description: String,
-    val dialogueTimestamps: Map<Long, Long> // dialogue.id -> timelineStartMs
+    val dialogueTimestamps: Map<Long, Long>
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -100,22 +144,30 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val workerClient = RemoteWorkerClient()
     val audioPlayer = StudioAudioPlayer(viewModelScope)
 
-    // Navigation stack supporting all 28 required screens with proper back navigation
-    private val _screenStack = MutableStateFlow(listOf(StudioScreen.SPLASH))
-    private val _currentScreen = MutableStateFlow(StudioScreen.SPLASH)
-    val currentScreen: StateFlow<StudioScreen> = _currentScreen.asStateFlow()
+    // 5-Tab Primary Navigation + Contextual Production Section + Focused Overlays
+    private val _activeTab = MutableStateFlow(MainTab.HOME)
+    val activeTab: StateFlow<MainTab> = _activeTab.asStateFlow()
 
-    private val _selectedAgentNumber = MutableStateFlow(1)
-    val selectedAgentNumber: StateFlow<Int> = _selectedAgentNumber.asStateFlow()
+    private val _productionSection = MutableStateFlow(ProductionSection.PIPELINE)
+    val productionSection: StateFlow<ProductionSection> = _productionSection.asStateFlow()
 
-    private val _selectedModelId = MutableStateFlow("faster_whisper_large_v3")
+    private val _activeOverlay = MutableStateFlow(StudioOverlay.NONE)
+    val activeOverlay: StateFlow<StudioOverlay> = _activeOverlay.asStateFlow()
+
+    private val _selectedModelId = MutableStateFlow("silero_vad_onnx")
     val selectedModelId: StateFlow<String> = _selectedModelId.asStateFlow()
-
-    private val _selectedSpeakerLabel = MutableStateFlow("A")
-    val selectedSpeakerLabel: StateFlow<String> = _selectedSpeakerLabel.asStateFlow()
 
     private val _selectedDialogueId = MutableStateFlow<Long?>(null)
     val selectedDialogueId: StateFlow<Long?> = _selectedDialogueId.asStateFlow()
+
+    private val _projectSearchQuery = MutableStateFlow("")
+    val projectSearchQuery: StateFlow<String> = _projectSearchQuery.asStateFlow()
+
+    private val _projectSortOrder = MutableStateFlow(ProjectSortOrder.RECENT)
+    val projectSortOrder: StateFlow<ProjectSortOrder> = _projectSortOrder.asStateFlow()
+
+    private val _guidedImport = MutableStateFlow(GuidedImportState())
+    val guidedImport: StateFlow<GuidedImportState> = _guidedImport.asStateFlow()
 
     private val _pipelineBanner = MutableStateFlow(PipelineBannerState())
     val pipelineBanner: StateFlow<PipelineBannerState> = _pipelineBanner.asStateFlow()
@@ -126,7 +178,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val _timelineZoom = MutableStateFlow(1.0f)
     val timelineZoom: StateFlow<Float> = _timelineZoom.asStateFlow()
 
-    // Undo / Redo stacks for Multitrack Timeline timing edits
     private val undoStack = ArrayDeque<UndoTimelineSnapshot>()
     private val redoStack = ArrayDeque<UndoTimelineSnapshot>()
     private val _canUndo = MutableStateFlow(false)
@@ -139,7 +190,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     val studioConfig: StateFlow<WorkerAndStudioConfig> = prefsRepo.configFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), WorkerAndStudioConfig())
 
-    private val _activeEpisodeId = MutableStateFlow(1L)
+    private val _activeEpisodeId = MutableStateFlow(0L)
     val activeEpisodeId: StateFlow<Long> = _activeEpisodeId.asStateFlow()
 
     val projects: StateFlow<List<ProjectEntity>> = dao.observeProjects()
@@ -152,6 +203,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         .flatMapLatest { dao.observeEpisodeById(it) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
+    val activeProject: StateFlow<ProjectEntity?> = combine(projects, activeEpisode) { projList, ep ->
+        if (ep != null) projList.find { it.id == ep.projectId } else projList.firstOrNull()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
     val audioStems: StateFlow<List<AudioStemEntity>> = _activeEpisodeId
         .flatMapLatest { dao.observeStemsForEpisode(it) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -160,12 +215,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         .flatMapLatest { dao.observeTranscriptsForEpisode(it) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // Chronological order: A-001 -> B-002 -> C-003 -> A-004 -> B-005 -> A-006 -> C-007
     val dialoguesChronological: StateFlow<List<DialogueSegmentEntity>> = _activeEpisodeId
         .flatMapLatest { dao.observeDialoguesChronological(it) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // Character-wise batch order: Batch 1 (A: A-001, A-004, A-006) -> Batch 2 (B: B-002, B-005) -> Batch 3 (C: C-003, C-007)
     val dialoguesCharacterWiseBatches: StateFlow<List<DialogueSegmentEntity>> = _activeEpisodeId
         .flatMapLatest { dao.observeDialoguesCharacterWiseBatches(it) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -203,385 +256,455 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         .flatMapLatest { dao.observeExportsForEpisode(it) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val allExports: StateFlow<List<ExportRecordEntity>> = dao.observeAllExports()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     init {
-        initializeStudioDatabaseAndDefaultProject()
+        initializeCatalogAndRestoreActiveEpisode()
     }
 
-    private fun initializeStudioDatabaseAndDefaultProject() {
+    /**
+     * Initializes ONLY the verified model manifest catalog and restores any genuine previously
+     * created user project/episode from Room. Never auto-creates fake/sample projects!
+     */
+    private fun initializeCatalogAndRestoreActiveEpisode() {
         viewModelScope.launch(Dispatchers.IO) {
-            // 1. Seed verified AI Model Catalog (Section 8)
             val existingModels = dao.getAllModelsOnce()
             if (existingModels.isEmpty()) {
                 dao.insertModels(ModelDownloadManager.buildVerifiedModelCatalog())
             }
 
-            // 2. Seed 3-tier Dictionary (Global, Anime-specific, Project-specific)
-            val existingDict = dao.getAllDictionaryEntriesOnce()
-            if (existingDict.isEmpty()) {
-                val starterDictionaries = listOf(
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "GLOBAL",
-                        japaneseSourceTerm = "ゴブリン",
-                        preferredRomanHinglish = "Goblin",
-                        preferredHindiWording = "Pishaach",
-                        preferredEnglishWording = "Goblin",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:Goblin]",
-                        contextNotes = "Keep fantasy monster race in English"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "GLOBAL",
-                        japaneseSourceTerm = "悪魔",
-                        preferredRomanHinglish = "Demon",
-                        preferredHindiWording = "Rakshas",
-                        preferredEnglishWording = "Demon",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:Demon]",
-                        contextNotes = "Keep Demon in English for anime consistency"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "GLOBAL",
-                        japaneseSourceTerm = "魔王",
-                        preferredRomanHinglish = "Demon King",
-                        preferredHindiWording = "Asur Raj",
-                        preferredEnglishWording = "Demon King",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:Demon King]",
-                        contextNotes = "Title of primary antagonist"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "GLOBAL",
-                        japaneseSourceTerm = "ダンジョン",
-                        preferredRomanHinglish = "Dungeon",
-                        preferredHindiWording = "Tehkhana",
-                        preferredEnglishWording = "Dungeon",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:Dungeon]",
-                        contextNotes = "Standard RPG/Isekai term kept in English"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "GLOBAL",
-                        japaneseSourceTerm = "マナ / 魔力",
-                        preferredRomanHinglish = "Mana",
-                        preferredHindiWording = "Jaadui Urja",
-                        preferredEnglishWording = "Mana",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "Maa-naa",
-                        contextNotes = "Magical energy pool"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "GLOBAL",
-                        japaneseSourceTerm = "ギルド",
-                        preferredRomanHinglish = "Guild",
-                        preferredHindiWording = "Sangh",
-                        preferredEnglishWording = "Guild",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:Guild]",
-                        contextNotes = "Adventurer Guild organization"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "GLOBAL",
-                        japaneseSourceTerm = "クエスト",
-                        preferredRomanHinglish = "Quest",
-                        preferredHindiWording = "Abhiyaan",
-                        preferredEnglishWording = "Quest",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:Quest]",
-                        contextNotes = "Guild mission or assignment"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "ANIME",
-                        animeSeriesName = "Chronicles of the Dungeon King",
-                        japaneseSourceTerm = "魔導書",
-                        preferredRomanHinglish = "book",
-                        preferredHindiWording = "pustak",
-                        preferredEnglishWording = "book",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:book]",
-                        contextNotes = "Per spec example: 'This is my book' -> 'Ye meri book hai.'"
-                    ),
-                    DictionaryEntryEntity(
-                        dictionaryLevel = "PROJECT",
-                        projectId = 1L,
-                        animeSeriesName = "Chronicles of the Dungeon King",
-                        japaneseSourceTerm = "結界",
-                        preferredRomanHinglish = "barrier",
-                        preferredHindiWording = "kavach",
-                        preferredEnglishWording = "barrier",
-                        preserveOriginalEnglish = true,
-                        pronunciationGuidance = "[EN:barrier]",
-                        contextNotes = "Project-specific combat terminology"
-                    )
-                )
-                starterDictionaries.forEach { dao.insertDictionaryEntry(it) }
-            }
-
-            // 3. Seed Flagship Project & Episode 1 with real 16-bit PCM WAV audio and run initial stages
-            val existingProjects = dao.getProjectsOnce()
-            if (existingProjects.isEmpty()) {
-                val projId = dao.insertProject(
-                    ProjectEntity(
-                        title = "Dungeon King S1 — Hindi-Hinglish Dub",
-                        animeSeriesName = "Chronicles of the Dungeon King",
-                        sourceLanguage = "ja-JP (Japanese)",
-                        targetLanguage = "hi-Latn (Roman Hinglish)",
-                        masterSampleRateHz = 24000,
-                        preferredTtsEngine = "XTTS-v2"
-                    )
-                )
-
-                val epDir = File(getApplication<Application>().filesDir, "episodes/ep_1").apply { mkdirs() }
-                val masterFile = AudioDspEngine.generateMasterEpisodeAudioOnDisk(
-                    File(epDir, "master_original_24k.wav"),
-                    24000
-                )
-
-                val epId = dao.insertEpisode(
-                    EpisodeEntity(
-                        projectId = projId,
-                        episodeNumber = 1,
-                        episodeTitle = "Ep 01 — The Dungeon of Mana (7-Dialogue Spec Episode)",
-                        videoFileName = "DungeonKing_S01E01_RAW_1080p_JA.mp4",
-                        durationMs = 32000L,
-                        resolution = "1920x1080 (1080p)",
-                        frameRateFps = 23.976f,
-                        fileSizeBytes = masterFile.length() * 14L,
-                        audioCodec = "PCM 16-bit Lossless / AAC-LC",
-                        audioSampleRateHz = 24000,
-                        audioChannels = 1,
-                        originalVideoPath = masterFile.absolutePath,
-                        originalMasterAudioPath = masterFile.absolutePath,
-                        currentStageNumber = 1,
-                        currentStageName = "Stage 1 — Video Uploaded"
-                    )
-                )
-                _activeEpisodeId.value = epId
-                prefsRepo.setActiveProjectAndEpisode(projId, epId)
-
-                // Execute Stages 1..13 deterministically so the user has real stems, transcripts,
-                // audio-only speaker profiles, global IDs (A-001..C-007), character-wise batches,
-                // reconstructed timeline, and 13-point QC results ready on disk immediately!
-                coordinator.executePipelineFromStage(
-                    episodeId = epId,
-                    startStage = 1,
-                    endStage = 13,
-                    selectedTtsEngine = "XTTS-v2"
-                )
+            val savedConfig = prefsRepo.configFlow.first()
+            val savedEp = if (savedConfig.activeEpisodeId > 0L) dao.getEpisodeById(savedConfig.activeEpisodeId) else null
+            if (savedEp != null) {
+                _activeEpisodeId.value = savedEp.id
             } else {
-                val firstEp = dao.getEpisodeById(1L)
-                if (firstEp != null) {
-                    _activeEpisodeId.value = firstEp.id
+                val realProjects = dao.getProjectsOnce()
+                val firstEp = realProjects.firstOrNull()?.let { proj ->
+                    dao.observeEpisodesForProject(proj.id).first().firstOrNull()
                 }
+                _activeEpisodeId.value = firstEp?.id ?: 0L
             }
         }
     }
 
-    fun finishSplash(onboardingCompleted: Boolean) {
-        val target = if (onboardingCompleted) StudioScreen.DASHBOARD else StudioScreen.ONBOARDING
-        _screenStack.value = listOf(target)
-        _currentScreen.value = target
+    // --- Navigation Helpers ---
+
+    fun selectTab(tab: MainTab) {
+        _activeOverlay.value = StudioOverlay.NONE
+        _activeTab.value = tab
     }
 
-    fun completeOnboarding() {
-        viewModelScope.launch {
-            prefsRepo.setOnboardingCompleted(true)
-            _screenStack.value = listOf(StudioScreen.DASHBOARD)
-            _currentScreen.value = StudioScreen.DASHBOARD
-        }
+    fun selectProductionSection(section: ProductionSection) {
+        _activeOverlay.value = StudioOverlay.NONE
+        _activeTab.value = MainTab.PRODUCTION
+        _productionSection.value = section
     }
 
-    fun navigateTo(screen: StudioScreen) {
-        if (_currentScreen.value == screen) return
-        val updated = (_screenStack.value + screen).takeLast(18)
-        _screenStack.value = updated
-        _currentScreen.value = screen
+    fun openOverlay(overlay: StudioOverlay) {
+        _activeOverlay.value = overlay
     }
 
-    fun navigateBack(): Boolean {
-        val stack = _screenStack.value
-        if (stack.size > 1) {
-            val popped = stack.dropLast(1)
-            _screenStack.value = popped
-            _currentScreen.value = popped.last()
+    fun closeOverlay() {
+        _activeOverlay.value = StudioOverlay.NONE
+    }
+
+    fun handleSystemBack(): Boolean {
+        if (_activeOverlay.value != StudioOverlay.NONE) {
+            _activeOverlay.value = StudioOverlay.NONE
             return true
         }
-        if (_currentScreen.value != StudioScreen.DASHBOARD) {
-            _screenStack.value = listOf(StudioScreen.DASHBOARD)
-            _currentScreen.value = StudioScreen.DASHBOARD
+        if (_activeTab.value != MainTab.HOME) {
+            _activeTab.value = MainTab.HOME
             return true
         }
         return false
     }
 
-    fun selectAgentForDetails(agentNumber: Int) {
-        _selectedAgentNumber.value = agentNumber.coerceIn(1, 7)
-        navigateTo(StudioScreen.AGENT_PROCESSING_DETAILS)
-    }
-
-    fun selectModelForDetails(modelId: String) {
+    fun openModelDetail(modelId: String) {
         _selectedModelId.value = modelId
-        navigateTo(StudioScreen.MODEL_DOWNLOAD_DETAILS)
+        _activeOverlay.value = StudioOverlay.MODEL_DETAIL
     }
 
-    fun selectSpeakerForDetails(speakerLabel: String) {
-        _selectedSpeakerLabel.value = speakerLabel
-        navigateTo(StudioScreen.VOICE_ANALYSIS_DETAILS)
+    fun openGuidedNewProject() {
+        val cfg = studioConfig.value
+        _guidedImport.value = GuidedImportState(
+            step = 1,
+            existingProjectId = null,
+            sampleRateHz = cfg.defaultAudioSampleRateHz,
+            preferredTtsEngine = cfg.selectedTtsEngine,
+            episodeNumber = 1
+        )
+        _activeOverlay.value = StudioOverlay.GUIDED_IMPORT
     }
 
-    fun selectDialogue(dialogueId: Long?) {
-        _selectedDialogueId.value = dialogueId
+    fun openGuidedImportEpisode(project: ProjectEntity? = activeProject.value) {
+        if (project == null) {
+            openGuidedNewProject()
+            return
+        }
+        val existingEps = allEpisodes.value.filter { it.projectId == project.id }
+        val nextNum = (existingEps.maxOfOrNull { it.episodeNumber } ?: 0) + 1
+        _guidedImport.value = GuidedImportState(
+            step = 2,
+            existingProjectId = project.id,
+            projectTitle = project.title,
+            animeSeriesName = project.animeSeriesName,
+            sampleRateHz = project.masterSampleRateHz,
+            preferredTtsEngine = project.preferredTtsEngine,
+            episodeNumber = nextNum,
+            episodeTitle = ""
+        )
+        _activeOverlay.value = StudioOverlay.GUIDED_IMPORT
     }
 
-    fun setTimelineZoom(zoom: Float) {
-        _timelineZoom.value = zoom.coerceIn(0.5f, 3.0f)
+    fun updateGuidedImport(transform: (GuidedImportState) -> GuidedImportState) {
+        _guidedImport.value = transform(_guidedImport.value)
     }
 
-    fun selectActiveEpisode(episodeId: Long, projectId: Long) {
+    fun setProjectSearchQuery(q: String) {
+        _projectSearchQuery.value = q
+    }
+
+    fun setProjectSortOrder(order: ProjectSortOrder) {
+        _projectSortOrder.value = order
+    }
+
+    fun selectActiveEpisode(episodeId: Long, projectId: Long, navigateToProduction: Boolean = false) {
         _activeEpisodeId.value = episodeId
+        _selectedDialogueId.value = null
+        audioPlayer.stop()
         viewModelScope.launch {
             prefsRepo.setActiveProjectAndEpisode(projectId, episodeId)
         }
+        if (navigateToProduction) {
+            _activeOverlay.value = StudioOverlay.NONE
+            _activeTab.value = MainTab.PRODUCTION
+            _productionSection.value = ProductionSection.PIPELINE
+        }
     }
 
-    /**
-     * Creates a new Anime Dubbing Project and initial episode workspace.
-     */
-    fun createNewProject(
-        projectTitle: String,
-        animeSeriesName: String,
-        sampleRateHz: Int,
-        preferredTtsEngine: String,
-        onCreated: () -> Unit = {}
-    ) {
+    fun deleteProject(projectId: Long) {
         viewModelScope.launch(Dispatchers.IO) {
-            val projId = dao.insertProject(
-                ProjectEntity(
-                    title = projectTitle.trim().ifBlank { "Untitled Anime Dub Project" },
-                    animeSeriesName = animeSeriesName.trim().ifBlank { "Custom Anime Series" },
-                    masterSampleRateHz = sampleRateHz,
-                    preferredTtsEngine = preferredTtsEngine
-                )
-            )
-            val tempDir = File(getApplication<Application>().filesDir, "episodes/proj_$projId").apply { mkdirs() }
-            val masterFile = AudioDspEngine.generateMasterEpisodeAudioOnDisk(
-                File(tempDir, "master_original_24k.wav"),
-                sampleRateHz
-            )
-            val epId = dao.insertEpisode(
-                EpisodeEntity(
-                    projectId = projId,
-                    episodeNumber = 1,
-                    episodeTitle = "Ep 01 — ${animeSeriesName.ifBlank { "Episode 1" }}",
-                    videoFileName = "${animeSeriesName.replace(" ", "_")}_E01_JA.mp4",
-                    durationMs = 32000L,
-                    resolution = "1920x1080 (1080p)",
-                    frameRateFps = 23.976f,
-                    fileSizeBytes = masterFile.length() * 12L,
-                    audioCodec = "PCM 16-bit / AAC-LC",
-                    audioSampleRateHz = sampleRateHz,
-                    audioChannels = 1,
-                    originalVideoPath = masterFile.absolutePath,
-                    originalMasterAudioPath = masterFile.absolutePath
-                )
-            )
-            _activeEpisodeId.value = epId
-            prefsRepo.setActiveProjectAndEpisode(projId, epId)
-            coordinator.executePipelineFromStage(epId, 1, 13, preferredTtsEngine)
-            launch(Dispatchers.Main) {
-                onCreated()
-                navigateTo(StudioScreen.VIDEO_UPLOAD)
+            val eps = dao.observeEpisodesForProject(projectId).first()
+            dao.deleteProjectById(projectId)
+            eps.forEach { ep ->
+                val dir = coordinator.getEpisodeWorkspaceDir(ep.id)
+                if (dir.exists()) dir.deleteRecursively()
+            }
+            if (eps.any { it.id == _activeEpisodeId.value }) {
+                val remaining = dao.observeAllEpisodes().first()
+                val nextEp = remaining.firstOrNull()
+                _activeEpisodeId.value = nextEp?.id ?: 0L
+                prefsRepo.setActiveProjectAndEpisode(nextEp?.projectId ?: 0L, nextEp?.id ?: 0L)
             }
         }
     }
 
     /**
-     * Handles real Video/Audio file upload selected via Android's system document/media picker,
-     * extracting real MediaMetadataRetriever properties (duration, resolution, frame rate, file size)
-     * and creating/updating the active episode.
+     * Real Media Inspection for Step 3 & Step 4 of the Guided Import Flow.
+     * Copies selected URI into staging directory, inspects genuine metadata using MediaMetadataRetriever
+     * and MediaExtractor, and runs real AudioDspEngine.extractAudioTrackToWav().
+     * Never fabricates duration, resolution, FPS, or audio!
      */
-    fun handleUploadedMediaUri(uri: Uri) {
+    fun inspectMediaUriForImport(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
+            _guidedImport.value = _guidedImport.value.copy(
+                step = 4,
+                mediaStatus = MediaInspectionStatus.LOADING,
+                inspectedMedia = null
+            )
+
             try {
                 val app = getApplication<Application>()
-                val contentResolver = app.contentResolver
-                var displayName = "Uploaded_Anime_Episode.mp4"
-                var fileSize = 0L
+                val resolver = app.contentResolver
+                var displayName = "imported_media"
+                var reportedSize = 0L
 
-                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                resolver.query(uri, null, null, null, null)?.use { cursor ->
                     if (cursor.moveToFirst()) {
                         val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                         val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
                         if (nameIdx >= 0) displayName = cursor.getString(nameIdx) ?: displayName
-                        if (sizeIdx >= 0) fileSize = cursor.getLong(sizeIdx)
+                        if (sizeIdx >= 0) reportedSize = cursor.getLong(sizeIdx)
                     }
                 }
 
-                val epId = _activeEpisodeId.value
-                val epDir = coordinator.getEpisodeWorkspaceDir(epId)
-                val destMediaFile = File(epDir, displayName.replace(Regex("[^a-zA-Z0-9._\\-]"), "_"))
+                val stagingDir = File(app.filesDir, "import_staging").apply { mkdirs() }
+                val safeName = displayName.replace(Regex("[^a-zA-Z0-9._\\-]"), "_")
+                val stagedSource = File(stagingDir, "${System.currentTimeMillis()}_$safeName")
 
-                contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(destMediaFile).use { output ->
+                val copied = resolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(stagedSource).use { output ->
                         input.copyTo(output)
                     }
-                }
-                if (fileSize <= 0L) fileSize = destMediaFile.length()
+                    true
+                } ?: false
 
-                var durationMs = 32000L
-                var width = 1920
-                var height = 1080
-                var frameRate = 23.976f
-
-                try {
-                    val mmr = MediaMetadataRetriever()
-                    mmr.setDataSource(destMediaFile.absolutePath)
-                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.let {
-                        if (it > 1000L) durationMs = it
-                    }
-                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()?.let {
-                        if (it > 0) width = it
-                    }
-                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()?.let {
-                        if (it > 0) height = it
-                    }
-                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()?.let {
-                        if (it > 0f) frameRate = it
-                    }
-                    mmr.release()
-                } catch (_: Exception) {
-                }
-
-                val masterWavFile = if (destMediaFile.name.endsWith(".wav", ignoreCase = true)) {
-                    destMediaFile
-                } else {
-                    AudioDspEngine.generateMasterEpisodeAudioOnDisk(File(epDir, "master_original_24k.wav"), 24000)
-                }
-
-                val currentEp = dao.getEpisodeById(epId)
-                if (currentEp != null) {
-                    val updated = currentEp.copy(
-                        videoFileName = displayName,
-                        durationMs = durationMs,
-                        resolution = "${width}x${height}",
-                        frameRateFps = frameRate,
-                        fileSizeBytes = fileSize,
-                        originalVideoPath = destMediaFile.absolutePath,
-                        originalMasterAudioPath = masterWavFile.absolutePath,
-                        currentStageNumber = 1,
-                        currentStageName = "Stage 1 — Uploaded: $displayName",
-                        updatedAt = System.currentTimeMillis()
+                if (!copied || !stagedSource.exists() || stagedSource.length() == 0L) {
+                    _guidedImport.value = _guidedImport.value.copy(
+                        mediaStatus = MediaInspectionStatus.EXTRACTION_FAILED,
+                        inspectedMedia = InspectedMediaInfo(
+                            fileName = displayName,
+                            errorMessage = "Could not read the selected file from device storage."
+                        )
                     )
-                    dao.updateEpisode(updated)
+                    return@launch
                 }
 
-                _pipelineBanner.value = PipelineBannerState(
-                    isRunning = false,
-                    statusBannerMessage = "Loaded media '$displayName' (${width}x${height}, ${durationMs / 1000}s). Ready for 14-Stage Pipeline."
+                val actualSize = stagedSource.length().takeIf { it > 0L } ?: reportedSize
+                val ext = stagedSource.extension.uppercase().ifBlank { "MEDIA" }
+
+                var durationMs = 0L
+                var width = 0
+                var height = 0
+                var frameRate = 0f
+                var hasVideo = false
+                var hasAudio = false
+                var detectedAudioCodec = ""
+                var detectedSampleRate = _guidedImport.value.sampleRateHz
+                var detectedChannels = 1
+
+                // 1. Inspect tracks with MediaExtractor
+                val extractor = MediaExtractor()
+                try {
+                    extractor.setDataSource(stagedSource.absolutePath)
+                    for (i in 0 until extractor.trackCount) {
+                        val fmt = extractor.getTrackFormat(i)
+                        val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                        if (mime.startsWith("video/")) {
+                            hasVideo = true
+                            if (fmt.containsKey(MediaFormat.KEY_WIDTH)) width = fmt.getInteger(MediaFormat.KEY_WIDTH)
+                            if (fmt.containsKey(MediaFormat.KEY_HEIGHT)) height = fmt.getInteger(MediaFormat.KEY_HEIGHT)
+                            if (fmt.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                                frameRate = try {
+                                    fmt.getInteger(MediaFormat.KEY_FRAME_RATE).toFloat()
+                                } catch (_: Exception) {
+                                    try { fmt.getFloat(MediaFormat.KEY_FRAME_RATE) } catch (_: Exception) { 0f }
+                                }
+                            }
+                            if (fmt.containsKey(MediaFormat.KEY_DURATION) && durationMs <= 0L) {
+                                durationMs = fmt.getLong(MediaFormat.KEY_DURATION) / 1000L
+                            }
+                        } else if (mime.startsWith("audio/")) {
+                            hasAudio = true
+                            detectedAudioCodec = mime.substringAfter("audio/").uppercase()
+                            if (fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                detectedSampleRate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                            }
+                            if (fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                detectedChannels = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                            }
+                            if (fmt.containsKey(MediaFormat.KEY_DURATION) && durationMs <= 0L) {
+                                durationMs = fmt.getLong(MediaFormat.KEY_DURATION) / 1000L
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { extractor.release() } catch (_: Exception) {}
+                }
+
+                // 2. Supplement with MediaMetadataRetriever
+                val mmr = MediaMetadataRetriever()
+                try {
+                    mmr.setDataSource(stagedSource.absolutePath)
+                    if (durationMs <= 0L) {
+                        mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.let {
+                            if (it > 0L) durationMs = it
+                        }
+                    }
+                    if (width <= 0 || height <= 0) {
+                        width = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: width
+                        height = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: height
+                    }
+                    if (frameRate <= 0f) {
+                        mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()?.let {
+                            if (it > 0f) frameRate = it
+                        }
+                    }
+                    if (mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes") hasVideo = true
+                    if (mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes") hasAudio = true
+                } catch (_: Exception) {
+                } finally {
+                    try { mmr.release() } catch (_: Exception) {}
+                }
+
+                val resolutionStr = if (width > 0 && height > 0) "${width}×${height}" else if (hasVideo) "Video (size unknown)" else "Audio-Only"
+
+                // 3. Extract real PCM WAV master right now so inspection verifies genuine extractability
+                val stagedWav = File(stagingDir, "${System.currentTimeMillis()}_master.wav")
+                val extractRes = AudioDspEngine.extractAudioTrackToWav(
+                    sourceFile = stagedSource,
+                    outputWavFile = stagedWav,
+                    targetSampleRateHz = _guidedImport.value.sampleRateHz
                 )
+
+                when (extractRes) {
+                    is MediaExtractionResult.Success -> {
+                        val finalDur = if (durationMs > 0L) durationMs else extractRes.durationMs
+                        _guidedImport.value = _guidedImport.value.copy(
+                            mediaStatus = MediaInspectionStatus.READY,
+                            inspectedMedia = InspectedMediaInfo(
+                                fileName = displayName,
+                                formatLabel = ext,
+                                fileSizeBytes = actualSize,
+                                durationMs = finalDur,
+                                resolution = resolutionStr,
+                                frameRateFps = frameRate,
+                                hasVideoTrack = hasVideo,
+                                hasAudioTrack = true,
+                                audioCodec = detectedAudioCodec.ifBlank { extractRes.audioCodec },
+                                audioSampleRateHz = extractRes.sampleRateHz,
+                                audioChannels = detectedChannels,
+                                localSourcePath = stagedSource.absolutePath,
+                                extractedWavPath = extractRes.wavFile.absolutePath,
+                                errorMessage = null
+                            )
+                        )
+                    }
+                    MediaExtractionResult.MissingAudioTrack -> {
+                        _guidedImport.value = _guidedImport.value.copy(
+                            mediaStatus = MediaInspectionStatus.MISSING_AUDIO,
+                            inspectedMedia = InspectedMediaInfo(
+                                fileName = displayName,
+                                formatLabel = ext,
+                                fileSizeBytes = actualSize,
+                                durationMs = durationMs,
+                                resolution = resolutionStr,
+                                frameRateFps = frameRate,
+                                hasVideoTrack = hasVideo,
+                                hasAudioTrack = false,
+                                errorMessage = "This file has no audio track. Select a video or audio file containing spoken dialogue."
+                            )
+                        )
+                    }
+                    is MediaExtractionResult.UnsupportedFormat -> {
+                        _guidedImport.value = _guidedImport.value.copy(
+                            mediaStatus = MediaInspectionStatus.UNSUPPORTED,
+                            inspectedMedia = InspectedMediaInfo(
+                                fileName = displayName,
+                                formatLabel = ext,
+                                fileSizeBytes = actualSize,
+                                durationMs = durationMs,
+                                resolution = resolutionStr,
+                                hasVideoTrack = hasVideo,
+                                hasAudioTrack = hasAudio,
+                                errorMessage = extractRes.reason
+                            )
+                        )
+                    }
+                    is MediaExtractionResult.Failure -> {
+                        _guidedImport.value = _guidedImport.value.copy(
+                            mediaStatus = MediaInspectionStatus.EXTRACTION_FAILED,
+                            inspectedMedia = InspectedMediaInfo(
+                                fileName = displayName,
+                                formatLabel = ext,
+                                fileSizeBytes = actualSize,
+                                durationMs = durationMs,
+                                resolution = resolutionStr,
+                                hasVideoTrack = hasVideo,
+                                hasAudioTrack = hasAudio,
+                                errorMessage = extractRes.reason
+                            )
+                        )
+                    }
+                }
             } catch (e: Exception) {
+                _guidedImport.value = _guidedImport.value.copy(
+                    mediaStatus = MediaInspectionStatus.EXTRACTION_FAILED,
+                    inspectedMedia = InspectedMediaInfo(
+                        errorMessage = e.localizedMessage ?: "Failed to inspect selected media."
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * Step 5: Persists the real Project + Episode + extracted PCM WAV master and optionally
+     * starts initial analysis stages (Stems -> VAD Speech Slices -> Speaker Analysis -> Global IDs).
+     */
+    fun confirmGuidedImportAndStart(startProcessingNow: Boolean) {
+        val state = _guidedImport.value
+        val media = state.inspectedMedia
+        if (state.mediaStatus != MediaInspectionStatus.READY || media == null) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _guidedImport.value = state.copy(isCommitting = true)
+            try {
+                val projId = state.existingProjectId ?: dao.insertProject(
+                    ProjectEntity(
+                        title = state.projectTitle.trim().ifBlank { "Untitled Dub Project" },
+                        animeSeriesName = state.animeSeriesName.trim().ifBlank { state.projectTitle.trim().ifBlank { "Anime Series" } },
+                        masterSampleRateHz = state.sampleRateHz,
+                        preferredTtsEngine = state.preferredTtsEngine
+                    )
+                )
+
+                val cleanEpTitle = state.episodeTitle.trim().ifBlank { "Episode ${state.episodeNumber}" }
+                val placeholderEpId = dao.insertEpisode(
+                    EpisodeEntity(
+                        projectId = projId,
+                        episodeNumber = state.episodeNumber,
+                        episodeTitle = cleanEpTitle,
+                        videoFileName = media.fileName,
+                        durationMs = media.durationMs,
+                        resolution = media.resolution,
+                        frameRateFps = media.frameRateFps,
+                        fileSizeBytes = media.fileSizeBytes,
+                        audioCodec = media.audioCodec,
+                        audioSampleRateHz = media.audioSampleRateHz,
+                        audioChannels = media.audioChannels,
+                        originalVideoPath = media.localSourcePath,
+                        originalMasterAudioPath = media.extractedWavPath,
+                        currentStageNumber = 2,
+                        currentStageName = "Stage 2 — Audio Extracted & Inspected",
+                        completedStagesMask = (1 shl 1) or (1 shl 2),
+                        pipelineStatus = "READY"
+                    )
+                )
+
+                // Move staged files into dedicated episode workspace directory
+                val epDir = coordinator.getEpisodeWorkspaceDir(placeholderEpId)
+                val stagedSrc = File(media.localSourcePath)
+                val finalSrc = File(epDir, stagedSrc.name.substringAfter("_", stagedSrc.name))
+                if (stagedSrc.exists()) stagedSrc.copyTo(finalSrc, overwrite = true)
+
+                val stagedWav = File(media.extractedWavPath)
+                val finalWav = File(epDir, "master_original_pcm.wav")
+                if (stagedWav.exists()) stagedWav.copyTo(finalWav, overwrite = true)
+
+                val savedEp = dao.getEpisodeById(placeholderEpId)
+                if (savedEp != null) {
+                    dao.updateEpisode(
+                        savedEp.copy(
+                            originalVideoPath = finalSrc.absolutePath,
+                            originalMasterAudioPath = finalWav.absolutePath,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                    )
+                }
+
+                _activeEpisodeId.value = placeholderEpId
+                prefsRepo.setActiveProjectAndEpisode(projId, placeholderEpId)
+
+                _guidedImport.value = GuidedImportState()
+                _activeOverlay.value = StudioOverlay.NONE
+                _activeTab.value = MainTab.PRODUCTION
+                _productionSection.value = ProductionSection.PIPELINE
+
+                if (startProcessingNow) {
+                    runPipelineStages(startStage = 3, endStage = 7)
+                } else {
+                    _pipelineBanner.value = PipelineBannerState(
+                        statusBannerMessage = "Imported '${media.fileName}' (${media.durationMs / 1000}s). Ready to run pipeline."
+                    )
+                }
+            } catch (e: Exception) {
+                _guidedImport.value = _guidedImport.value.copy(isCommitting = false)
                 _pipelineBanner.value = PipelineBannerState(
-                    isRunning = false,
-                    statusBannerMessage = "Media upload error: ${e.localizedMessage}",
+                    statusBannerMessage = "Failed to save episode: ${e.localizedMessage}",
                     isError = true
                 )
             }
@@ -589,17 +712,24 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Runs the complete 14-Stage Pipeline or resumes from a checkpoint stage.
+     * Runs a range of pipeline stages (e.g. 2..7 or single stage N..N) with live progress updates.
      */
-    fun runPipelineStages(startStage: Int = 1, endStage: Int = 14) {
+    fun runPipelineStages(startStage: Int = 2, endStage: Int = 13) {
         val epId = _activeEpisodeId.value
+        if (epId <= 0L) {
+            _pipelineBanner.value = PipelineBannerState(
+                statusBannerMessage = "Create a project and import an episode first.",
+                isError = true
+            )
+            return
+        }
         val ttsEngine = studioConfig.value.selectedTtsEngine
         viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = startStage,
-                activeStageTitle = "Initializing Stage $startStage...",
-                activeDetail = "Starting deterministic 7-Agent pipeline coordinator..."
+                activeStageTitle = "Starting Stage $startStage…",
+                activeDetail = "Initializing deterministic 7-agent coordinator…"
             )
             val result = coordinator.executePipelineFromStage(
                 episodeId = epId,
@@ -626,7 +756,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 onFailure = { err ->
                     _pipelineBanner.value = PipelineBannerState(
                         isRunning = false,
-                        statusBannerMessage = "Pipeline Error: ${err.localizedMessage}",
+                        statusBannerMessage = err.localizedMessage ?: "Pipeline stage failed.",
                         isError = true
                     )
                 }
@@ -635,53 +765,199 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Renames a recurring speaker profile (e.g. A = Character 1 -> Satoru) across the project.
+     * Inline transcript & timing edit — keeps TranscriptSegmentEntity and DialogueSegmentEntity in sync.
      */
-    fun renameSpeakerCharacter(speaker: SpeakerProfileEntity, newCharacterName: String, consentConfirmed: Boolean) {
+    fun updateDialogueTranscriptAndTiming(
+        dialogue: DialogueSegmentEntity,
+        newJapaneseText: String,
+        newRomajiReading: String,
+        newStartMs: Long,
+        newEndMs: Long
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
-            dao.updateSpeakerProfile(
-                speaker.copy(
-                    characterName = newCharacterName.trim().ifBlank { speaker.characterName },
-                    rightsConsentConfirmed = consentConfirmed,
-                    useConsentedGenericVoiceFallback = !consentConfirmed
+            val safeStart = newStartMs.coerceAtLeast(0L)
+            val safeEnd = newEndMs.coerceAtLeast(safeStart + 200L)
+            val ep = dao.getEpisodeById(dialogue.episodeId)
+            var slicePath = dialogue.originalAudioSlicePath
+
+            // Re-slice real vocal audio if timestamps changed
+            if (ep != null && (safeStart != dialogue.originalStartMs || safeEnd != dialogue.originalEndMs)) {
+                val stems = dao.getStemsForEpisodeOnce(ep.id)
+                val vocalFile = stems.find { it.stemType == "DIALOGUE_VOCAL" }?.let { File(it.filePath) }
+                    ?.takeIf { it.exists() }
+                    ?: File(ep.originalMasterAudioPath).takeIf { it.exists() }
+                if (vocalFile != null) {
+                    val buf = AudioDspEngine.readWavFile(vocalFile)
+                    val sliced = AudioDspEngine.sliceBuffer(buf, safeStart, safeEnd)
+                    val out = File(coordinator.getEpisodeWorkspaceDir(ep.id), "jp_slices/jp_seg_%03d.wav".format(dialogue.globalOrderNumber))
+                    AudioDspEngine.writeWavFile(out, sliced)
+                    slicePath = out.absolutePath
+                }
+            }
+
+            dao.updateDialogue(
+                dialogue.copy(
+                    japaneseText = newJapaneseText.trim(),
+                    originalStartMs = safeStart,
+                    originalEndMs = safeEnd,
+                    originalDurationMs = safeEnd - safeStart,
+                    timelineStartMs = safeStart,
+                    originalAudioSlicePath = slicePath
                 )
             )
-            // Update timeline track title as well
-            val tracks = dao.getTimelineTracksOnce(speaker.episodeId)
-            tracks.find { it.speakerLabel == speaker.speakerLabel }?.let { track ->
-                dao.updateTimelineTrack(
-                    track.copy(trackTitle = "Track ${track.trackIndex}: Speaker ${speaker.speakerLabel} — ${newCharacterName.trim()}")
+
+            val transcriptsList = dao.getTranscriptsForEpisodeOnce(dialogue.episodeId)
+            val matchingTr = transcriptsList.find { it.id == dialogue.transcriptSegmentId }
+                ?: transcriptsList.find { it.segmentIndex == dialogue.globalOrderNumber }
+            if (matchingTr != null) {
+                dao.updateTranscriptSegment(
+                    matchingTr.copy(
+                        japaneseText = newJapaneseText.trim(),
+                        romajiReading = newRomajiReading.trim(),
+                        preliminaryStartMs = safeStart,
+                        preliminaryEndMs = safeEnd,
+                        originalAudioSlicePath = slicePath
+                    )
                 )
             }
         }
     }
 
     /**
-     * Reassigns a dialogue segment's speaker label (e.g. from B to A) while keeping the global sequential number intact!
-     * For example, if Dialogue #4 was B-004 and user corrects speaker to A, its ID becomes A-004.
+     * Adds a genuine user-authored dialogue segment with real audio slice extraction from the episode.
      */
-    fun reassignDialogueSpeaker(dialogue: DialogueSegmentEntity, newSpeakerLabel: String) {
+    fun addManualDialogueSegment(
+        japaneseText: String,
+        romajiReading: String,
+        startMs: Long,
+        endMs: Long,
+        speakerLabel: String = "A"
+    ) {
+        val epId = _activeEpisodeId.value
+        if (epId <= 0L) return
         viewModelScope.launch(Dispatchers.IO) {
-            val cleanLabel = newSpeakerLabel.trim().uppercase()
-            val newDialogueId = "$cleanLabel-%03d".format(dialogue.globalOrderNumber)
-            val updated = dialogue.copy(
-                speakerLabel = cleanLabel,
-                dialogueId = newDialogueId,
-                voiceReferenceId = "VREF-1-$cleanLabel"
+            val ep = dao.getEpisodeById(epId) ?: return@launch
+            val safeStart = startMs.coerceIn(0L, ep.durationMs.coerceAtLeast(1000L))
+            val safeEnd = endMs.coerceAtLeast(safeStart + 300L)
+            val existing = dao.getDialoguesChronologicalOnce(epId)
+            val nextOrder = (existing.maxOfOrNull { it.globalOrderNumber } ?: 0) + 1
+            val cleanSpeaker = speakerLabel.trim().uppercase().ifBlank { "A" }
+
+            val stems = dao.getStemsForEpisodeOnce(epId)
+            val sourceAudio = stems.find { it.stemType == "DIALOGUE_VOCAL" }?.let { File(it.filePath) }
+                ?.takeIf { it.exists() }
+                ?: File(ep.originalMasterAudioPath).takeIf { it.exists() }
+
+            var slicePath = ""
+            if (sourceAudio != null) {
+                val buf = AudioDspEngine.readWavFile(sourceAudio)
+                val sliced = AudioDspEngine.sliceBuffer(buf, safeStart, safeEnd)
+                if (sliced.samples.isNotEmpty()) {
+                    val out = File(coordinator.getEpisodeWorkspaceDir(epId), "jp_slices/jp_seg_%03d.wav".format(nextOrder))
+                    AudioDspEngine.writeWavFile(out, sliced)
+                    slicePath = out.absolutePath
+                }
+            }
+
+            val tr = TranscriptSegmentEntity(
+                episodeId = epId,
+                segmentIndex = nextOrder,
+                japaneseText = japaneseText.trim(),
+                romajiReading = romajiReading.trim(),
+                preliminaryStartMs = safeStart,
+                preliminaryEndMs = safeEnd,
+                confidenceScore = 1.0f,
+                asrModelUsed = "Manual User Entry",
+                originalAudioSlicePath = slicePath
             )
-            dao.updateDialogue(updated)
-            // Dependency-aware regeneration of just this dialogue with the new speaker's voice reference
-            coordinator.regenerateSingleDialogueOnly(
-                dialogueId = updated.id,
-                selectedTtsEngine = studioConfig.value.selectedTtsEngine
+            dao.insertTranscriptSegments(listOf(tr))
+            val savedTr = dao.getTranscriptsForEpisodeOnce(epId).lastOrNull()
+
+            dao.insertDialogues(
+                listOf(
+                    DialogueSegmentEntity(
+                        episodeId = epId,
+                        globalOrderNumber = nextOrder,
+                        dialogueId = "$cleanSpeaker-%03d".format(nextOrder),
+                        speakerLabel = cleanSpeaker,
+                        originalStartMs = safeStart,
+                        originalEndMs = safeEnd,
+                        originalDurationMs = safeEnd - safeStart,
+                        transcriptSegmentId = savedTr?.id ?: 0L,
+                        japaneseText = japaneseText.trim(),
+                        romanHinglishText = "",
+                        ttsNormalizedText = "",
+                        alignmentSource = "Manual Timeline Entry",
+                        originalAudioSlicePath = slicePath,
+                        timelineStartMs = safeStart
+                    )
+                )
+            )
+            // Re-run Stage 7 numbering so global order stays strictly chronological
+            coordinator.runStage7GlobalDialogueNumbering(ep)
+        }
+    }
+
+    fun updateDialogueTranslationOnly(
+        dialogue: DialogueSegmentEntity,
+        newRomanHinglish: String,
+        newEmotion: String,
+        newSpeakingStyle: String
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val dicts = dao.getAllDictionaryEntriesOnce()
+            val cleanText = newRomanHinglish.trim()
+            val normalized = HinglishTtsNormalizer.normalizeForTtsPronunciation(cleanText, dicts)
+            dao.updateDialogue(
+                dialogue.copy(
+                    romanHinglishText = cleanText,
+                    ttsNormalizedText = normalized,
+                    emotion = newEmotion,
+                    speakingStyle = newSpeakingStyle.trim().ifBlank { dialogue.speakingStyle },
+                    generationStatus = if (cleanText.isNotBlank() && dialogue.generatedAudioPath == null) "TRANSLATED" else dialogue.generationStatus,
+                    translationVersion = dialogue.translationVersion + 1
+                )
             )
         }
     }
 
-    /**
-     * Updates a single dialogue's translation or emotion and performs dependency-aware regeneration
-     * of ONLY that dialogue (never reruns Japanese transcription or other dialogues!).
-     */
+    fun renameSpeakerCharacter(speaker: SpeakerProfileEntity, newCharacterName: String, consentConfirmed: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val cleanName = newCharacterName.trim().ifBlank { "Speaker ${speaker.speakerLabel}" }
+            dao.updateSpeakerProfile(
+                speaker.copy(
+                    characterName = cleanName,
+                    rightsConsentConfirmed = consentConfirmed,
+                    useConsentedGenericVoiceFallback = !consentConfirmed
+                )
+            )
+            val tracks = dao.getTimelineTracksOnce(speaker.episodeId)
+            tracks.find { it.speakerLabel == speaker.speakerLabel }?.let { track ->
+                dao.updateTimelineTrack(track.copy(trackTitle = "${speaker.speakerLabel} • $cleanName"))
+            }
+        }
+    }
+
+    fun reassignDialogueSpeaker(dialogue: DialogueSegmentEntity, newSpeakerLabel: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val cleanLabel = newSpeakerLabel.trim().uppercase().ifBlank { "A" }
+            val ep = dao.getEpisodeById(dialogue.episodeId) ?: return@launch
+            val newDialogueId = "$cleanLabel-%03d".format(dialogue.globalOrderNumber)
+            val updated = dialogue.copy(
+                speakerLabel = cleanLabel,
+                dialogueId = newDialogueId,
+                voiceReferenceId = "VREF-${ep.projectId}-$cleanLabel"
+            )
+            dao.updateDialogue(updated)
+            if (updated.romanHinglishText.isNotBlank() && !updated.generatedAudioPath.isNullOrBlank()) {
+                coordinator.regenerateSingleDialogueOnly(
+                    dialogueId = updated.id,
+                    selectedTtsEngine = studioConfig.value.selectedTtsEngine
+                )
+            }
+        }
+    }
+
     fun updateAndRegenerateSingleDialogue(
         dialogueId: Long,
         newRomanHinglish: String,
@@ -691,8 +967,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = 10,
-                activeStageTitle = "Dependency-Aware Single Dialogue Regeneration",
-                activeDetail = "Synthesizing updated line & updating multitrack mix (Japanese ASR & unaffected lines untouched)..."
+                activeStageTitle = "Synthesizing Dialogue Line",
+                activeDetail = "Updating audio clip and refreshing multitrack mix…"
             )
             val res = coordinator.regenerateSingleDialogueOnly(
                 dialogueId = dialogueId,
@@ -704,13 +980,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 onSuccess = { dlg ->
                     PipelineBannerState(
                         isRunning = false,
-                        statusBannerMessage = "Regenerated ${dlg.dialogueId} (${dlg.actualGeneratedDurationMs} ms, Ratio ${dlg.timeStretchRatio}x) without rerunning unrelated stages."
+                        statusBannerMessage = "Updated ${dlg.dialogueId} (${dlg.actualGeneratedDurationMs} ms, stretch ${dlg.timeStretchRatio}x)."
                     )
                 },
                 onFailure = { err ->
                     PipelineBannerState(
                         isRunning = false,
-                        statusBannerMessage = "Regeneration error: ${err.localizedMessage}",
+                        statusBannerMessage = err.localizedMessage ?: "Synthesis failed.",
                         isError = true
                     )
                 }
@@ -718,10 +994,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    /**
-     * Executes scoped dictionary replacement ("ONLY_HERE", "CURRENT_DIALOGUE", "CURRENT_EPISODE",
-     * "CURRENT_ANIME", "GLOBALLY", "EVERYWHERE") and invalidates/regenerates ONLY affected dialogues.
-     */
     fun applyDictionaryScopedChange(
         targetDialogueId: Long?,
         japaneseTerm: String,
@@ -731,12 +1003,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         scope: String
     ) {
         val epId = _activeEpisodeId.value
+        if (epId <= 0L) return
         viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = 8,
-                activeStageTitle = "Scoped Dictionary Update ($scope)",
-                activeDetail = "Updating affected translations & regenerating affected dialogue audio..."
+                activeStageTitle = "Applying Dictionary Rule ($scope)",
+                activeDetail = "Updating affected dialogues…"
             )
             val count = coordinator.applyScopedDictionaryReplacement(
                 episodeId = epId,
@@ -750,7 +1023,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             )
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = false,
-                statusBannerMessage = "Applied dictionary term '$newRomanHinglishTerm' ($scope). Dependency-aware regeneration updated $count affected dialogue(s)."
+                statusBannerMessage = "Saved '$newRomanHinglishTerm' ($scope). Updated $count affected dialogue(s)."
             )
         }
     }
@@ -767,27 +1040,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    /**
-     * Adjusts an audio stem's volume, mute, or solo state and re-mixes Stage 12 without rerunning TTS!
-     */
     fun updateStemControls(stem: AudioStemEntity, volumeGain: Float, isMuted: Boolean, isSolo: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
-            val updated = stem.copy(
-                volumeGain = volumeGain.coerceIn(0f, 1.5f),
-                isMuted = isMuted,
-                isSolo = isSolo
+            dao.updateStem(
+                stem.copy(
+                    volumeGain = volumeGain.coerceIn(0f, 1.5f),
+                    isMuted = isMuted,
+                    isSolo = isSolo
+                )
             )
-            dao.updateStem(updated)
             val ep = dao.getEpisodeById(stem.episodeId)
             if (ep != null) {
-                coordinator.runStage12Agent7MultitrackMixing(ep)
+                try { coordinator.runStage12Agent7MultitrackMixing(ep) } catch (_: Exception) {}
             }
         }
     }
 
-    /**
-     * Adjusts a timeline track's volume, mute, or solo state and re-mixes Stage 12 without rerunning TTS!
-     */
     fun updateTimelineTrackControls(track: TimelineTrackEntity, volumeGain: Float, isMuted: Boolean, isSolo: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             dao.updateTimelineTrack(
@@ -799,23 +1067,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             )
             val ep = dao.getEpisodeById(track.episodeId)
             if (ep != null) {
-                coordinator.runStage12Agent7MultitrackMixing(ep)
+                try { coordinator.runStage12Agent7MultitrackMixing(ep) } catch (_: Exception) {}
             }
         }
     }
 
-    /**
-     * Adjusts a dialogue's start time or duration boundaries on the timeline with Undo/Redo support.
-     * Changing timeline placement NEVER regenerates unchanged TTS audio and NEVER shifts subsequent dialogues forward!
-     */
+    fun selectDialogue(dialogueId: Long?) {
+        _selectedDialogueId.value = dialogueId
+    }
+
+    fun setTimelineZoom(zoom: Float) {
+        _timelineZoom.value = zoom.coerceIn(0.5f, 3.0f)
+    }
+
     fun adjustDialogueTimelinePosition(dialogue: DialogueSegmentEntity, deltaMs: Long) {
         viewModelScope.launch(Dispatchers.IO) {
             val all = dao.getDialoguesChronologicalOnce(dialogue.episodeId)
-            val snapshot = UndoTimelineSnapshot(
-                description = "Move ${dialogue.dialogueId}",
-                dialogueTimestamps = all.associate { it.id to it.timelineStartMs }
+            undoStack.addLast(
+                UndoTimelineSnapshot(
+                    description = "Move ${dialogue.dialogueId}",
+                    dialogueTimestamps = all.associate { it.id to it.timelineStartMs }
+                )
             )
-            undoStack.addLast(snapshot)
             redoStack.clear()
             _canUndo.value = undoStack.isNotEmpty()
             _canRedo.value = false
@@ -824,7 +1097,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             dao.updateDialogue(dialogue.copy(timelineStartMs = newStart))
             val ep = dao.getEpisodeById(dialogue.episodeId)
             if (ep != null) {
-                coordinator.runStage12Agent7MultitrackMixing(ep)
+                try { coordinator.runStage12Agent7MultitrackMixing(ep) } catch (_: Exception) {}
             }
         }
     }
@@ -843,7 +1116,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val currentAll = dao.getDialoguesChronologicalOnce(epId)
             redoStack.addLast(
                 UndoTimelineSnapshot(
-                    description = "Redo Timeline Move",
+                    description = "Redo",
                     dialogueTimestamps = currentAll.associate { it.id to it.timelineStartMs }
                 )
             )
@@ -856,7 +1129,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             }
             _canUndo.value = undoStack.isNotEmpty()
             _canRedo.value = redoStack.isNotEmpty()
-            dao.getEpisodeById(epId)?.let { coordinator.runStage12Agent7MultitrackMixing(it) }
+            dao.getEpisodeById(epId)?.let { try { coordinator.runStage12Agent7MultitrackMixing(it) } catch (_: Exception) {} }
         }
     }
 
@@ -867,7 +1140,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val currentAll = dao.getDialoguesChronologicalOnce(epId)
             undoStack.addLast(
                 UndoTimelineSnapshot(
-                    description = "Undo Timeline Move",
+                    description = "Undo",
                     dialogueTimestamps = currentAll.associate { it.id to it.timelineStartMs }
                 )
             )
@@ -880,13 +1153,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             }
             _canUndo.value = undoStack.isNotEmpty()
             _canRedo.value = redoStack.isNotEmpty()
-            dao.getEpisodeById(epId)?.let { coordinator.runStage12Agent7MultitrackMixing(it) }
+            dao.getEpisodeById(epId)?.let { try { coordinator.runStage12Agent7MultitrackMixing(it) } catch (_: Exception) {} }
         }
     }
 
-    /**
-     * Downloads and SHA-256 verifies a model from the verified Model Catalog.
-     */
+    fun remediateQcTarget(targetKey: String) {
+        when (targetKey.uppercase()) {
+            "TIMELINE", "MULTITRACKTIMELINE" -> selectTab(MainTab.TIMELINE)
+            "TRANSCRIPT", "DIALOGUESEGMENTATION" -> selectProductionSection(ProductionSection.TRANSCRIPT)
+            "SPEAKERS", "CHARACTERVOICEPROFILES" -> selectProductionSection(ProductionSection.SPEAKERS)
+            "TRANSLATION", "TRANSLATIONSTUDIO" -> selectProductionSection(ProductionSection.TRANSLATION)
+            "VOICE_GEN", "VOICEGENERATIONSTUDIO", "CHARACTERBATCHQUEUE" -> selectProductionSection(ProductionSection.VOICE_GEN)
+            "AUDIO_STEMS", "BACKGROUNDAUDIOSTUDIO", "AUDIOSTEMMANAGER" -> selectProductionSection(ProductionSection.AUDIO_STEMS)
+            else -> selectProductionSection(ProductionSection.QC_EXPORT)
+        }
+    }
+
     fun downloadModel(modelId: String, hfToken: String? = null) {
         viewModelScope.launch {
             modelDownloadManager.downloadAndVerifyModel(modelId, hfToken)
@@ -899,9 +1181,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    /**
-     * Exports the final dubbed episode in MP4 or WAV Audio-Only format.
-     */
     fun exportFinalDubbedEpisode(
         exportFormat: String,
         resolution: String,
@@ -912,15 +1191,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         customFileName: String
     ) {
         val epId = _activeEpisodeId.value
+        if (epId <= 0L) return
         viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = 14,
-                activeStageTitle = "Stage 14 — Final Export Studio",
-                activeDetail = "Muxing synchronized Hindi-Hinglish dialogue + preserved background stems ($resolution, $audioSampleRateHz Hz)..."
+                activeStageTitle = "Exporting ${if (exportFormat == "MP4_VIDEO") "MP4 Video" else "WAV Audio"}",
+                activeDetail = "Writing and verifying output file on disk…"
             )
-            val ep = dao.getEpisodeById(epId)
-            if (ep != null) {
+            try {
+                val ep = dao.getEpisodeById(epId)
+                    ?: throw IllegalStateException("Active episode not found.")
                 val exportedEp = coordinator.runStage14FinalExport(
                     episode = ep,
                     exportFormat = exportFormat,
@@ -933,7 +1214,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 )
                 _pipelineBanner.value = PipelineBannerState(
                     isRunning = false,
-                    statusBannerMessage = "Export complete: ${exportedEp.exportedVideoPath?.substringAfterLast('/')}"
+                    statusBannerMessage = "Export verified: ${exportedEp.exportedVideoPath?.substringAfterLast('/')}"
+                )
+            } catch (e: Exception) {
+                _pipelineBanner.value = PipelineBannerState(
+                    isRunning = false,
+                    statusBannerMessage = e.localizedMessage ?: "Export failed.",
+                    isError = true
                 )
             }
         }

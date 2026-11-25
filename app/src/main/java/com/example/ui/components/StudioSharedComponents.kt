@@ -3,35 +3,34 @@ package com.example.ui.components
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -40,361 +39,539 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.example.data.local.EpisodeEntity
+import com.example.data.local.ProjectEntity
 import com.example.engine.AudioDspEngine
 import com.example.engine.AudioPlaybackState
+import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.StudioAmber
-import com.example.ui.theme.StudioAmberContainer
 import com.example.ui.theme.StudioBorder
+import com.example.ui.theme.StudioBorderSubtle
 import com.example.ui.theme.StudioCrimson
-import com.example.ui.theme.StudioCrimsonContainer
 import com.example.ui.theme.StudioCyan
-import com.example.ui.theme.StudioCyanContainer
 import com.example.ui.theme.StudioEmerald
-import com.example.ui.theme.StudioEmeraldContainer
+import com.example.ui.theme.StudioSurface
 import com.example.ui.theme.StudioSurfaceElevated
 import com.example.ui.theme.StudioTextMuted
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioViolet
-import com.example.ui.theme.StudioVioletContainer
-import com.example.viewmodel.PipelineBannerState
+import com.example.ui.theme.speakerColorFor
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-/**
- * Formats milliseconds into exact studio timecode: MM:SS.mmm (e.g., 00:05.000).
- */
-fun formatTimecodeMs(ms: Long): String {
-    val safeMs = ms.coerceAtLeast(0L)
-    val minutes = (safeMs / 60000L)
-    val seconds = (safeMs % 60000L) / 1000L
-    val millis = safeMs % 1000L
-    return "%02d:%02d.%03d".format(minutes, seconds, millis)
+fun speakerAccentColor(label: String): Color = speakerColorFor(label)
+
+fun formatTimeMs(ms: Long): String {
+    val safe = ms.coerceAtLeast(0L)
+    val totalSec = safe / 1000L
+    val mins = totalSec / 60L
+    val secs = totalSec % 60L
+    val millis = (safe % 1000L) / 10L
+    return "%02d:%02d.%02d".format(mins, secs, millis)
+}
+
+fun formatDurationCompact(ms: Long): String {
+    if (ms <= 0L) return "0:00"
+    val totalSec = ms / 1000L
+    val hrs = totalSec / 3600L
+    val mins = (totalSec % 3600L) / 60L
+    val secs = totalSec % 60L
+    return if (hrs > 0L) "%d:%02d:%02d".format(hrs, mins, secs) else "%d:%02d".format(mins, secs)
+}
+
+fun formatBytes(bytes: Long): String {
+    if (bytes <= 0L) return "0 B"
+    return when {
+        bytes >= 1024L * 1024L * 1024L -> "%.2f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
+        bytes >= 1024L * 1024L -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> "%.1f KB".format(bytes / 1024.0)
+        else -> "$bytes B"
+    }
+}
+
+fun formatElapsedMs(startMs: Long, endMs: Long): String {
+    val diff = (endMs - startMs).coerceAtLeast(0L)
+    return when {
+        diff < 1000L -> "${diff}ms"
+        diff < 60_000L -> "%.1fs".format(diff / 1000.0)
+        else -> "${diff / 60_000L}m ${(diff % 60_000L) / 1000L}s"
+    }
+}
+
+fun formatShortDate(epochMs: Long): String {
+    if (epochMs <= 0L) return "—"
+    return SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()).format(Date(epochMs))
+}
+
+@Composable
+fun StudioCard(
+    modifier: Modifier = Modifier,
+    elevated: Boolean = false,
+    accentBorder: Color? = null,
+    padding: Dp = 16.dp,
+    onClick: (() -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val container = if (elevated) StudioSurfaceElevated else StudioSurface
+    val borderColor = accentBorder ?: if (elevated) StudioBorder else StudioBorderSubtle
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+        shape = RoundedCornerShape(14.dp),
+        color = container,
+        border = BorderStroke(1.dp, borderColor),
+        tonalElevation = 0.dp
+    ) {
+        Column(
+            modifier = Modifier.padding(padding),
+            content = content
+        )
+    }
+}
+
+@Composable
+fun StatusPill(
+    text: String,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(6.dp),
+        color = color.copy(alpha = 0.14f),
+        border = BorderStroke(1.dp, color.copy(alpha = 0.35f))
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = FontWeight.SemiBold,
+                fontFamily = JetBrainsMonoFamily
+            ),
+            color = color,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+        )
+    }
+}
+
+fun statusColorFor(status: String): Color = when (status.uppercase()) {
+    "COMPLETED", "PASSED", "INSTALLED", "VERIFIED", "READY", "SYNCED", "SUCCESS", "BUILT_IN" -> StudioEmerald
+    "RUNNING", "DOWNLOADING", "VERIFYING", "TRANSLATED", "GENERATED", "RETRIED" -> StudioCyan
+    "WARNING", "PENDING", "WAITING", "PAUSED_CHECKPOINT" -> StudioAmber
+    "FAILED", "ERROR", "CORRUPTED", "BLOCKED" -> StudioCrimson
+    else -> StudioTextMuted
 }
 
 @Composable
 fun StudioSectionHeader(
     title: String,
     subtitle: String? = null,
-    badgeText: String? = null,
-    badgeColor: Color = StudioViolet
+    trailing: @Composable (() -> Unit)? = null
 ) {
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = title,
-                style = MaterialTheme.typography.headlineSmall,
+                style = MaterialTheme.typography.titleMedium,
                 color = StudioTextPrimary,
-                modifier = Modifier.weight(1f)
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
-            if (!badgeText.isNullOrBlank()) {
-                Surface(
-                    color = badgeColor.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(8.dp),
-                    border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.45f))
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = StudioTextSecondary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        if (trailing != null) {
+            Spacer(modifier = Modifier.width(8.dp))
+            trailing()
+        }
+    }
+}
+
+@Composable
+fun StudioEmptyState(
+    icon: ImageVector,
+    title: String,
+    description: String,
+    primaryActionLabel: String? = null,
+    onPrimaryAction: (() -> Unit)? = null,
+    secondaryActionLabel: String? = null,
+    onSecondaryAction: (() -> Unit)? = null,
+    testTagPrefix: String = "empty_state"
+) {
+    StudioCard(
+        modifier = Modifier.testTag("${testTagPrefix}_card"),
+        padding = 24.dp
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(StudioSurfaceElevated)
+                    .border(1.dp, StudioBorder, RoundedCornerShape(14.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = title,
+                    tint = StudioViolet,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = StudioTextPrimary,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodyMedium,
+                color = StudioTextSecondary,
+                textAlign = TextAlign.Center
+            )
+            if (primaryActionLabel != null && onPrimaryAction != null) {
+                Spacer(modifier = Modifier.height(20.dp))
+                Button(
+                    onClick = onPrimaryAction,
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("${testTagPrefix}_primary_btn"),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = StudioViolet,
+                        contentColor = Color(0xFF0A0B0F)
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Text(
-                        text = badgeText,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = badgeColor,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                    )
+                    Text(primaryActionLabel, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+            if (secondaryActionLabel != null && onSecondaryAction != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onSecondaryAction,
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("${testTagPrefix}_secondary_btn"),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, StudioBorder)
+                ) {
+                    Text(secondaryActionLabel, color = StudioTextPrimary)
                 }
             }
         }
-        if (!subtitle.isNullOrBlank()) {
-            Spacer(modifier = Modifier.height(2.dp))
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = StudioTextSecondary
-            )
+    }
+}
+
+/**
+ * Compact contextual strip so the user always sees which Project, Episode, and Stage is open,
+ * how many stages are complete, and whether anything needs attention.
+ */
+@Composable
+fun ActiveContextBar(
+    project: ProjectEntity?,
+    episode: EpisodeEntity?,
+    onSwitchProject: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (episode == null) return
+    val completedCount = (1..14).count { (episode.completedStagesMask and (1 shl it)) != 0 }
+    val hasError = episode.pipelineStatus == "ERROR" || !episode.lastErrorMessage.isNullOrBlank()
+    val statusColor = when {
+        hasError -> StudioCrimson
+        episode.pipelineStatus == "RUNNING" -> StudioCyan
+        completedCount >= 13 -> StudioEmerald
+        else -> StudioAmber
+    }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(onClick = onSwitchProject),
+        color = StudioSurface,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, if (hasError) StudioCrimson.copy(alpha = 0.45f) else StudioBorderSubtle)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "${project?.title ?: "Project"} • Ep ${episode.episodeNumber}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = StudioTextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = episode.currentStageName,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (hasError) StudioCrimson else StudioTextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = when {
+                        hasError -> Icons.Default.ErrorOutline
+                        completedCount >= 13 -> Icons.Default.CheckCircle
+                        else -> Icons.Default.Schedule
+                    },
+                    contentDescription = "Stage Status",
+                    tint = statusColor,
+                    modifier = Modifier.size(16.dp)
+                )
+                StatusPill(text = "$completedCount/14", color = statusColor)
+            }
         }
     }
 }
 
-@Composable
-fun RuntimeCompatibilityBadge(runtimeType: String) {
-    val (bg, fg, label) = when (runtimeType) {
-        "ANDROID_LOCAL" -> Triple(StudioEmeraldContainer, StudioEmerald, "ANDROID LOCAL DSP")
-        "ONNX_ANDROID" -> Triple(StudioCyanContainer, StudioCyan, "ONNX ANDROID")
-        "NATIVE_CPP_DSP" -> Triple(StudioEmeraldContainer, StudioEmerald, "NATIVE C++ / PCM")
-        "EXTERNAL_API" -> Triple(StudioVioletContainer, StudioViolet, "FIREBASE AI LOGIC")
-        else -> Triple(StudioAmberContainer, StudioAmber, "REMOTE GPU WORKER")
-    }
-    Surface(
-        color = bg,
-        shape = RoundedCornerShape(6.dp),
-        border = BorderStroke(1.dp, fg.copy(alpha = 0.4f))
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = fg,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-        )
-    }
-}
-
+/**
+ * Honest PCM Waveform Canvas.
+ * Renders real PCM amplitude bars extracted strictly from [audioFilePath].
+ * Never draws synthetic sine waves if no real audio file exists.
+ */
 @Composable
 fun AudioWaveformCanvas(
     audioFilePath: String?,
-    accentColor: Color = StudioViolet,
-    height: Dp = 52.dp,
-    barCount: Int = 44,
-    progressFraction: Float = 0f,
-    onSeekFraction: ((Float) -> Unit)? = null
+    accentColor: Color,
+    modifier: Modifier = Modifier,
+    barCount: Int = 56,
+    playbackProgress: Float = 0f
 ) {
     val peaks = remember(audioFilePath, barCount) {
         if (audioFilePath.isNullOrBlank()) {
-            List(barCount) { i -> 0.18f + 0.45f * kotlin.math.abs(kotlin.math.sin(i * 0.45f)) }
+            emptyList()
         } else {
             AudioDspEngine.extractWaveformPeaks(File(audioFilePath), barCount)
         }
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(height)
-            .background(Color(0xFF0E1019), RoundedCornerShape(8.dp))
-            .then(
-                if (onSeekFraction != null) {
-                    Modifier.pointerInput(Unit) {
-                        detectTapGestures { offset ->
-                            if (size.width > 0) {
-                                onSeekFraction((offset.x / size.width).coerceIn(0f, 1f))
-                            }
-                        }
-                    }
-                } else Modifier
-            )
-            .padding(horizontal = 6.dp, vertical = 6.dp)
-    ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val w = size.width
-            val h = size.height
-            val count = peaks.size.coerceAtLeast(1)
-            val slotWidth = w / count
-            val barWidth = (slotWidth * 0.64f).coerceAtLeast(2f)
-
-            // Center line
-            drawLine(
-                color = StudioBorder.copy(alpha = 0.5f),
-                start = Offset(0f, h / 2f),
-                end = Offset(w, h / 2f),
-                strokeWidth = 1f
-            )
-
-            for (i in peaks.indices) {
-                val frac = i.toFloat() / count
-                val amp = peaks[i].coerceIn(0.08f, 1.0f)
-                val barH = (h * amp).coerceAtLeast(4f)
-                val x = i * slotWidth + (slotWidth - barWidth) / 2f
-                val y = (h - barH) / 2f
-                val color = if (progressFraction > 0f && frac <= progressFraction) {
-                    StudioCyan
-                } else {
-                    accentColor.copy(alpha = 0.82f)
-                }
-                drawRoundRect(
-                    color = color,
-                    topLeft = Offset(x, y),
-                    size = Size(barWidth, barH),
-                    cornerRadius = CornerRadius(2f, 2f)
-                )
-            }
-
-            if (progressFraction in 0.001f..0.999f) {
-                val playheadX = w * progressFraction
+    if (peaks.isEmpty()) {
+        Box(
+            modifier = modifier
+                .fillMaxWidth()
+                .height(40.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(StudioSurfaceElevated.copy(alpha = 0.55f))
+                .border(1.dp, StudioBorderSubtle, RoundedCornerShape(8.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.fillMaxWidth().height(1.dp)) {
                 drawLine(
-                    color = Color.White,
-                    start = Offset(playheadX, 0f),
-                    end = Offset(playheadX, h),
-                    strokeWidth = 3f
+                    color = StudioBorder,
+                    start = Offset(12f, 0f),
+                    end = Offset(size.width - 12f, 0f),
+                    strokeWidth = 1.5f,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 8f), 0f)
                 )
             }
+            Text(
+                text = "No audio waveform",
+                style = MaterialTheme.typography.labelSmall,
+                color = StudioTextMuted,
+                modifier = Modifier
+                    .background(StudioSurfaceElevated)
+                    .padding(horizontal = 8.dp)
+            )
+        }
+        return
+    }
+
+    Canvas(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(40.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(StudioSurfaceElevated.copy(alpha = 0.7f))
+    ) {
+        val count = peaks.size
+        val barWidth = (size.width / count).coerceAtLeast(2f)
+        val gap = (barWidth * 0.28f).coerceAtLeast(1f)
+        val drawWidth = (barWidth - gap).coerceAtLeast(1.5f)
+        val midY = size.height / 2f
+
+        for (i in 0 until count) {
+            val amp = peaks[i].coerceIn(0.05f, 1.0f)
+            val barH = (amp * size.height * 0.84f).coerceAtLeast(3f)
+            val x = i * barWidth + gap / 2f
+            val frac = i.toFloat() / count.toFloat()
+            val color = if (playbackProgress > 0f && frac <= playbackProgress) {
+                accentColor
+            } else {
+                accentColor.copy(alpha = 0.42f)
+            }
+            drawRoundRect(
+                color = color,
+                topLeft = Offset(x, midY - barH / 2f),
+                size = Size(drawWidth, barH),
+                cornerRadius = CornerRadius(2f, 2f)
+            )
         }
     }
 }
 
 @Composable
-fun AudioPlayPreviewButton(
+fun AudioPlayPauseButton(
     filePath: String?,
     label: String,
     playbackState: AudioPlaybackState,
-    onPlayClick: (String, String) -> Unit,
-    onStopClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    accentColor: Color = StudioViolet
+    onTogglePlay: (String, String) -> Unit,
+    accentColor: Color = StudioViolet,
+    modifier: Modifier = Modifier
 ) {
-    val isThisPlaying = playbackState.isPlaying && playbackState.activeFilePath == filePath && !filePath.isNullOrBlank()
-    val fileExists = remember(filePath) { !filePath.isNullOrBlank() && File(filePath).exists() }
+    val fileExists = remember(filePath) {
+        !filePath.isNullOrBlank() && File(filePath).exists() && File(filePath).length() > 44L
+    }
+    val isThisPlaying = playbackState.isPlaying && playbackState.activeFilePath == filePath
 
-    OutlinedButton(
+    IconButton(
         onClick = {
-            if (isThisPlaying) {
-                onStopClick()
-            } else if (!filePath.isNullOrBlank()) {
-                onPlayClick(filePath, label)
+            if (fileExists && !filePath.isNullOrBlank()) {
+                onTogglePlay(filePath, label)
             }
         },
         enabled = fileExists,
-        shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, if (isThisPlaying) StudioCyan else accentColor.copy(alpha = 0.6f)),
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = if (isThisPlaying) StudioCyanContainer else accentColor.copy(alpha = 0.10f),
-            contentColor = if (isThisPlaying) StudioCyan else StudioTextPrimary
-        ),
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-        modifier = modifier.height(38.dp).testTag("audio_preview_${label.take(12).replace(" ", "_")}")
+        modifier = modifier
+            .size(48.dp)
+            .clip(CircleShape)
+            .background(
+                when {
+                    !fileExists -> StudioSurfaceElevated.copy(alpha = 0.5f)
+                    isThisPlaying -> accentColor.copy(alpha = 0.22f)
+                    else -> StudioSurfaceElevated
+                }
+            )
+            .border(
+                1.dp,
+                if (isThisPlaying) accentColor else StudioBorderSubtle,
+                CircleShape
+            )
     ) {
         Icon(
-            imageVector = if (isThisPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
-            contentDescription = if (isThisPlaying) "Stop $label" else "Preview $label",
-            modifier = Modifier.size(16.dp)
-        )
-        Spacer(modifier = Modifier.width(6.dp))
-        Text(
-            text = if (isThisPlaying) {
-                "Stop (${formatTimecodeMs(playbackState.currentPositionMs)})"
-            } else {
-                label
-            },
-            style = MaterialTheme.typography.labelMedium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            imageVector = if (isThisPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+            contentDescription = if (isThisPlaying) "Pause $label" else "Play $label",
+            tint = if (fileExists) accentColor else StudioTextMuted,
+            modifier = Modifier.size(22.dp)
         )
     }
 }
 
 @Composable
-fun PipelineLiveStatusBanner(
-    bannerState: PipelineBannerState,
-    playbackState: AudioPlaybackState,
-    onStopAudio: () -> Unit,
-    onDismissBanner: () -> Unit
+fun MetadataChipRow(
+    items: List<Pair<String, String>>,
+    modifier: Modifier = Modifier
 ) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        if (bannerState.isRunning) {
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                colors = CardDefaults.cardColors(containerColor = StudioVioletContainer),
-                border = BorderStroke(1.dp, StudioViolet)
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        items.forEach { (label, value) ->
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(StudioSurfaceElevated)
+                    .border(1.dp, StudioBorderSubtle, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp,
-                            color = StudioCyan
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = bannerState.activeStageTitle,
-                            style = MaterialTheme.typography.titleSmall,
-                            color = StudioTextPrimary,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = bannerState.activeDetail,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextSecondary
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    LinearProgressIndicator(
-                        progress = { (bannerState.activeStageNumber.coerceIn(1, 14)) / 14f },
-                        modifier = Modifier.fillMaxWidth().height(5.dp),
-                        color = StudioCyan,
-                        trackColor = StudioSurfaceElevated
-                    )
-                }
-            }
-        } else if (!bannerState.statusBannerMessage.isNullOrBlank()) {
-            val isErr = bannerState.isError
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (isErr) StudioCrimsonContainer else StudioEmeraldContainer
-                ),
-                border = BorderStroke(1.dp, if (isErr) StudioCrimson else StudioEmerald)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = if (isErr) Icons.Default.Error else Icons.Default.CheckCircle,
-                        contentDescription = "Status",
-                        tint = if (isErr) StudioCrimson else StudioEmerald,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = bannerState.statusBannerMessage,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextPrimary,
-                        modifier = Modifier.weight(1f)
-                    )
-                    IconButton(onClick = onDismissBanner, modifier = Modifier.size(28.dp)) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Dismiss",
-                            tint = StudioTextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                }
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = StudioTextMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = value,
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        fontFamily = JetBrainsMonoFamily,
+                        fontWeight = FontWeight.SemiBold
+                    ),
+                    color = StudioTextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
+    }
+}
 
-        if (playbackState.isPlaying) {
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
-                colors = CardDefaults.cardColors(containerColor = StudioCyanContainer),
-                border = BorderStroke(1.dp, StudioCyan)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Sync,
-                        contentDescription = "Playing",
-                        tint = StudioCyan,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Playing: ${playbackState.activeLabel}  •  ${formatTimecodeMs(playbackState.currentPositionMs)} / ${formatTimecodeMs(playbackState.totalDurationMs)}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = StudioTextPrimary,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Text(
-                        text = "STOP",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = StudioCyan,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.clickable { onStopAudio() }.padding(4.dp)
-                    )
-                }
-            }
-        }
+@Composable
+fun WarningBanner(
+    message: String,
+    isError: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    val color = if (isError) StudioCrimson else StudioAmber
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(color.copy(alpha = 0.12f))
+            .border(1.dp, color.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Icon(
+            imageVector = if (isError) Icons.Default.ErrorOutline else Icons.Default.WarningAmber,
+            contentDescription = if (isError) "Error" else "Notice",
+            tint = color,
+            modifier = Modifier.size(18.dp)
+        )
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodySmall,
+            color = StudioTextPrimary,
+            modifier = Modifier.weight(1f)
+        )
     }
 }

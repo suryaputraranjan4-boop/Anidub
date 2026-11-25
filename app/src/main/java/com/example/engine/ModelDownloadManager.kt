@@ -241,6 +241,25 @@ class ModelDownloadManager(
     }
 
     companion object {
+        fun isLocalRuntime(runtimeCompatibility: String): Boolean {
+            return runtimeCompatibility in setOf("ANDROID_LOCAL", "ONNX_ANDROID", "NATIVE_CPP_DSP")
+        }
+
+        fun providerForModel(modelId: String): String = when (modelId) {
+            "faster_whisper_large_v3" -> "SYSTRAN / OpenAI"
+            "silero_vad_onnx" -> "Silero Team"
+            "whisperx_ja_align" -> "m-bain / Hugging Face"
+            "pyannote_diarization_community_1" -> "pyannoteAI"
+            "librosa_pyin_native_dsp" -> "Built-in Android DSP"
+            "firebase_ai_gemini_3_8_flash" -> "Google / Firebase AI Logic"
+            "coqui_xtts_v2" -> "Coqui AI"
+            "f5_tts_hindi_24khz" -> "SPRINGLab / SWivid"
+            "chatterbox_multilingual_v3" -> "ResembleAI (Archived)"
+            "uvr_mdx_net_demucs" -> "UVR / Meta Demucs + Local DSP"
+            "ffmpeg_native_timeline_dsp" -> "Android MediaCodec / Native PCM"
+            else -> "Open Source"
+        }
+
         fun buildVerifiedModelCatalog(): List<ModelManifestEntity> = listOf(
             ModelManifestEntity(
                 modelId = "faster_whisper_large_v3",

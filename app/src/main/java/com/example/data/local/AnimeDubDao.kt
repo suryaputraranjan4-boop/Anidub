@@ -210,6 +210,12 @@ interface AnimeDubDao {
     @Query("SELECT * FROM export_records WHERE episodeId = :episodeId ORDER BY exportedAt DESC")
     fun observeExportsForEpisode(episodeId: Long): Flow<List<ExportRecordEntity>>
 
+    @Query("SELECT * FROM export_records ORDER BY exportedAt DESC LIMIT 20")
+    fun observeAllExports(): Flow<List<ExportRecordEntity>>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertExportRecord(record: ExportRecordEntity): Long
+
+    @Query("DELETE FROM projects WHERE id = :projectId")
+    suspend fun deleteProjectById(projectId: Long)
 }

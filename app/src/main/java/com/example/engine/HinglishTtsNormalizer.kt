@@ -245,13 +245,7 @@ object HinglishTtsNormalizer {
         val outFile = File(outputDir, "dlg_${dialogueId.lowercase().replace('-', '_')}.wav")
         AudioDspEngine.writeWavFile(outFile, stretchedBuffer)
 
-        // Ensure actual duration reflects real PCM frames written
-        val actualMs = if (stretchedBuffer.durationMs == targetDurationMs) {
-            // Preserve authentic millisecond precision measurement (e.g., 2002 ms for 2000 ms target)
-            targetDurationMs + ((dialogueId.hashCode() and 3) + 1).toLong()
-        } else {
-            stretchedBuffer.durationMs
-        }
+        val actualMs = stretchedBuffer.durationMs
 
         return SynthesizedDialogueResult(
             outputFile = outFile,

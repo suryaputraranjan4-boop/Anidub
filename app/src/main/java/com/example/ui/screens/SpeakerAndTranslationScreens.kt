@@ -1,16 +1,16 @@
 package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -19,247 +19,276 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Book
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.RecordVoiceOver
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.data.local.DialogueSegmentEntity
 import com.example.data.local.DictionaryEntryEntity
 import com.example.data.local.SpeakerProfileEntity
-import com.example.engine.AudioPlaybackState
-import com.example.ui.components.AudioPlayPreviewButton
+import com.example.ui.components.AudioPlayPauseButton
 import com.example.ui.components.AudioWaveformCanvas
+import com.example.ui.components.MetadataChipRow
+import com.example.ui.components.StatusPill
+import com.example.ui.components.StudioCard
+import com.example.ui.components.StudioEmptyState
 import com.example.ui.components.StudioSectionHeader
-import com.example.ui.components.formatTimecodeMs
+import com.example.ui.components.WarningBanner
+import com.example.ui.components.speakerAccentColor
+import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.StudioAmber
-import com.example.ui.theme.StudioAmberContainer
 import com.example.ui.theme.StudioBorder
-import com.example.ui.theme.StudioCrimson
+import com.example.ui.theme.StudioBorderSubtle
 import com.example.ui.theme.StudioCyan
-import com.example.ui.theme.StudioCyanContainer
 import com.example.ui.theme.StudioEmerald
-import com.example.ui.theme.StudioEmeraldContainer
 import com.example.ui.theme.StudioSurface
 import com.example.ui.theme.StudioSurfaceElevated
 import com.example.ui.theme.StudioTextMuted
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioViolet
-import com.example.ui.theme.StudioVioletContainer
-import com.example.ui.theme.speakerColorFor
+import com.example.viewmodel.StudioViewModel
 
 /**
- * Screen 12 — Agent 3: Speaker Library (100% Audio-Only Speaker Identification)
+ * SPEAKER LIBRARY & CHARACTER PROFILES (AUDIO-ONLY)
+ * Zero visual or facial recognition. Neutral default names ("Speaker A", "Speaker B"),
+ * editable character names, measured F0 / timbre / speaking style / emotion,
+ * explicit Source Voice Consent vs Authorized Generic Voice distinction, and reference clip playback.
  */
 @Composable
-fun SpeakerLibraryScreen(
-    speakers: List<SpeakerProfileEntity>,
-    dialogues: List<DialogueSegmentEntity>,
-    playbackState: AudioPlaybackState,
-    onPlayAudio: (String, String) -> Unit,
-    onStopAudio: () -> Unit,
-    onRenameSpeaker: (SpeakerProfileEntity, String, Boolean) -> Unit,
-    onReassignDialogueSpeaker: (DialogueSegmentEntity, String) -> Unit,
-    onInspectVoiceAnalysis: (String) -> Unit,
-    onOpenVoiceProfiles: () -> Unit
-) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            StudioSectionHeader(
-                title = "Agent 3 — Audio-Only Speaker Library",
-                subtitle = "Stable speaker labels (A, B, C...) assigned by first chronological occurrence using 16-D voice embeddings & F0 acoustics",
-                badgeText = "ZERO VISUAL RECOGNITION"
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioEmeraldContainer),
-                border = BorderStroke(1.dp, StudioEmerald),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Default.RecordVoiceOver, contentDescription = null, tint = StudioEmerald)
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = "Audio-First Guarantee: No visual character recognition, no facial recognition, and no video-frame matching are used.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextPrimary
+fun SpeakerProfilesView(viewModel: StudioViewModel) {
+    val speakers by viewModel.speakers.collectAsState()
+    val playback by viewModel.playbackState.collectAsState()
+    val banner by viewModel.pipelineBanner.collectAsState()
+
+    var editingSpeaker by remember { mutableStateOf<SpeakerProfileEntity?>(null) }
+
+    if (editingSpeaker != null) {
+        val sp = editingSpeaker!!
+        var nameInput by remember(sp.id) { mutableStateOf(sp.characterName) }
+        var consentConfirmed by remember(sp.id) { mutableStateOf(sp.rightsConsentConfirmed) }
+
+        AlertDialog(
+            onDismissRequest = { editingSpeaker = null },
+            containerColor = StudioSurfaceElevated,
+            title = { Text("Edit Speaker ${sp.speakerLabel}", color = StudioTextPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = nameInput,
+                        onValueChange = { nameInput = it },
+                        label = { Text("Character Name") },
+                        placeholder = { Text("Speaker ${sp.speakerLabel}") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
                     )
-                }
-            }
-        }
-
-        items(speakers) { sp ->
-            val spColor = speakerColorFor(sp.speakerLabel)
-            var editableName by remember(sp.id, sp.characterName) { mutableStateOf(sp.characterName) }
-
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, spColor.copy(alpha = 0.6f)),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Surface(
-                            color = spColor.copy(alpha = 0.2f),
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, spColor)
-                        ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "SPEAKER ${sp.speakerLabel}",
+                                text = "Source Voice Rights Confirmed",
                                 style = MaterialTheme.typography.labelLarge,
-                                color = spColor,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
+                                color = StudioTextPrimary
+                            )
+                            Text(
+                                text = if (consentConfirmed) {
+                                    "Cloning from source vocal reference permitted."
+                                } else {
+                                    "Unconfirmed: uses authorized generic studio voice fallback."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = StudioTextSecondary
                             )
                         }
-                        Text(
-                            text = "${sp.dialogueCount} Dialogues • Consistency ${(sp.voiceConsistencyScore * 100).toInt()}%",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = StudioEmerald
+                        Switch(
+                            checked = consentConfirmed,
+                            onCheckedChange = { consentConfirmed = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF0A0B0F),
+                                checkedTrackColor = StudioEmerald
+                            )
                         )
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = editableName,
-                            onValueChange = { editableName = it },
-                            label = { Text("Character Name (${sp.speakerLabel} = ...)") },
-                            modifier = Modifier.weight(1f).testTag("speaker_rename_${sp.speakerLabel}")
-                        )
-                        Button(
-                            onClick = { onRenameSpeaker(sp, editableName, sp.rightsConsentConfirmed) },
-                            colors = ButtonDefaults.buttonColors(containerColor = StudioViolet)
-                        ) {
-                            Icon(Icons.Default.Edit, contentDescription = "Save Name", modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Save")
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Pitch Range: ${sp.f0MinHz}–${sp.f0MaxHz} Hz (Mean ${sp.f0MeanHz} Hz)  •  Timbre: ${sp.timbreDescriptor}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextSecondary
-                    )
-                    Text(
-                        text = "Voice Reference ID: ${sp.voiceReferenceId}  •  Similarity: ${(sp.voiceSimilarityScore * 100).toInt()}%",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = StudioCyan
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        AudioPlayPreviewButton(
-                            filePath = sp.voiceReferencePath,
-                            label = "Voice Ref ${sp.speakerLabel}",
-                            playbackState = playbackState,
-                            onPlayClick = onPlayAudio,
-                            onStopClick = onStopAudio,
-                            accentColor = spColor
-                        )
-                        OutlinedButton(onClick = { onInspectVoiceAnalysis(sp.speakerLabel) }) {
-                            Text("Acoustic Analysis")
-                        }
-                        OutlinedButton(onClick = onOpenVoiceProfiles) {
-                            Text("Profile")
-                        }
                     }
                 }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.renameSpeakerCharacter(sp, nameInput, consentConfirmed)
+                        editingSpeaker = null
+                    }
+                ) {
+                    Text("Save", color = StudioViolet)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingSpeaker = null }) {
+                    Text("Cancel", color = StudioTextSecondary)
+                }
             }
-        }
+        )
+    }
 
-        // Manual correction of speaker assignments per dialogue
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("speaker_profiles_list"),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
         item {
             StudioSectionHeader(
-                title = "Manual Speaker Assignment Correction",
-                subtitle = "Reassign any dialogue segment to Speaker A, B, or C while preserving global order number"
+                title = "Speaker Profiles (Audio-Only)",
+                subtitle = "Clustered strictly from F0 pitch & 16-D vocal embeddings — zero facial/video recognition"
             )
         }
 
-        items(dialogues) { dlg ->
-            val spColor = speakerColorFor(dlg.speakerLabel)
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, StudioBorder),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "${dlg.dialogueId} (${formatTimecodeMs(dlg.originalStartMs)} - ${formatTimecodeMs(dlg.originalEndMs)})",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = spColor
-                        )
-                        Text(
-                            text = dlg.japaneseText,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = StudioTextPrimary,
-                            maxLines = 1
+        if (speakers.isEmpty()) {
+            item {
+                StudioEmptyState(
+                    icon = Icons.Default.RecordVoiceOver,
+                    title = "No Detected Speakers Yet",
+                    description = "Run Stage 6 Audio-Only Speaker Analysis after speech segmentation to cluster recurring voices and build reusable character profiles.",
+                    primaryActionLabel = "Run Speaker Analysis (Stage 6)",
+                    onPrimaryAction = { if (!banner.isRunning) viewModel.runPipelineStages(6, 7) },
+                    testTagPrefix = "speakers_empty"
+                )
+            }
+        } else {
+            items(speakers, key = { it.id }) { sp ->
+                val accent = speakerAccentColor(sp.speakerLabel)
+                val consentLabel = if (sp.rightsConsentConfirmed) "Source Voice (Consented)" else "Authorized Generic Fallback"
+                val consentColor = if (sp.rightsConsentConfirmed) StudioEmerald else StudioAmber
+
+                StudioCard(padding = 16.dp) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            StatusPill(text = "Speaker ${sp.speakerLabel}", color = accent)
+                            Column {
+                                Text(
+                                    text = sp.characterName,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = StudioTextPrimary
+                                )
+                                Text(
+                                    text = "${sp.dialogueCount} dialogue line(s) • ${sp.voiceReferenceId}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                    color = StudioTextMuted
+                                )
+                            }
+                        }
+                        IconButton(
+                            onClick = { editingSpeaker = sp },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(Icons.Default.Edit, contentDescription = "Edit ${sp.characterName}", tint = StudioTextSecondary)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Explicit Rights Consent vs Authorized Generic Voice Badge + Inline Toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(Icons.Default.VerifiedUser, contentDescription = null, tint = consentColor, modifier = Modifier.size(16.dp))
+                            StatusPill(text = consentLabel, color = consentColor)
+                        }
+                        Switch(
+                            checked = sp.rightsConsentConfirmed,
+                            onCheckedChange = { confirmed ->
+                                viewModel.renameSpeakerCharacter(sp, sp.characterName, confirmed)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF0A0B0F),
+                                checkedTrackColor = StudioEmerald
+                            )
                         )
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        listOf("A", "B", "C").forEach { candidateLabel ->
-                            FilterChip(
-                                selected = dlg.speakerLabel == candidateLabel,
-                                onClick = {
-                                    if (dlg.speakerLabel != candidateLabel) {
-                                        onReassignDialogueSpeaker(dlg, candidateLabel)
-                                    }
-                                },
-                                label = { Text(candidateLabel) }
-                            )
-                        }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    MetadataChipRow(
+                        items = listOf(
+                            "F0 Mean" to if (sp.f0MeanHz > 0f) "${sp.f0MeanHz} Hz" else "—",
+                            "Pitch Range" to if (sp.f0MaxHz > 0f) "${sp.f0MinHz.toInt()}–${sp.f0MaxHz.toInt()} Hz" else "—",
+                            "Speed" to if (sp.speakingSpeedSylPerSec > 0f) "${sp.speakingSpeedSylPerSec} syl/s" else "—"
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "${sp.timbreDescriptor} • Style: ${sp.speakingStyle} • Dominant Tone: ${sp.dominantEmotion}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudioTextSecondary
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("Voice Reference Sample", style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        AudioPlayPauseButton(
+                            filePath = sp.voiceReferencePath,
+                            label = "${sp.characterName} Reference",
+                            playbackState = playback,
+                            onTogglePlay = { path, lbl -> viewModel.audioPlayer.togglePlayPause(path, lbl) },
+                            accentColor = accent
+                        )
+                        AudioWaveformCanvas(
+                            audioFilePath = sp.voiceReferencePath,
+                            accentColor = accent,
+                            modifier = Modifier.weight(1f),
+                            barCount = 48
+                        )
                     }
                 }
             }
@@ -268,642 +297,447 @@ fun SpeakerLibraryScreen(
 }
 
 /**
- * Screen 13 — Character Voice Profiles & Consent
+ * TRANSLATION & DICTIONARY STUDIO
+ * Clean Roman Hinglish translation editor (Japanese -> Roman Hinglish, never Devanagari)
+ * paired with Global / Anime / Project dictionary management.
  */
 @Composable
-fun CharacterVoiceProfilesScreen(
-    speakers: List<SpeakerProfileEntity>,
-    playbackState: AudioPlaybackState,
-    onPlayAudio: (String, String) -> Unit,
-    onStopAudio: () -> Unit,
-    onUpdateSpeakerConsent: (SpeakerProfileEntity, String, Boolean) -> Unit
-) {
+fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
+    val dialogues by viewModel.dialoguesChronological.collectAsState()
+    val dictionaries by viewModel.dictionaries.collectAsState()
+    val activeProject by viewModel.activeProject.collectAsState()
+    val banner by viewModel.pipelineBanner.collectAsState()
+
+    var subMode by remember { mutableStateOf("TRANSLATIONS") } // TRANSLATIONS or DICTIONARIES
+    var dictLevelFilter by remember { mutableStateOf("GLOBAL") } // GLOBAL, ANIME, PROJECT
+    var showAddDictDialog by remember { mutableStateOf(false) }
+    var editingDialogue by remember { mutableStateOf<DialogueSegmentEntity?>(null) }
+
+    val emotions = listOf("NEUTRAL", "ANGRY", "EXCITED", "CALM", "SAD", "HAPPY", "FEARFUL", "SHOUTING", "WHISPERING")
+
+    if (editingDialogue != null) {
+        val dlg = editingDialogue!!
+        var hinglishText by remember(dlg.id) { mutableStateOf(dlg.romanHinglishText) }
+        var emotion by remember(dlg.id) { mutableStateOf(dlg.emotion) }
+        var style by remember(dlg.id) { mutableStateOf(dlg.speakingStyle) }
+        val hasDevanagari = Regex("[\\u0900-\\u097F]").containsMatchIn(hinglishText)
+
+        AlertDialog(
+            onDismissRequest = { editingDialogue = null },
+            containerColor = StudioSurfaceElevated,
+            title = { Text("Translate ${dlg.dialogueId}", color = StudioTextPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (dlg.japaneseText.isNotBlank()) {
+                        Text(dlg.japaneseText, style = MaterialTheme.typography.bodySmall, color = StudioTextSecondary)
+                    }
+                    OutlinedTextField(
+                        value = hinglishText,
+                        onValueChange = { hinglishText = it },
+                        label = { Text("Roman Hinglish (Latin Script Only)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        isError = hasDevanagari,
+                        minLines = 2
+                    )
+                    if (hasDevanagari) {
+                        Text(
+                            "Devanagari script detected. Use Roman Hinglish (e.g., 'Mujhe kam mat samajhna.').",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = StudioAmber
+                        )
+                    }
+                    OutlinedTextField(
+                        value = style,
+                        onValueChange = { style = it },
+                        label = { Text("Speaking Style") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    Text("Emotion", style = MaterialTheme.typography.labelSmall, color = StudioTextSecondary)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        emotions.take(4).forEach { em ->
+                            FilterChip(
+                                selected = emotion == em,
+                                onClick = { emotion = em },
+                                label = { Text(em, style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        emotions.drop(4).take(4).forEach { em ->
+                            FilterChip(
+                                selected = emotion == em,
+                                onClick = { emotion = em },
+                                label = { Text(em, style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(
+                        enabled = !hasDevanagari,
+                        onClick = {
+                            viewModel.updateDialogueTranslationOnly(dlg, hinglishText, emotion, style)
+                            editingDialogue = null
+                        }
+                    ) {
+                        Text("Save Text", color = StudioCyan)
+                    }
+                    TextButton(
+                        enabled = !hasDevanagari && hinglishText.isNotBlank(),
+                        onClick = {
+                            viewModel.updateAndRegenerateSingleDialogue(dlg.id, hinglishText, emotion)
+                            editingDialogue = null
+                        }
+                    ) {
+                        Text("Save & Voice", color = StudioViolet)
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingDialogue = null }) {
+                    Text("Cancel", color = StudioTextSecondary)
+                }
+            }
+        )
+    }
+
+    if (showAddDictDialog) {
+        var jpTerm by remember { mutableStateOf("") }
+        var romanTerm by remember { mutableStateOf("") }
+        var pronGuide by remember { mutableStateOf("") }
+        var notes by remember { mutableStateOf("") }
+        var level by remember { mutableStateOf(dictLevelFilter) }
+
+        AlertDialog(
+            onDismissRequest = { showAddDictDialog = false },
+            containerColor = StudioSurfaceElevated,
+            title = { Text("Add Dictionary Term", color = StudioTextPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("GLOBAL", "ANIME", "PROJECT").forEach { lvl ->
+                            FilterChip(
+                                selected = level == lvl,
+                                onClick = { level = lvl },
+                                label = { Text(lvl, style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = jpTerm,
+                        onValueChange = { jpTerm = it },
+                        label = { Text("Japanese Term") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = romanTerm,
+                        onValueChange = { romanTerm = it },
+                        label = { Text("Preferred Roman Hinglish / English") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = pronGuide,
+                        onValueChange = { pronGuide = it },
+                        label = { Text("Pronunciation Hint (Optional)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = notes,
+                        onValueChange = { notes = it },
+                        label = { Text("Context Notes") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = jpTerm.isNotBlank() && romanTerm.isNotBlank(),
+                    onClick = {
+                        viewModel.addOrUpdateDictionaryEntry(
+                            DictionaryEntryEntity(
+                                dictionaryLevel = level,
+                                projectId = if (level == "PROJECT") activeProject?.id else null,
+                                animeSeriesName = if (level == "ANIME") activeProject?.animeSeriesName else null,
+                                japaneseSourceTerm = jpTerm.trim(),
+                                preferredRomanHinglish = romanTerm.trim(),
+                                preferredHindiWording = romanTerm.trim(),
+                                preferredEnglishWording = romanTerm.trim(),
+                                preserveOriginalEnglish = true,
+                                pronunciationGuidance = pronGuide.trim().ifBlank { romanTerm.trim() },
+                                contextNotes = notes.trim()
+                            )
+                        )
+                        showAddDictDialog = false
+                    }
+                ) {
+                    Text("Save Term", color = StudioViolet)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddDictDialog = false }) {
+                    Text("Cancel", color = StudioTextSecondary)
+                }
+            }
+        )
+    }
+
     LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("translation_studio_list"),
+        contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // Mode Switcher: Translations vs Dictionaries
         item {
-            StudioSectionHeader(
-                title = "Character Voice Profiles & Cloning Consent",
-                subtitle = "Reusable normalized voice reference per character with explicit rights/consent confirmation",
-                badgeText = "REUSABLE VOICE REF"
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = subMode == "TRANSLATIONS",
+                    onClick = { subMode = "TRANSLATIONS" },
+                    label = { Text("Hinglish Editor (${dialogues.size})") },
+                    modifier = Modifier.weight(1f),
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = StudioViolet.copy(alpha = 0.2f),
+                        selectedLabelColor = StudioViolet,
+                        containerColor = StudioSurface
+                    )
+                )
+                FilterChip(
+                    selected = subMode == "DICTIONARIES",
+                    onClick = { subMode = "DICTIONARIES" },
+                    label = { Text("Dictionaries (${dictionaries.size})") },
+                    modifier = Modifier.weight(1f),
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = StudioCyan.copy(alpha = 0.2f),
+                        selectedLabelColor = StudioCyan,
+                        containerColor = StudioSurface
+                    )
+                )
+            }
         }
 
-        items(speakers) { sp ->
-            val spColor = speakerColorFor(sp.speakerLabel)
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, spColor.copy(alpha = 0.55f)),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+        if (subMode == "TRANSLATIONS") {
+            item {
+                StudioCard(elevated = true) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "Speaker ${sp.speakerLabel}: ${sp.characterName}",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = StudioTextPrimary,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Surface(
-                            color = StudioVioletContainer,
-                            shape = RoundedCornerShape(6.dp)
-                        ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Roman Hinglish Translation", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                             Text(
-                                text = sp.voiceReferenceId,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = StudioViolet,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                "Powered by Gemini 3.8 Flash via Firebase AI Logic with 3-tier dictionary enforcement.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = StudioTextSecondary
                             )
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Clean Non-Overlapping Reference Sample • ${sp.preferredTtsEngine}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioCyan
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    AudioWaveformCanvas(
-                        audioFilePath = sp.voiceReferencePath,
-                        accentColor = spColor,
-                        height = 48.dp
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    // Mandatory Voice Actor Rights / Consent Confirmation
-                    Surface(
-                        color = if (sp.rightsConsentConfirmed) StudioEmeraldContainer else StudioAmberContainer,
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, if (sp.rightsConsentConfirmed) StudioEmerald else StudioAmber),
-                        modifier = Modifier.fillMaxWidth()
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = { viewModel.runPipelineStages(8, 8) },
+                        enabled = !banner.isRunning && dialogues.any { it.japaneseText.isNotBlank() },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("translation_run_gemini_btn"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = StudioViolet,
+                            contentColor = Color(0xFF0A0B0F)
+                        ),
+                        shape = RoundedCornerShape(10.dp)
                     ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Translate All Japanese Lines with Gemini")
+                    }
+                }
+            }
+
+            if (dialogues.isEmpty()) {
+                item {
+                    StudioEmptyState(
+                        icon = Icons.Default.Translate,
+                        title = "No Dialogues Ready for Translation",
+                        description = "Segment and transcribe dialogue lines in the Transcript tab first before translating into Roman Hinglish.",
+                        testTagPrefix = "translation_empty"
+                    )
+                }
+            } else {
+                items(dialogues, key = { it.id }) { dlg ->
+                    val accent = speakerAccentColor(dlg.speakerLabel)
+                    StudioCard(padding = 14.dp) {
                         Row(
-                            modifier = Modifier.padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                StatusPill(text = dlg.dialogueId, color = accent)
+                                StatusPill(text = dlg.emotion, color = StudioCyan)
+                                Text(
+                                    text = "${"%.2f".format(dlg.originalDurationMs / 1000.0)}s",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                    color = StudioTextMuted
+                                )
+                            }
+                            IconButton(
+                                onClick = { editingDialogue = dlg },
+                                modifier = Modifier.size(48.dp)
+                            ) {
+                                Icon(Icons.Default.Edit, contentDescription = "Edit translation", tint = StudioViolet, modifier = Modifier.size(18.dp))
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                            val wide = maxWidth >= 520.dp
+                            if (wide) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("JAPANESE SOURCE", style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = dlg.japaneseText.ifBlank { "No Japanese text entered" },
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = if (dlg.japaneseText.isNotBlank()) StudioTextSecondary else StudioAmber
+                                        )
+                                    }
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("ROMAN HINGLISH", style = MaterialTheme.typography.labelSmall, color = StudioViolet)
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = dlg.romanHinglishText.ifBlank { "Not translated yet" },
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = if (dlg.romanHinglishText.isNotBlank()) StudioTextPrimary else StudioTextMuted
+                                        )
+                                    }
+                                }
+                            } else {
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Column {
+                                        Text("JAPANESE SOURCE", style = MaterialTheme.typography.labelSmall, color = StudioTextMuted)
+                                        Text(
+                                            text = dlg.japaneseText.ifBlank { "No Japanese text entered" },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = if (dlg.japaneseText.isNotBlank()) StudioTextSecondary else StudioAmber
+                                        )
+                                    }
+                                    HorizontalDivider(color = StudioBorderSubtle)
+                                    Column {
+                                        Text("ROMAN HINGLISH", style = MaterialTheme.typography.labelSmall, color = StudioViolet)
+                                        Text(
+                                            text = dlg.romanHinglishText.ifBlank { "Not translated yet — tap Edit or run Gemini." },
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = if (dlg.romanHinglishText.isNotBlank()) StudioTextPrimary else StudioTextMuted
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (dlg.ttsNormalizedText.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "TTS Phonetic: ${dlg.ttsNormalizedText}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                color = StudioTextMuted
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            // 3-Tier Dictionaries: Global, Anime, Project
+            item {
+                StudioSectionHeader(
+                    title = "Terminology Dictionaries",
+                    subtitle = "Priority: Project > Anime > Global",
+                    trailing = {
+                        Button(
+                            onClick = { showAddDictDialog = true },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = StudioViolet,
+                                contentColor = Color(0xFF0A0B0F)
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Add Term")
+                        }
+                    }
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("GLOBAL", "ANIME", "PROJECT").forEach { lvl ->
+                        FilterChip(
+                            selected = dictLevelFilter == lvl,
+                            onClick = { dictLevelFilter = lvl },
+                            label = { Text(lvl) }
+                        )
+                    }
+                }
+            }
+
+            val scopedDicts = dictionaries.filter { it.dictionaryLevel == dictLevelFilter }
+            if (scopedDicts.isEmpty()) {
+                item {
+                    StudioEmptyState(
+                        icon = Icons.Default.Book,
+                        title = "No $dictLevelFilter Dictionary Terms",
+                        description = "Add recurring character names, anime attacks, or English loanwords so Gemini translation and TTS pronunciation stay consistent.",
+                        primaryActionLabel = "Add $dictLevelFilter Term",
+                        onPrimaryAction = { showAddDictDialog = true }
+                    )
+                }
+            } else {
+                items(scopedDicts, key = { it.id }) { entry ->
+                    StudioCard(padding = 12.dp) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        Icons.Default.Security,
-                                        contentDescription = null,
-                                        tint = if (sp.rightsConsentConfirmed) StudioEmerald else StudioAmber,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = if (sp.rightsConsentConfirmed) {
-                                            "Voice Cloning Rights & Authorization Confirmed"
-                                        } else {
-                                            "Using Consented Generic Studio Voice Alternative"
-                                        },
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = StudioTextPrimary
-                                    )
-                                }
                                 Text(
-                                    text = "Toggle OFF if authorization is unavailable to automatically switch to a consented generic studio voice profile.",
+                                    text = "${entry.japaneseSourceTerm}  →  ${entry.preferredRomanHinglish}",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = StudioTextPrimary
+                                )
+                                Text(
+                                    text = "Pronunciation: ${entry.pronunciationGuidance.ifBlank { entry.preferredRomanHinglish }}${if (entry.contextNotes.isNotBlank()) " • ${entry.contextNotes}" else ""}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = StudioTextSecondary
                                 )
                             }
-                            Switch(
-                                checked = sp.rightsConsentConfirmed,
-                                onCheckedChange = { confirmed ->
-                                    onUpdateSpeakerConsent(sp, sp.characterName, confirmed)
-                                }
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    AudioPlayPreviewButton(
-                        filePath = sp.voiceReferencePath,
-                        label = "Preview Reference (${sp.voiceReferenceId})",
-                        playbackState = playbackState,
-                        onPlayClick = onPlayAudio,
-                        onStopClick = onStopAudio,
-                        accentColor = spColor
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * Screen 14 — Voice Analysis Details (Agent 3 Acoustic & Embedding Inspector)
- */
-@Composable
-fun VoiceAnalysisDetailsScreen(
-    speakers: List<SpeakerProfileEntity>,
-    selectedSpeakerLabel: String,
-    onSelectSpeaker: (String) -> Unit
-) {
-    val activeSpeaker = speakers.find { it.speakerLabel == selectedSpeakerLabel }
-        ?: speakers.firstOrNull()
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            StudioSectionHeader(
-                title = "Agent 3 — Acoustic & Voice Embedding Analysis",
-                subtitle = "11 multi-dimensional voice characteristics extracted strictly from audio (Zero visual matching)",
-                badgeText = "LIBROSA.PYIN + 16-D EMBEDDING"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                speakers.forEach { sp ->
-                    FilterChip(
-                        selected = sp.speakerLabel == activeSpeaker?.speakerLabel,
-                        onClick = { onSelectSpeaker(sp.speakerLabel) },
-                        label = { Text("Speaker ${sp.speakerLabel} (${sp.characterName.take(12)})") }
-                    )
-                }
-            }
-        }
-
-        if (activeSpeaker != null) {
-            val spColor = speakerColorFor(activeSpeaker.speakerLabel)
-            val acousticMetrics = listOf(
-                "1. Pitch & F0 Range" to "${activeSpeaker.f0MinHz} Hz – ${activeSpeaker.f0MaxHz} Hz",
-                "2. Mean F0 & Pitch Variation (Std)" to "Mean: ${activeSpeaker.f0MeanHz} Hz  •  Std Dev: ±${activeSpeaker.f0StdHz} Hz",
-                "3. Tone Characteristics" to "Harmonic Fundamental with Balanced Formant Tilt",
-                "4. Timbre Classification" to activeSpeaker.timbreDescriptor,
-                "5. Spectral Centroid" to "${activeSpeaker.spectralCentroidHz} Hz",
-                "6. Speaking Speed" to "${activeSpeaker.speakingSpeedSylPerSec} syllables / sec",
-                "7. Voice Texture" to activeSpeaker.voiceTexture,
-                "8. Speaking Style" to activeSpeaker.speakingStyle,
-                "9. Dominant Emotion Estimate" to activeSpeaker.dominantEmotion,
-                "10. Intra-Cluster Voice Similarity" to "${(activeSpeaker.voiceSimilarityScore * 100).toInt()}% Cosine Match",
-                "11. Episode Voice Consistency" to "${(activeSpeaker.voiceConsistencyScore * 100).toInt()}% Cross-Dialogue Stability"
-            )
-
-            item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                    border = BorderStroke(1.dp, spColor),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(
-                            text = "Speaker ${activeSpeaker.speakerLabel} — ${activeSpeaker.characterName}",
-                            style = MaterialTheme.typography.headlineSmall,
-                            color = spColor
-                        )
-                        acousticMetrics.forEach { (label, value) ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
+                            IconButton(
+                                onClick = { viewModel.deleteDictionaryEntry(entry.id) },
+                                modifier = Modifier.size(48.dp)
                             ) {
-                                Text(text = label, style = MaterialTheme.typography.bodySmall, color = StudioTextSecondary, modifier = Modifier.weight(0.46f))
-                                Text(text = value, style = MaterialTheme.typography.labelMedium, color = StudioTextPrimary, modifier = Modifier.weight(0.54f))
+                                Icon(Icons.Default.DeleteOutline, contentDescription = "Delete term", tint = StudioTextMuted)
                             }
                         }
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "16-Dimensional Acoustic Speaker Embedding Vector:",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = StudioCyan
-                        )
-                        Text(
-                            text = activeSpeaker.speakerEmbeddingJson,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioTextSecondary
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * Screen 15 — Agent 4: Translation Studio (Firebase AI Logic Gemini 3.8 Flash + Scoped Dictionary)
- */
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-fun TranslationStudioScreen(
-    dialogues: List<DialogueSegmentEntity>,
-    onReRunGeminiTranslation: () -> Unit,
-    onUpdateSingleLineAndRegenerate: (Long, String, String) -> Unit,
-    onApplyScopedTermReplacement: (
-        targetDialogueId: Long?,
-        japaneseTerm: String,
-        oldWord: String,
-        newRomanHinglish: String,
-        pronunciation: String,
-        scope: String
-    ) -> Unit,
-    onOpenGlobalDictionary: () -> Unit,
-    onOpenAnimeDictionary: () -> Unit
-) {
-    var selectedDlgForTermEdit by remember { mutableStateOf<DialogueSegmentEntity?>(null) }
-    var oldTermInput by remember { mutableStateOf("Dungeon") }
-    var newTermInput by remember { mutableStateOf("Dungeon") }
-    var jpTermInput by remember { mutableStateOf("ダンジョン") }
-    var pronInput by remember { mutableStateOf("[EN:Dungeon]") }
-    var selectedScope by remember { mutableStateOf("EVERYWHERE") }
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            StudioSectionHeader(
-                title = "Agent 4 — Gemini Roman Hinglish Translation Studio",
-                subtitle = "Visible translation strictly uses natural spoken Roman Hinglish (never Devanagari) with preserved Japanese source & internal TTS phonetic representation",
-                badgeText = "GEMINI 3.8 FLASH"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = onReRunGeminiTranslation,
-                    colors = ButtonDefaults.buttonColors(containerColor = StudioViolet),
-                    modifier = Modifier.weight(1f).testTag("translation_run_gemini_btn")
-                ) {
-                    Icon(Icons.Default.Translate, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Translate All with Gemini")
-                }
-                OutlinedButton(onClick = onOpenGlobalDictionary) {
-                    Text("Global Dict")
-                }
-                OutlinedButton(onClick = onOpenAnimeDictionary) {
-                    Text("Anime Dict")
-                }
-            }
-        }
-
-        // Scoped Dictionary Term Replacement Workbench (All 6 Mandatory Scopes)
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, StudioCyan.copy(alpha = 0.6f)),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "SCOPED DICTIONARY REPLACEMENT & DEPENDENCY-AWARE INVALIDATION",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = StudioCyan
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = oldTermInput,
-                            onValueChange = { oldTermInput = it },
-                            label = { Text("Find Term") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = newTermInput,
-                            onValueChange = { newTermInput = it },
-                            label = { Text("Preferred Roman Hinglish") },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = jpTermInput,
-                            onValueChange = { jpTermInput = it },
-                            label = { Text("Japanese Source Term") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = pronInput,
-                            onValueChange = { pronInput = it },
-                            label = { Text("TTS Pronunciation") },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Text(
-                        text = "Select Replacement Scope (Target Dialogue: ${selectedDlgForTermEdit?.dialogueId ?: dialogues.firstOrNull()?.dialogueId ?: "A-001"}):",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = StudioTextSecondary
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        listOf(
-                            "EVERYWHERE" to "Change everywhere",
-                            "ONLY_HERE" to "Change only here",
-                            "CURRENT_DIALOGUE" to "Change in current dialogue",
-                            "CURRENT_EPISODE" to "Change in current episode",
-                            "CURRENT_ANIME" to "Change in current anime",
-                            "GLOBALLY" to "Change globally"
-                        ).forEach { (scopeKey, label) ->
-                            FilterChip(
-                                selected = selectedScope == scopeKey,
-                                onClick = { selectedScope = scopeKey },
-                                label = { Text(label) }
-                            )
-                        }
-                    }
-                    Button(
-                        onClick = {
-                            val targetId = selectedDlgForTermEdit?.id ?: dialogues.firstOrNull()?.id
-                            onApplyScopedTermReplacement(
-                                targetId,
-                                jpTermInput,
-                                oldTermInput,
-                                newTermInput,
-                                pronInput,
-                                selectedScope
-                            )
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = StudioCyan),
-                        modifier = Modifier.fillMaxWidth().testTag("apply_scoped_dict_btn")
-                    ) {
-                        Text("Apply Scoped Dictionary Replacement & Regenerate Affected Audio Only", color = StudioSurface)
-                    }
-                }
-            }
-        }
-
-        items(dialogues) { dlg ->
-            val spColor = speakerColorFor(dlg.speakerLabel)
-            var editHinglish by remember(dlg.id, dlg.romanHinglishText) { mutableStateOf(dlg.romanHinglishText) }
-            var editEmotion by remember(dlg.id, dlg.emotion) { mutableStateOf(dlg.emotion) }
-
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, spColor.copy(alpha = 0.5f)),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { selectedDlgForTermEdit = dlg }
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "${dlg.dialogueId} • Speaker ${dlg.speakerLabel} (${formatTimecodeMs(dlg.originalStartMs)} - ${formatTimecodeMs(dlg.originalEndMs)})",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = spColor,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "Window: %.2fs".format(dlg.originalDurationMs / 1000.0),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = StudioEmerald
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "Original Japanese (Preserved): ${dlg.japaneseText}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextSecondary
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = editHinglish,
-                        onValueChange = { editHinglish = it },
-                        label = { Text("Visible Roman Hinglish Translation (Never Devanagari)") },
-                        modifier = Modifier.fillMaxWidth().testTag("hinglish_input_${dlg.dialogueId}")
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Internal TTS Pronunciation Layer: ${dlg.ttsNormalizedText}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = StudioCyan
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Emotion: $editEmotion • Style: ${dlg.speakingStyle}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioTextMuted
-                        )
-                        Button(
-                            onClick = { onUpdateSingleLineAndRegenerate(dlg.id, editHinglish, editEmotion) },
-                            colors = ButtonDefaults.buttonColors(containerColor = StudioViolet)
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Save & Regen ${dlg.dialogueId}")
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * Screen 16 & 17 — Global Dictionary & Anime/Project Dictionary Screens
- */
-@Composable
-fun DictionaryManagerScreen(
-    levelFilter: String, // "GLOBAL" or "ANIME_PROJECT"
-    entries: List<DictionaryEntryEntity>,
-    onSaveEntry: (DictionaryEntryEntity) -> Unit,
-    onDeleteEntry: (Long) -> Unit,
-    onSwitchLevelView: () -> Unit
-) {
-    var selectedLevel by remember(levelFilter) {
-        mutableStateOf(if (levelFilter == "GLOBAL") "GLOBAL" else "ANIME")
-    }
-    var jpSource by remember { mutableStateOf("") }
-    var romanHinglish by remember { mutableStateOf("") }
-    var hindiWord by remember { mutableStateOf("") }
-    var englishWord by remember { mutableStateOf("") }
-    var pronunciation by remember { mutableStateOf("") }
-    var contextNote by remember { mutableStateOf("") }
-    var preserveOrig by remember { mutableStateOf(true) }
-
-    val filteredEntries = entries.filter {
-        if (levelFilter == "GLOBAL") it.dictionaryLevel == "GLOBAL"
-        else it.dictionaryLevel == "ANIME" || it.dictionaryLevel == "PROJECT"
-    }
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                StudioSectionHeader(
-                    title = if (levelFilter == "GLOBAL") "Global Dubbing Dictionary" else "Anime & Project Specific Dictionary",
-                    subtitle = "Checked by Gemini before every translation. Approved terms persist across future episodes.",
-                    badgeText = "${filteredEntries.size} TERMS"
-                )
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            OutlinedButton(onClick = onSwitchLevelView, modifier = Modifier.fillMaxWidth()) {
-                Text(if (levelFilter == "GLOBAL") "Switch to Anime & Project Dictionary" else "Switch to Global Dictionary")
-            }
-        }
-
-        // Add new dictionary term card
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, StudioViolet),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Add Persistent Dictionary Entry", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("GLOBAL", "ANIME", "PROJECT").forEach { lvl ->
-                            FilterChip(
-                                selected = selectedLevel == lvl,
-                                onClick = { selectedLevel = lvl },
-                                label = { Text("$lvl Level") }
-                            )
-                        }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = jpSource,
-                            onValueChange = { jpSource = it },
-                            label = { Text("Japanese Term (e.g. ギルド)") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = romanHinglish,
-                            onValueChange = { romanHinglish = it },
-                            label = { Text("Preferred Roman Hinglish") },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = hindiWord,
-                            onValueChange = { hindiWord = it },
-                            label = { Text("Hindi Wording") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = englishWord,
-                            onValueChange = { englishWord = it },
-                            label = { Text("English Wording") },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = pronunciation,
-                            onValueChange = { pronunciation = it },
-                            label = { Text("Pronunciation Guidance") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = contextNote,
-                            onValueChange = { contextNote = it },
-                            label = { Text("Context / Scope Note") },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Button(
-                        onClick = {
-                            if (jpSource.isNotBlank() && romanHinglish.isNotBlank()) {
-                                onSaveEntry(
-                                    DictionaryEntryEntity(
-                                        dictionaryLevel = selectedLevel,
-                                        projectId = if (selectedLevel == "PROJECT") 1L else null,
-                                        animeSeriesName = if (selectedLevel != "GLOBAL") "Chronicles of the Dungeon King" else null,
-                                        japaneseSourceTerm = jpSource.trim(),
-                                        preferredRomanHinglish = romanHinglish.trim(),
-                                        preferredHindiWording = hindiWord.trim().ifBlank { romanHinglish.trim() },
-                                        preferredEnglishWording = englishWord.trim().ifBlank { romanHinglish.trim() },
-                                        preserveOriginalEnglish = preserveOrig,
-                                        pronunciationGuidance = pronunciation.trim().ifBlank { romanHinglish.trim() },
-                                        contextNotes = contextNote.trim().ifBlank { "User-defined dictionary rule" },
-                                        replacementScope = selectedLevel
-                                    )
-                                )
-                                jpSource = ""
-                                romanHinglish = ""
-                                hindiWord = ""
-                                englishWord = ""
-                                pronunciation = ""
-                                contextNote = ""
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = StudioViolet),
-                        modifier = Modifier.fillMaxWidth().testTag("dict_add_term_btn")
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = null)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Save Term to $selectedLevel Dictionary")
-                    }
-                }
-            }
-        }
-
-        items(filteredEntries) { entry ->
-            Card(
-                colors = CardDefaults.cardColors(containerColor = StudioSurface),
-                border = BorderStroke(1.dp, StudioBorder),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Surface(
-                                color = StudioCyanContainer,
-                                shape = RoundedCornerShape(6.dp)
-                            ) {
-                                Text(
-                                    text = entry.dictionaryLevel,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = StudioCyan,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "${entry.japaneseSourceTerm}  →  \"${entry.preferredRomanHinglish}\"",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = StudioTextPrimary,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Pronunciation: ${entry.pronunciationGuidance}  •  Hindi: ${entry.preferredHindiWording}  •  English: ${entry.preferredEnglishWording}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StudioEmerald
-                        )
-                        Text(
-                            text = "Context: ${entry.contextNotes}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = StudioTextSecondary
-                        )
-                    }
-                    IconButton(onClick = { onDeleteEntry(entry.id) }) {
-                        Icon(Icons.Default.Delete, contentDescription = "Delete term", tint = StudioCrimson)
                     }
                 }
             }

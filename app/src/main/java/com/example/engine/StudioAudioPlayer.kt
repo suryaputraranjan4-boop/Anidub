@@ -15,6 +15,7 @@ import java.io.File
 
 data class AudioPlaybackState(
     val isPlaying: Boolean = false,
+    val isPaused: Boolean = false,
     val activeFilePath: String = "",
     val activeLabel: String = "",
     val currentPositionMs: Long = 0L,
@@ -28,17 +29,38 @@ class StudioAudioPlayer(private val scope: CoroutineScope) {
     private val _playbackState = MutableStateFlow(AudioPlaybackState())
     val playbackState: StateFlow<AudioPlaybackState> = _playbackState.asStateFlow()
 
+    fun togglePlayPause(filePath: String, label: String, startOffsetMs: Long = 0L) {
+        val state = _playbackState.value
+        if (state.activeFilePath == filePath && mediaPlayer != null) {
+            if (state.isPlaying) {
+                pause()
+            } else if (state.isPaused) {
+                resume()
+            } else {
+                playFile(filePath, label, startOffsetMs)
+            }
+            return
+        }
+        playFile(filePath, label, startOffsetMs)
+    }
+
     fun playFile(filePath: String, label: String, startOffsetMs: Long = 0L) {
         val file = File(filePath)
-        if (!file.exists()) {
-            Log.w("StudioAudioPlayer", "Audio file does not exist: $filePath")
+        if (filePath.isBlank() || !file.exists() || file.length() == 0L) {
+            Log.w("StudioAudioPlayer", "Audio file missing or empty: $filePath")
             return
         }
 
-        // Toggle pause/stop if same file is currently playing
-        if (_playbackState.value.isPlaying && _playbackState.value.activeFilePath == filePath && startOffsetMs == 0L) {
-            stop()
-            return
+        // Toggle pause/resume if same file is active and no explicit jump requested
+        val state = _playbackState.value
+        if (state.activeFilePath == filePath && mediaPlayer != null && startOffsetMs == 0L) {
+            if (state.isPlaying) {
+                pause()
+                return
+            } else if (state.isPaused) {
+                resume()
+                return
+            }
         }
 
         stop()
@@ -47,8 +69,9 @@ class StudioAudioPlayer(private val scope: CoroutineScope) {
             mp.setDataSource(file.absolutePath)
             mp.prepare()
             val duration = mp.duration.toLong().coerceAtLeast(100L)
-            if (startOffsetMs > 0L && startOffsetMs < duration) {
-                mp.seekTo(startOffsetMs.toInt())
+            val clampedOffset = startOffsetMs.coerceIn(0L, (duration - 50L).coerceAtLeast(0L))
+            if (clampedOffset > 0L) {
+                mp.seekTo(clampedOffset.toInt())
             }
             mp.setOnCompletionListener {
                 stop()
@@ -57,39 +80,61 @@ class StudioAudioPlayer(private val scope: CoroutineScope) {
             mediaPlayer = mp
             _playbackState.value = AudioPlaybackState(
                 isPlaying = true,
+                isPaused = false,
                 activeFilePath = filePath,
                 activeLabel = label,
-                currentPositionMs = startOffsetMs,
+                currentPositionMs = clampedOffset,
                 totalDurationMs = duration
             )
 
-            progressJob = scope.launch(Dispatchers.Main) {
-                while (isActive && mediaPlayer != null) {
-                    val player = mediaPlayer ?: break
-                    if (player.isPlaying) {
-                        _playbackState.value = _playbackState.value.copy(
-                            currentPositionMs = player.currentPosition.toLong()
-                        )
-                    }
-                    delay(60L)
-                }
-            }
+            startProgressTicker()
         } catch (e: Exception) {
             Log.e("StudioAudioPlayer", "Failed to play $filePath", e)
             stop()
         }
     }
 
+    fun pause() {
+        try {
+            val mp = mediaPlayer ?: return
+            if (mp.isPlaying) {
+                mp.pause()
+                _playbackState.value = _playbackState.value.copy(
+                    isPlaying = false,
+                    isPaused = true,
+                    currentPositionMs = mp.currentPosition.toLong()
+                )
+            }
+        } catch (e: Exception) {
+            Log.e("StudioAudioPlayer", "Pause failed", e)
+        }
+    }
+
+    fun resume() {
+        try {
+            val mp = mediaPlayer ?: return
+            if (!mp.isPlaying) {
+                mp.start()
+                _playbackState.value = _playbackState.value.copy(
+                    isPlaying = true,
+                    isPaused = false
+                )
+                startProgressTicker()
+            }
+        } catch (e: Exception) {
+            Log.e("StudioAudioPlayer", "Resume failed", e)
+        }
+    }
+
     fun seekTo(positionMs: Long) {
         try {
             val mp = mediaPlayer
+            val maxDur = _playbackState.value.totalDurationMs.coerceAtLeast(positionMs)
+            val target = positionMs.coerceIn(0L, maxDur)
             if (mp != null) {
-                val target = positionMs.coerceIn(0L, _playbackState.value.totalDurationMs)
                 mp.seekTo(target.toInt())
-                _playbackState.value = _playbackState.value.copy(currentPositionMs = target)
-            } else {
-                _playbackState.value = _playbackState.value.copy(currentPositionMs = positionMs)
             }
+            _playbackState.value = _playbackState.value.copy(currentPositionMs = target)
         } catch (e: Exception) {
             Log.e("StudioAudioPlayer", "Seek failed", e)
         }
@@ -109,7 +154,27 @@ class StudioAudioPlayer(private val scope: CoroutineScope) {
         mediaPlayer = null
         _playbackState.value = _playbackState.value.copy(
             isPlaying = false,
+            isPaused = false,
             currentPositionMs = 0L
         )
+    }
+
+    private fun startProgressTicker() {
+        progressJob?.cancel()
+        progressJob = scope.launch(Dispatchers.Main) {
+            while (isActive && mediaPlayer != null) {
+                val player = mediaPlayer ?: break
+                try {
+                    if (player.isPlaying) {
+                        _playbackState.value = _playbackState.value.copy(
+                            currentPositionMs = player.currentPosition.toLong()
+                        )
+                    }
+                } catch (_: Exception) {
+                    break
+                }
+                delay(50L)
+            }
+        }
     }
 }
