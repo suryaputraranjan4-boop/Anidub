@@ -172,7 +172,7 @@ fun SpeakerProfilesView(viewModel: StudioViewModel) {
         item {
             StudioSectionHeader(
                 title = "Speaker Profiles (Audio-Only)",
-                subtitle = "Clustered strictly from F0 pitch & 16-D vocal embeddings — zero facial/video recognition"
+                subtitle = "Remote pyannote/WeSpeaker diarization or non-neural acoustic F0/spectral fallback — zero facial recognition"
             )
         }
 
@@ -254,11 +254,12 @@ fun SpeakerProfilesView(viewModel: StudioViewModel) {
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
+                    val simLabel = if (sp.voiceSimilarityScore >= 0f) "${(sp.voiceSimilarityScore * 100).toInt()}%" else "Unmeasured"
                     MetadataChipRow(
                         items = listOf(
-                            "F0 Mean" to if (sp.f0MeanHz > 0f) "${sp.f0MeanHz} Hz" else "—",
-                            "Pitch Range" to if (sp.f0MaxHz > 0f) "${sp.f0MinHz.toInt()}–${sp.f0MaxHz.toInt()} Hz" else "—",
-                            "Speed" to if (sp.speakingSpeedSylPerSec > 0f) "${sp.speakingSpeedSylPerSec} syl/s" else "—"
+                            "F0 Mean" to if (sp.f0MeanHz > 0f) "${sp.f0MeanHz} Hz" else "Unmeasured",
+                            "Pitch Range" to if (sp.f0MaxHz > 0f) "${sp.f0MinHz.toInt()}–${sp.f0MaxHz.toInt()} Hz" else "Unmeasured",
+                            "Similarity" to simLabel
                         )
                     )
                     Spacer(modifier = Modifier.height(8.dp))

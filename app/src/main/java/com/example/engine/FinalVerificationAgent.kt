@@ -75,20 +75,26 @@ object FinalVerificationAgent {
             )
         }
 
-        // 3. Dialogue completeness
+        // 3. Dialogue completeness & text/timeline sanity
         if (dialogues.isNotEmpty()) {
             val missingDialogues = dialogues.filter { dlg ->
                 val p = dlg.generatedAudioPath
                 p.isNullOrBlank() || !File(p).exists() || File(p).length() <= 44L
             }
+            val missingHinglish = dialogues.filter { it.romanHinglishText.isBlank() }
+            val outOfBounds = if (expectedDurationMs > 0L) {
+                dialogues.filter { it.timelineStartMs < 0L || it.timelineStartMs > expectedDurationMs + 500L }
+            } else emptyList()
+            val allDialoguesOk = missingDialogues.isEmpty() && missingHinglish.isEmpty() && outOfBounds.isEmpty()
             checks.add(
                 VerificationCheckItem(
-                    checkName = "Dialogue Audio Completeness",
-                    passed = missingDialogues.isEmpty(),
-                    detail = if (missingDialogues.isEmpty()) {
-                        "All ${dialogues.size} dialogue clips verified on disk."
-                    } else {
-                        "${missingDialogues.size} of ${dialogues.size} dialogue clips missing audio (${missingDialogues.take(4).joinToString { it.dialogueId }})."
+                    checkName = "Dialogue Audio, Text & Sync Completeness",
+                    passed = allDialoguesOk,
+                    detail = when {
+                        allDialoguesOk -> "All ${dialogues.size} dialogue clips verified on disk with Roman Hinglish text and valid timeline positions."
+                        missingDialogues.isNotEmpty() -> "${missingDialogues.size} of ${dialogues.size} dialogue clips missing audio (${missingDialogues.take(4).joinToString { it.dialogueId }})."
+                        missingHinglish.isNotEmpty() -> "${missingHinglish.size} dialogue(s) missing Roman Hinglish text (${missingHinglish.take(4).joinToString { it.dialogueId }})."
+                        else -> "${outOfBounds.size} dialogue(s) fall outside episode duration bounds (${expectedDurationMs}ms)."
                     }
                 )
             )
@@ -96,7 +102,13 @@ object FinalVerificationAgent {
 
         // 4. Subtitle file validation
         if (subtitleFiles.isNotEmpty()) {
-            val subResults = subtitleFiles.map { SubtitleGenerator.validateSubtitleFile(it) }
+            val subResults = subtitleFiles.map {
+                SubtitleGenerator.validateSubtitleFile(
+                    file = it,
+                    expectedCueCount = dialogues.size.takeIf { c -> c > 0 } ?: -1,
+                    episodeDurationMs = expectedDurationMs
+                )
+            }
             val failedSubs = subResults.filterNot { it.isValid }
             checks.add(
                 VerificationCheckItem(
@@ -129,9 +141,19 @@ object FinalVerificationAgent {
 
     private fun verifyWavOutput(wavFile: File, expectedDurationMs: Long): List<VerificationCheckItem> {
         val items = mutableListOf<VerificationCheckItem>()
-        val buf = AudioDspEngine.readWavFile(wavFile)
-        val hasSamples = buf.samples.isNotEmpty()
-        if (!hasSamples) {
+        val strictRes = AudioDspEngine.readWavFileStrict(wavFile)
+        if (strictRes.isFailure) {
+            items.add(
+                VerificationCheckItem(
+                    "WAV PCM Decode",
+                    false,
+                    "Invalid WAV container: ${strictRes.exceptionOrNull()?.localizedMessage ?: "malformed PCM header"}"
+                )
+            )
+            return items
+        }
+        val buf = strictRes.getOrThrow()
+        if (buf.samples.isEmpty()) {
             items.add(VerificationCheckItem("WAV PCM Decode", false, "WAV file contains 0 readable PCM samples."))
             return items
         }

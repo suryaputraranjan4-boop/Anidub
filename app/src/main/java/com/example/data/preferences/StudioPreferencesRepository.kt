@@ -19,11 +19,14 @@ data class WorkerAndStudioConfig(
     val activeEpisodeId: Long = 1L,
     val remoteWorkerEnabled: Boolean = false,
     val remoteWorkerBaseUrl: String = "",
+    val remoteWorkerAuthToken: String = "",
     val remoteWorkerHasAuthToken: Boolean = false,
+    val allowInsecureLocalHttp: Boolean = false,
     val workerGpuAvailable: Boolean = false,
     val maxProcessingConcurrency: Int = 2,
     val requestTimeoutSeconds: Int = 120,
     val maxUploadLimitMb: Int = 2048,
+    val geminiModelName: String = "gemini-3.8-flash",
     val selectedAsrVariant: String = "Whisper Large V3 Turbo",
     val selectedTtsEngine: String = "F5-Hindi-24KHz",
     val selectedSeparationModel: String = "HTDemucs",
@@ -42,11 +45,14 @@ class StudioPreferencesRepository(private val context: Context) {
         val ACTIVE_EPISODE_ID = longPreferencesKey("active_episode_id")
         val WORKER_ENABLED = booleanPreferencesKey("worker_enabled")
         val WORKER_URL = stringPreferencesKey("worker_url")
+        val WORKER_AUTH_TOKEN = stringPreferencesKey("worker_auth_token")
         val WORKER_HAS_TOKEN = booleanPreferencesKey("worker_has_token")
+        val ALLOW_INSECURE_LOCAL_HTTP = booleanPreferencesKey("allow_insecure_local_http")
         val WORKER_GPU = booleanPreferencesKey("worker_gpu")
         val MAX_CONCURRENCY = intPreferencesKey("max_concurrency")
         val TIMEOUT_SEC = intPreferencesKey("timeout_sec")
         val UPLOAD_LIMIT_MB = intPreferencesKey("upload_limit_mb")
+        val GEMINI_MODEL_NAME = stringPreferencesKey("gemini_model_name")
         val SELECTED_ASR = stringPreferencesKey("selected_asr")
         val SELECTED_TTS = stringPreferencesKey("selected_tts")
         val SELECTED_SEP = stringPreferencesKey("selected_sep")
@@ -58,17 +64,21 @@ class StudioPreferencesRepository(private val context: Context) {
     }
 
     val configFlow: Flow<WorkerAndStudioConfig> = context.studioDataStore.data.map { prefs: Preferences ->
+        val token = prefs[Keys.WORKER_AUTH_TOKEN] ?: ""
         WorkerAndStudioConfig(
             onboardingCompleted = prefs[Keys.ONBOARDING_DONE] ?: false,
             activeProjectId = prefs[Keys.ACTIVE_PROJECT_ID] ?: 1L,
             activeEpisodeId = prefs[Keys.ACTIVE_EPISODE_ID] ?: 1L,
             remoteWorkerEnabled = prefs[Keys.WORKER_ENABLED] ?: false,
             remoteWorkerBaseUrl = prefs[Keys.WORKER_URL] ?: "",
-            remoteWorkerHasAuthToken = prefs[Keys.WORKER_HAS_TOKEN] ?: false,
+            remoteWorkerAuthToken = token,
+            remoteWorkerHasAuthToken = token.isNotBlank() || (prefs[Keys.WORKER_HAS_TOKEN] ?: false),
+            allowInsecureLocalHttp = prefs[Keys.ALLOW_INSECURE_LOCAL_HTTP] ?: false,
             workerGpuAvailable = prefs[Keys.WORKER_GPU] ?: false,
             maxProcessingConcurrency = prefs[Keys.MAX_CONCURRENCY] ?: 2,
             requestTimeoutSeconds = prefs[Keys.TIMEOUT_SEC] ?: 120,
             maxUploadLimitMb = prefs[Keys.UPLOAD_LIMIT_MB] ?: 2048,
+            geminiModelName = prefs[Keys.GEMINI_MODEL_NAME]?.takeIf { it.isNotBlank() } ?: "gemini-3.8-flash",
             selectedAsrVariant = prefs[Keys.SELECTED_ASR] ?: "Whisper Large V3 Turbo",
             selectedTtsEngine = prefs[Keys.SELECTED_TTS] ?: "F5-Hindi-24KHz",
             selectedSeparationModel = prefs[Keys.SELECTED_SEP] ?: "HTDemucs",
@@ -94,20 +104,31 @@ class StudioPreferencesRepository(private val context: Context) {
     suspend fun updateWorkerSettings(
         enabled: Boolean,
         url: String,
-        hasAuthToken: Boolean,
-        gpuAvailable: Boolean,
-        maxConcurrency: Int,
-        timeoutSeconds: Int,
-        uploadLimitMb: Int
+        authToken: String = "",
+        hasAuthToken: Boolean = authToken.isNotBlank(),
+        allowInsecureLocalHttp: Boolean = false,
+        gpuAvailable: Boolean = false,
+        maxConcurrency: Int = 2,
+        timeoutSeconds: Int = 120,
+        uploadLimitMb: Int = 2048
     ) {
         context.studioDataStore.edit {
             it[Keys.WORKER_ENABLED] = enabled
             it[Keys.WORKER_URL] = url.trim()
-            it[Keys.WORKER_HAS_TOKEN] = hasAuthToken
+            it[Keys.WORKER_AUTH_TOKEN] = authToken.trim()
+            it[Keys.WORKER_HAS_TOKEN] = authToken.isNotBlank() || hasAuthToken
+            it[Keys.ALLOW_INSECURE_LOCAL_HTTP] = allowInsecureLocalHttp
             it[Keys.WORKER_GPU] = gpuAvailable
             it[Keys.MAX_CONCURRENCY] = maxConcurrency.coerceIn(1, 16)
             it[Keys.TIMEOUT_SEC] = timeoutSeconds.coerceIn(15, 600)
             it[Keys.UPLOAD_LIMIT_MB] = uploadLimitMb.coerceIn(100, 10240)
+        }
+    }
+
+    suspend fun updateGeminiModelName(modelName: String) {
+        val clean = modelName.trim().ifBlank { "gemini-3.8-flash" }
+        context.studioDataStore.edit {
+            it[Keys.GEMINI_MODEL_NAME] = clean
         }
     }
 

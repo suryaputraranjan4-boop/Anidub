@@ -58,8 +58,8 @@ data class AudioStemEntity(
     val volumeGain: Float = 1.0f,
     val isMuted: Boolean = false,
     val isSolo: Boolean = false,
-    val separationQualityScore: Float = 0.94f, // SDR / SIR estimate
-    val peakDbfs: Float = -3.2f,
+    val separationQualityScore: Float = -1f, // -1f = unmeasured (never invent SDR/SIR)
+    val peakDbfs: Float = -96.0f,
     val isHonestTwoStemModel: Boolean = true,
     val createdAt: Long = System.currentTimeMillis()
 )
@@ -73,8 +73,8 @@ data class TranscriptSegmentEntity(
     val romajiReading: String,
     val preliminaryStartMs: Long,
     val preliminaryEndMs: Long,
-    val confidenceScore: Float,
-    val asrModelUsed: String = "Faster-Whisper Large-v3 (ja)",
+    val confidenceScore: Float = -1f, // -1f = unmeasured / manual user entry
+    val asrModelUsed: String = "Unrecognized",
     val originalAudioSlicePath: String
 )
 
@@ -94,7 +94,7 @@ data class DialogueSegmentEntity(
     val ttsNormalizedText: String, // Internal pronunciation-optimized phonetic string for TTS
     val emotion: String = "NEUTRAL", // ANGRY, SAD, HAPPY, EXCITED, FEARFUL, CALM, WHISPERING, SHOUTING, NEUTRAL
     val speakingStyle: String = "Natural",
-    val alignmentSource: String = "Silero VAD + WhisperX-JA Phoneme Alignment",
+    val alignmentSource: String = "Unaligned",
     val overlapsWithDialogueId: String? = null,
     val originalAudioSlicePath: String = "",
     val generatedAudioPath: String? = null,
@@ -103,19 +103,19 @@ data class DialogueSegmentEntity(
     val durationDeviationMs: Long = 0L,
     val timeStretchRatio: Float = 1.0f,
     val voiceReferenceId: String = "",
-    val ttsEngineUsed: String = "F5-Hindi-24KHz",
+    val ttsEngineUsed: String = "",
     val characterBatchNumber: Int = 0, // Batch 1 (A), Batch 2 (B), Batch 3 (C)
     val orderInCharacterBatch: Int = 0, // 1st in batch, 2nd in batch...
     val generationStatus: String = "PENDING", // PENDING, TRANSLATED, GENERATED, SYNCED, FAILED
     val timelineStartMs: Long = 0L, // Must equal originalStartMs unless manually adjusted
-    val peakDbfs: Float = -4.0f,
+    val peakDbfs: Float = -96.0f,
     val translationVersion: Int = 1,
     val generationVersion: Int = 0,
     val errorNote: String? = null,
     val characterId: String = "",
-    val emotionConfidence: Float = 0f,
-    val speakerConfidence: Float = 0f,
-    val translationConfidence: Float = 0f,
+    val emotionConfidence: Float = -1f, // -1f = unmeasured
+    val speakerConfidence: Float = -1f, // -1f = unmeasured
+    val translationConfidence: Float = -1f, // -1f = unmeasured
     val sceneContextNote: String = "",
     val syncStatus: String = "PENDING", // PENDING, ALIGNED, TIME_STRETCHED, NEEDS_ADAPTATION
     val verificationStatus: String = "UNVERIFIED"
@@ -139,17 +139,17 @@ data class SpeakerProfileEntity(
     val speakingStyle: String,
     val dominantEmotion: String,
     val speakerEmbeddingJson: String, // 16-dimensional acoustic speaker embedding vector
-    val voiceSimilarityScore: Float,
+    val voiceSimilarityScore: Float = -1f, // -1f = unmeasured (single sample or uncompared)
     val voiceReferencePath: String,
     val voiceReferenceId: String,
-    val rightsConsentConfirmed: Boolean = true,
-    val useConsentedGenericVoiceFallback: Boolean = false,
+    val rightsConsentConfirmed: Boolean = false, // Strict default: FALSE until explicitly confirmed by user
+    val useConsentedGenericVoiceFallback: Boolean = true,
     val preferredTtsEngine: String = "F5-Hindi-24KHz",
     val dialogueCount: Int = 0,
-    val voiceConsistencyScore: Float = 0.96f,
+    val voiceConsistencyScore: Float = -1f, // -1f = unmeasured
     val characterId: String = "",
     val visualIdentityNote: String = "Audio-Only Mode (No visual recognition)",
-    val profileConfidence: Float = 0f
+    val profileConfidence: Float = -1f // -1f = unmeasured
 )
 
 @Entity(tableName = "dictionary_entries")
@@ -252,7 +252,8 @@ data class ModelManifestEntity(
     val installedVersion: String = "",
     val localFilePath: String = "", // Directory containing actual official filenames
     val sha256Checksum: String = "", // Verified SHA-256 of primary weight file
-    val statusNote: String = ""
+    val statusNote: String = "",
+    val verificationLevel: String = "UNVERIFIED" // VERIFIED_SHA256, VERIFIED_SIZE_ONLY, UNVERIFIED, BUILT_IN
 )
 
 @Entity(tableName = "agent_job_records")

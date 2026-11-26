@@ -734,6 +734,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val cfg = studioConfig.value
         val ttsEngine = cfg.selectedTtsEngine
         val workerUrl = cfg.remoteWorkerBaseUrl
+        val workerToken = cfg.remoteWorkerAuthToken
+        val allowLanHttp = cfg.allowInsecureLocalHttp
+        val geminiModel = cfg.geminiModelName
         activePipelineJob = viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
@@ -746,7 +749,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 startStage = startStage,
                 endStage = endStage,
                 selectedTtsEngine = ttsEngine,
-                remoteWorkerUrl = workerUrl
+                remoteWorkerUrl = workerUrl,
+                remoteWorkerAuthToken = workerToken,
+                allowInsecureLocalHttp = allowLanHttp,
+                geminiModelName = geminiModel
             ) { stageNum, stageTitle, detail ->
                 _pipelineBanner.value = PipelineBannerState(
                     isRunning = true,
@@ -890,7 +896,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 romajiReading = romajiReading.trim(),
                 preliminaryStartMs = safeStart,
                 preliminaryEndMs = safeEnd,
-                confidenceScore = 1.0f,
+                confidenceScore = -1f,
                 asrModelUsed = "Manual User Entry",
                 originalAudioSlicePath = slicePath
             )
@@ -964,13 +970,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun reassignDialogueSpeaker(dialogue: DialogueSegmentEntity, newSpeakerLabel: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            val cleanLabel = newSpeakerLabel.trim().uppercase().ifBlank { "A" }
+            val cleanLabel = newSpeakerLabel.trim().uppercase().ifBlank { "UNIDENTIFIED" }
             val ep = dao.getEpisodeById(dialogue.episodeId) ?: return@launch
             val newDialogueId = "$cleanLabel-%03d".format(dialogue.globalOrderNumber)
             val updated = dialogue.copy(
                 speakerLabel = cleanLabel,
                 dialogueId = newDialogueId,
-                voiceReferenceId = "VREF-${ep.projectId}-$cleanLabel"
+                voiceReferenceId = if (cleanLabel == "UNIDENTIFIED") "" else "VREF-${ep.projectId}-$cleanLabel"
             )
             dao.updateDialogue(updated)
             if (updated.romanHinglishText.isNotBlank() && !updated.generatedAudioPath.isNullOrBlank()) {
@@ -978,7 +984,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 coordinator.regenerateSingleDialogueOnly(
                     dialogueId = updated.id,
                     selectedTtsEngine = cfg.selectedTtsEngine,
-                    remoteWorkerUrl = cfg.remoteWorkerBaseUrl
+                    remoteWorkerUrl = cfg.remoteWorkerBaseUrl,
+                    remoteWorkerAuthToken = cfg.remoteWorkerAuthToken,
+                    allowInsecureLocalHttp = cfg.allowInsecureLocalHttp
                 )
             }
         }
@@ -1002,7 +1010,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 newRomanHinglishText = newRomanHinglish,
                 newEmotion = newEmotion,
                 selectedTtsEngine = cfg.selectedTtsEngine,
-                remoteWorkerUrl = cfg.remoteWorkerBaseUrl
+                remoteWorkerUrl = cfg.remoteWorkerBaseUrl,
+                remoteWorkerAuthToken = cfg.remoteWorkerAuthToken,
+                allowInsecureLocalHttp = cfg.allowInsecureLocalHttp
             )
             _pipelineBanner.value = res.fold(
                 onSuccess = { dlg ->
@@ -1049,7 +1059,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 pronunciationGuidance = pronunciationGuidance,
                 scope = scope,
                 selectedTtsEngine = cfg.selectedTtsEngine,
-                remoteWorkerUrl = cfg.remoteWorkerBaseUrl
+                remoteWorkerUrl = cfg.remoteWorkerBaseUrl,
+                remoteWorkerAuthToken = cfg.remoteWorkerAuthToken,
+                allowInsecureLocalHttp = cfg.allowInsecureLocalHttp
             )
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = false,
@@ -1305,9 +1317,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun verifyRemoteWorkerHealth(url: String) {
+    fun verifyRemoteWorkerHealth(
+        url: String,
+        authToken: String = studioConfig.value.remoteWorkerAuthToken,
+        allowInsecureLocalHttp: Boolean = studioConfig.value.allowInsecureLocalHttp
+    ) {
         viewModelScope.launch {
-            _workerHealth.value = workerClient.checkWorkerHealth(url)
+            _workerHealth.value = workerClient.checkWorkerHealth(
+                baseUrl = url,
+                authToken = authToken,
+                allowInsecureLocalHttp = allowInsecureLocalHttp
+            )
         }
     }
 

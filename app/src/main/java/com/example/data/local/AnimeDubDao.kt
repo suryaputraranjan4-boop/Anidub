@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
@@ -61,6 +62,12 @@ interface AnimeDubDao {
     @Query("DELETE FROM audio_stems WHERE episodeId = :episodeId AND stemType != 'ORIGINAL_MASTER'")
     suspend fun deleteSeparatedStemsKeepMaster(episodeId: Long)
 
+    @Transaction
+    suspend fun replaceSeparatedStemsAtomic(episodeId: Long, newStems: List<AudioStemEntity>) {
+        deleteSeparatedStemsKeepMaster(episodeId)
+        newStems.forEach { insertStem(it) }
+    }
+
     // Japanese Transcripts (Agent 1)
     @Query("SELECT * FROM transcript_segments WHERE episodeId = :episodeId ORDER BY segmentIndex ASC")
     fun observeTranscriptsForEpisode(episodeId: Long): Flow<List<TranscriptSegmentEntity>>
@@ -76,6 +83,12 @@ interface AnimeDubDao {
 
     @Query("DELETE FROM transcript_segments WHERE episodeId = :episodeId")
     suspend fun clearTranscriptsForEpisode(episodeId: Long)
+
+    @Transaction
+    suspend fun replaceTranscriptsAtomic(episodeId: Long, segments: List<TranscriptSegmentEntity>) {
+        clearTranscriptsForEpisode(episodeId)
+        insertTranscriptSegments(segments)
+    }
 
     // Dialogue Segments (Agent 2, 3, 4, 5, 7)
     @Query("SELECT * FROM dialogue_segments WHERE episodeId = :episodeId ORDER BY globalOrderNumber ASC")
@@ -122,6 +135,12 @@ interface AnimeDubDao {
     @Query("DELETE FROM speaker_profiles WHERE episodeId = :episodeId")
     suspend fun clearSpeakersForEpisode(episodeId: Long)
 
+    @Transaction
+    suspend fun replaceSpeakersAtomic(episodeId: Long, profiles: List<SpeakerProfileEntity>) {
+        clearSpeakersForEpisode(episodeId)
+        insertSpeakerProfiles(profiles)
+    }
+
     // Dictionary (Agent 4: Global, Anime, Project levels)
     @Query("SELECT * FROM dictionary_entries ORDER BY dictionaryLevel ASC, japaneseSourceTerm ASC")
     fun observeAllDictionaryEntries(): Flow<List<DictionaryEntryEntity>>
@@ -161,6 +180,12 @@ interface AnimeDubDao {
     @Query("DELETE FROM timeline_tracks WHERE episodeId = :episodeId")
     suspend fun clearTimelineTracks(episodeId: Long)
 
+    @Transaction
+    suspend fun replaceTimelineTracksAtomic(episodeId: Long, tracks: List<TimelineTrackEntity>) {
+        clearTimelineTracks(episodeId)
+        insertTimelineTracks(tracks)
+    }
+
     // Quality Control Results (Stage 13)
     @Query("SELECT * FROM quality_check_results WHERE episodeId = :episodeId ORDER BY checkNumber ASC")
     fun observeQualityChecks(episodeId: Long): Flow<List<QualityCheckResultEntity>>
@@ -173,6 +198,12 @@ interface AnimeDubDao {
 
     @Query("DELETE FROM quality_check_results WHERE episodeId = :episodeId")
     suspend fun clearQualityChecks(episodeId: Long)
+
+    @Transaction
+    suspend fun replaceQualityChecksAtomic(episodeId: Long, checks: List<QualityCheckResultEntity>) {
+        clearQualityChecks(episodeId)
+        insertQualityChecks(checks)
+    }
 
     // Model Manifests (Section 8)
     @Query("SELECT * FROM model_manifests ORDER BY specialistAgentNumber ASC, modelName ASC")

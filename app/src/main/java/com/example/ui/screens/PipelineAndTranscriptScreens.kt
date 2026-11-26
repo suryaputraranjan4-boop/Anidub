@@ -784,10 +784,15 @@ fun TranscriptAndDialogueEditorView(viewModel: StudioViewModel) {
                         )
                     }
 
-                    if (tr != null && tr.confidenceScore > 0f) {
+                    if (tr != null) {
+                        val confText = if (tr.confidenceScore >= 0f) {
+                            "${(tr.confidenceScore * 100).toInt()}%"
+                        } else {
+                            "Unmeasured"
+                        }
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "Duration ${dlg.originalDurationMs} ms • Confidence ${(tr.confidenceScore * 100).toInt()}%",
+                            text = "Duration ${dlg.originalDurationMs} ms • Confidence $confText",
                             style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
                             color = StudioTextMuted
                         )

@@ -24,7 +24,7 @@ data class SubtitleValidationResult(
 )
 
 /**
- * Agent 21 — Subtitle Generation & Validation Engine.
+ * Agent 21 — Subtitle Generation & Strict Validation Engine.
  *
  * Generates genuine, standards-compliant subtitle files synchronized to the final
  * chronological dialogue timestamps:
@@ -33,17 +33,32 @@ data class SubtitleValidationResult(
  *  - Bilingual Japanese + Hinglish SRT (`*_bilingual.srt`)
  *  - Styled Advanced SubStation Alpha ASS (`*_styled.ass`) with per-speaker color styling
  *
- * Includes a real parser (`validateSubtitleFile`) to verify syntax, cue count, and
- * monotonically valid timestamps before reporting success.
+ * Strict Honesty Rules:
+ * - Never injects fake placeholder strings like "(Pending Hinglish)" or "(No Japanese transcript)".
+ * - `validateSubtitleFile` strictly rejects empty cues, placeholder strings, invalid timestamps,
+ *   out-of-order cues, cues exceeding episode duration bounds, and cue count mismatches.
  */
 object SubtitleGenerator {
+
+    private val PLACEHOLDER_MARKERS = listOf(
+        "(No Japanese transcript)",
+        "(Pending Hinglish)",
+        "(Pending Japanese)",
+        "[Unrecognized]",
+        "[Pending]",
+        "[TODO]",
+        "UNASSIGNED-",
+        "UNIDENTIFIED-"
+    )
+    private val BARE_ID_REGEX = Regex("""^\[?[A-Z]{1,3}-\d{3,4}\]?$""")
 
     fun generateAllSubtitles(
         episodeTitle: String,
         dialogues: List<DialogueSegmentEntity>,
         speakersByLabel: Map<String, SpeakerProfileEntity>,
         outputDir: File,
-        baseFileName: String
+        baseFileName: String,
+        episodeDurationMs: Long = 0L
     ): GeneratedSubtitleBundle {
         outputDir.mkdirs()
         val sorted = dialogues.sortedBy { it.timelineStartMs }
@@ -54,24 +69,24 @@ object SubtitleGenerator {
         val biFile = File(outputDir, "${safeBase}_bilingual.srt")
         val assFile = File(outputDir, "${safeBase}_styled.ass")
 
-        jpFile.writeText(buildSrtContent(sorted) { d ->
-            d.japaneseText.ifBlank { "[${d.dialogueId}] (No Japanese transcript)" }
-        })
-        hiFile.writeText(buildSrtContent(sorted) { d ->
-            d.romanHinglishText.ifBlank { d.japaneseText.ifBlank { "[${d.dialogueId}]" } }
-        })
+        jpFile.writeText(buildSrtContent(sorted) { d -> d.japaneseText.trim() })
+        hiFile.writeText(buildSrtContent(sorted) { d -> d.romanHinglishText.trim() })
         biFile.writeText(buildSrtContent(sorted) { d ->
-            val hi = d.romanHinglishText.ifBlank { "(Pending Hinglish)" }
-            val jp = d.japaneseText.ifBlank { "(Pending Japanese)" }
-            "$hi\n$jp"
+            val hi = d.romanHinglishText.trim()
+            val jp = d.japaneseText.trim()
+            when {
+                hi.isNotEmpty() && jp.isNotEmpty() -> "$hi\n$jp"
+                hi.isNotEmpty() -> hi
+                else -> ""
+            }
         })
         assFile.writeText(buildAssContent(episodeTitle, sorted, speakersByLabel))
 
         val validations = listOf(
-            validateSubtitleFile(jpFile),
-            validateSubtitleFile(hiFile),
-            validateSubtitleFile(biFile),
-            validateSubtitleFile(assFile)
+            validateSubtitleFile(jpFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs),
+            validateSubtitleFile(hiFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs),
+            validateSubtitleFile(biFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs),
+            validateSubtitleFile(assFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs)
         )
         val issues = validations.filterNot { it.isValid }.map { "${it.file.name}: ${it.errorSummary}" }
 
@@ -144,7 +159,7 @@ object SubtitleGenerator {
             val endMs = startMs + durMs
             val spName = (speakersByLabel[dlg.speakerLabel]?.characterName ?: "Speaker_${dlg.speakerLabel}")
                 .replace(",", " ")
-            val text = dlg.romanHinglishText.ifBlank { dlg.japaneseText.ifBlank { dlg.dialogueId } }
+            val text = dlg.romanHinglishText.trim()
                 .replace("\r\n", "\\N")
                 .replace("\n", "\\N")
             sb.appendLine(
@@ -154,41 +169,112 @@ object SubtitleGenerator {
         return sb.toString()
     }
 
-    fun validateSubtitleFile(file: File): SubtitleValidationResult {
+    fun validateSubtitleFile(
+        file: File,
+        expectedCueCount: Int = -1,
+        episodeDurationMs: Long = 0L
+    ): SubtitleValidationResult {
         val ext = file.extension.uppercase(Locale.US)
         if (!file.exists() || file.length() == 0L) {
             return SubtitleValidationResult(file, ext, 0, false, "File missing or empty.")
         }
         val content = file.readText()
         return when (ext) {
-            "SRT" -> validateSrtText(file, content)
-            "ASS" -> validateAssText(file, content)
+            "SRT" -> validateSrtText(file, content, expectedCueCount, episodeDurationMs)
+            "ASS" -> validateAssText(file, content, expectedCueCount, episodeDurationMs)
             else -> SubtitleValidationResult(file, ext, 0, false, "Unsupported subtitle extension: .$ext")
         }
     }
 
-    private fun validateSrtText(file: File, content: String): SubtitleValidationResult {
-        val timeLineRegex = Regex("""(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})""")
-        val matches = timeLineRegex.findAll(content).toList()
-        if (matches.isEmpty()) {
-            return SubtitleValidationResult(file, "SRT", 0, false, "No valid SRT timestamp cues found.")
+    private fun isPlaceholderOrEmptyText(raw: String): Boolean {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return true
+        if (PLACEHOLDER_MARKERS.any { trimmed.contains(it, ignoreCase = true) }) return true
+        if (BARE_ID_REGEX.matches(trimmed)) return true
+        return false
+    }
+
+    private fun validateSrtText(
+        file: File,
+        content: String,
+        expectedCueCount: Int,
+        episodeDurationMs: Long
+    ): SubtitleValidationResult {
+        val timeLineRegex = Regex("""^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})$""")
+        val normalized = content.replace("\r\n", "\n").trim()
+        if (normalized.isEmpty()) {
+            return SubtitleValidationResult(file, "SRT", 0, false, "SRT content is empty.")
         }
+        val blocks = normalized.split(Regex("""\n{2,}""")).filter { it.isNotBlank() }
+        if (blocks.isEmpty()) {
+            return SubtitleValidationResult(file, "SRT", 0, false, "No SRT cue blocks found.")
+        }
+
+        var cueCount = 0
         var lastStart = -1L
-        for ((idx, m) in matches.withIndex()) {
+        var lastEnd = -1L
+        var overlapCount = 0
+
+        for ((idx, block) in blocks.withIndex()) {
+            val lines = block.lines()
+            val timeLineIndex = lines.indexOfFirst { timeLineRegex.matches(it.trim()) }
+            if (timeLineIndex < 0) {
+                return SubtitleValidationResult(file, "SRT", cueCount, false, "Block #${idx + 1} missing valid SRT timestamp line.")
+            }
+            val m = timeLineRegex.matchEntire(lines[timeLineIndex].trim())!!
             val startMs = toMs(m.groupValues[1], m.groupValues[2], m.groupValues[3], m.groupValues[4])
             val endMs = toMs(m.groupValues[5], m.groupValues[6], m.groupValues[7], m.groupValues[8])
             if (endMs <= startMs) {
-                return SubtitleValidationResult(file, "SRT", matches.size, false, "Cue #${idx + 1} has end <= start.")
+                return SubtitleValidationResult(file, "SRT", blocks.size, false, "Cue #${idx + 1} has end <= start.")
             }
             if (startMs < lastStart) {
-                return SubtitleValidationResult(file, "SRT", matches.size, false, "Cue #${idx + 1} timestamp is out of chronological order.")
+                return SubtitleValidationResult(file, "SRT", blocks.size, false, "Cue #${idx + 1} timestamp is out of chronological order.")
             }
+            if (episodeDurationMs > 0L && endMs > episodeDurationMs + 1500L) {
+                return SubtitleValidationResult(
+                    file,
+                    "SRT",
+                    blocks.size,
+                    false,
+                    "Cue #${idx + 1} ends at ${endMs}ms, exceeding episode duration (${episodeDurationMs}ms)."
+                )
+            }
+            if (lastEnd > startMs) overlapCount++
             lastStart = startMs
+            lastEnd = maxOf(lastEnd, endMs)
+
+            val payload = lines.drop(timeLineIndex + 1).joinToString("\n").trim()
+            if (isPlaceholderOrEmptyText(payload)) {
+                return SubtitleValidationResult(
+                    file,
+                    "SRT",
+                    blocks.size,
+                    false,
+                    "Cue #${idx + 1} has empty or placeholder subtitle text."
+                )
+            }
+            cueCount++
         }
-        return SubtitleValidationResult(file, "SRT", matches.size, true, "Valid SRT (${matches.size} cues).")
+
+        if (expectedCueCount > 0 && cueCount != expectedCueCount) {
+            return SubtitleValidationResult(
+                file,
+                "SRT",
+                cueCount,
+                false,
+                "Cue count mismatch: found $cueCount, expected $expectedCueCount."
+            )
+        }
+        val overlapSuffix = if (overlapCount > 0) " ($overlapCount overlapping cues)" else ""
+        return SubtitleValidationResult(file, "SRT", cueCount, true, "Valid SRT ($cueCount cues)$overlapSuffix.")
     }
 
-    private fun validateAssText(file: File, content: String): SubtitleValidationResult {
+    private fun validateAssText(
+        file: File,
+        content: String,
+        expectedCueCount: Int,
+        episodeDurationMs: Long
+    ): SubtitleValidationResult {
         val hasScriptInfo = content.contains("[Script Info]")
         val hasStyles = content.contains("[V4+ Styles]")
         val hasEvents = content.contains("[Events]")
@@ -200,6 +286,53 @@ object SubtitleGenerator {
                 dialogueLines.size,
                 false,
                 "Missing required ASS sections or 0 Dialogue events."
+            )
+        }
+
+        var lastStart = -1L
+        for ((idx, line) in dialogueLines.withIndex()) {
+            val fields = line.removePrefix("Dialogue:").trim().split(",", limit = 10)
+            if (fields.size < 10) {
+                return SubtitleValidationResult(file, "ASS", dialogueLines.size, false, "ASS Dialogue #${idx + 1} has fewer than 10 fields.")
+            }
+            val startMs = parseAssTimestampMs(fields[1].trim())
+            val endMs = parseAssTimestampMs(fields[2].trim())
+            if (startMs < 0L || endMs <= startMs) {
+                return SubtitleValidationResult(file, "ASS", dialogueLines.size, false, "ASS Dialogue #${idx + 1} has invalid start/end timestamps.")
+            }
+            if (startMs < lastStart) {
+                return SubtitleValidationResult(file, "ASS", dialogueLines.size, false, "ASS Dialogue #${idx + 1} is out of chronological order.")
+            }
+            if (episodeDurationMs > 0L && endMs > episodeDurationMs + 1500L) {
+                return SubtitleValidationResult(
+                    file,
+                    "ASS",
+                    dialogueLines.size,
+                    false,
+                    "ASS Dialogue #${idx + 1} ends at ${endMs}ms, exceeding episode duration (${episodeDurationMs}ms)."
+                )
+            }
+            lastStart = startMs
+
+            val text = fields[9].replace("\\N", "\n").trim()
+            if (isPlaceholderOrEmptyText(text)) {
+                return SubtitleValidationResult(
+                    file,
+                    "ASS",
+                    dialogueLines.size,
+                    false,
+                    "ASS Dialogue #${idx + 1} has empty or placeholder text."
+                )
+            }
+        }
+
+        if (expectedCueCount > 0 && dialogueLines.size != expectedCueCount) {
+            return SubtitleValidationResult(
+                file,
+                "ASS",
+                dialogueLines.size,
+                false,
+                "ASS cue count mismatch: found ${dialogueLines.size}, expected $expectedCueCount."
             )
         }
         return SubtitleValidationResult(file, "ASS", dialogueLines.size, true, "Valid ASS (${dialogueLines.size} events).")
@@ -221,6 +354,15 @@ object SubtitleGenerator {
         val seconds = (safe % 60_000L) / 1_000L
         val centis = (safe % 1_000L) / 10L
         return String.format(Locale.US, "%d:%02d:%02d.%02d", hours, minutes, seconds, centis)
+    }
+
+    private fun parseAssTimestampMs(ts: String): Long {
+        val m = Regex("""^(\d+):(\d{2}):(\d{2})\.(\d{2})$""").matchEntire(ts) ?: return -1L
+        val h = m.groupValues[1].toLong()
+        val min = m.groupValues[2].toLong()
+        val sec = m.groupValues[3].toLong()
+        val cs = m.groupValues[4].toLong()
+        return h * 3_600_000L + min * 60_000L + sec * 1_000L + cs * 10L
     }
 
     private fun toMs(h: String, m: String, s: String, ms: String): Long {

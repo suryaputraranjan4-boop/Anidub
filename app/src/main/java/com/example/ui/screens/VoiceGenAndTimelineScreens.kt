@@ -152,7 +152,7 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
                     text = if (workerHealth?.reachable == true) {
                         "Remote worker reachable at ${config.remoteWorkerBaseUrl}. Selected engine: ${selectedEngine.displayName}."
                     } else {
-                        "No remote PyTorch GPU worker connected. Genuine spoken Hindi/Hinglish audio is synthesized on-device via Android Speech TTS (hi-IN / en-IN) + WSOLA synchronization."
+                        "No remote PyTorch GPU worker connected. Genuine spoken Hindi/Hinglish audio is synthesized on-device via Android Speech TTS (generic system voice, no voice cloning) + WSOLA synchronization."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = StudioTextSecondary

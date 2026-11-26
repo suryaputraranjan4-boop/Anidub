@@ -61,7 +61,8 @@ object VerifiedModelCatalog {
         "silero_vad_onnx" -> "Silero Team / ONNX Community"
         "f5_tts_hindi_24khz" -> "SPRINGLab (IIT Madras)"
         "pyannote_diarization_3_1" -> "pyannoteAI (Gated HF)"
-        "android_local_acoustic_dsp" -> "Built-in Android Kotlin DSP"
+        "wespeaker_voxceleb_resnet34_lm" -> "WeSpeaker / pyannoteAI"
+        "android_local_acoustic_dsp" -> "Built-in Android Kotlin DSP (Non-Neural)"
         "android_local_media_mixer" -> "Android MediaCodec / MediaMuxer"
         "firebase_ai_gemini_3_8_flash" -> "Google / Firebase AI Logic"
         else -> "Verified Open Source"
@@ -69,8 +70,8 @@ object VerifiedModelCatalog {
 
     fun runtimeBadgeLabel(runtimeCompatibility: String): String = when (runtimeCompatibility) {
         RUNTIME_ANDROID_LOCAL -> "Android Local Built-In"
-        RUNTIME_ONNX_COMPATIBLE -> "ONNX Format (ORT Mobile / Worker)"
-        RUNTIME_REMOTE_GPU_WORKER -> "Remote Python/PyTorch GPU Worker"
+        RUNTIME_ONNX_COMPATIBLE -> "On-Device ONNX Runtime Mobile"
+        RUNTIME_REMOTE_GPU_WORKER -> "Remote GPU Worker Only (Not Local)"
         RUNTIME_EXTERNAL_API -> "Firebase AI Logic Cloud API"
         else -> runtimeCompatibility.replace('_', ' ')
     }
@@ -359,6 +360,25 @@ object VerifiedModelCatalog {
             )
         )
 
+        // G. Speaker Embedding — WeSpeaker VoxCeleb ResNet34-LM (Open CC-BY-4.0 weights, Remote Worker Only)
+        val wespeakerFiles = listOf(
+            ModelArtifactFile(
+                filename = "pytorch_model.bin",
+                relativePath = "pytorch_model.bin",
+                downloadUrl = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM/resolve/main/pytorch_model.bin",
+                expectedBytes = 26_645_418L,
+                expectedSha256 = "366edf44f4c80889a3eb7a9d7bdf02c4aede3127f7dd15e274dcdb826b143c56",
+                role = "WEIGHTS"
+            ),
+            ModelArtifactFile(
+                filename = "config.yaml",
+                relativePath = "config.yaml",
+                downloadUrl = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM/resolve/main/config.yaml",
+                expectedBytes = 221L,
+                role = "CONFIG"
+            )
+        )
+
         return listOf(
             // 1. Japanese Speech Recognition — Whisper Large V3 Turbo
             ModelManifestEntity(
@@ -379,7 +399,7 @@ object VerifiedModelCatalog {
                 licenseName = "MIT License",
                 licenseNotes = "Official OpenAI Whisper Large V3 Turbo MIT release (809M params, 4-layer pruned decoder).",
                 runtimeCompatibility = RUNTIME_REMOTE_GPU_WORKER,
-                compatibilitySummary = "Not natively runnable on Android (no PyTorch/Transformers runtime in APK). Requires Self-Hosted Python/PyTorch GPU Worker (~4 GB VRAM FP16). Can be downloaded & SHA-256 verified to app storage for staging.",
+                compatibilitySummary = "Remote GPU Worker Only (Not natively runnable on Android — PyTorch/Safetensors weights). Requires Self-Hosted Python/PyTorch GPU Worker (~4 GB VRAM FP16). Can be downloaded & SHA-256 verified to app storage for staging.",
                 requiredDependencies = "Python 3.10+, torch, transformers >= 4.45, safetensors, accelerate",
                 isGatedHuggingFace = false,
                 isExperimentalArchived = false,
@@ -387,17 +407,18 @@ object VerifiedModelCatalog {
                 verifiedFilesCount = 0,
                 totalFilesCount = whisperFiles.size,
                 sha256Checksum = "",
-                statusNote = "11 verified files (1.62 GB total). Requires Remote Python/PyTorch GPU Worker for inference."
+                verificationLevel = "UNVERIFIED",
+                statusNote = "11 verified files (1.62 GB total). Remote GPU Worker Only — not executed locally on Android."
             ),
 
-            // 2. Voice Activity Detection — Silero VAD ONNX
+            // 2. Voice Activity Detection — Silero VAD ONNX (Runs Natively via ONNX Runtime Mobile!)
             ModelManifestEntity(
                 modelId = "silero_vad_onnx",
-                modelName = "Silero VAD (ONNX)",
+                modelName = "Silero VAD (ONNX Runtime Mobile)",
                 modelVersion = "onnx-community/silero-vad (main)",
                 specialistAgentNumber = 2,
                 category = "Voice Activity Detection (Agent 2)",
-                purpose = "Detects precise Japanese speech segments, silence regions, and dialogue boundaries.",
+                purpose = "Neural voice activity detection identifying exact Japanese speech boundaries and silence gaps on-device.",
                 sourceUrl = "https://huggingface.co/onnx-community/silero-vad",
                 fileFormat = "ONNX (.onnx FP32)",
                 supportedLanguages = "Language-agnostic (6,000+ languages incl. Japanese & Hindi)",
@@ -409,15 +430,16 @@ object VerifiedModelCatalog {
                 licenseName = "MIT License",
                 licenseNotes = "Official Silero VAD ONNX release redistributed by onnx-community under MIT License.",
                 runtimeCompatibility = RUNTIME_ONNX_COMPATIBLE,
-                compatibilitySummary = "Standard ONNX format compatible with ONNX Runtime Mobile (Android) & ONNX Runtime (Python worker). Note: onnxruntime-android AAR is not bundled in this APK; built-in Kotlin PCM VAD executes offline fallback while model.onnx is downloaded & verified.",
-                requiredDependencies = "ONNX Runtime Mobile / Python onnxruntime (Fallback: Built-in Android PCM VAD)",
+                compatibilitySummary = "Runs natively on Android via bundled ONNX Runtime Mobile (com.microsoft.onnxruntime:onnxruntime-android) as soon as model.onnx is downloaded & SHA-256 verified. Falls back to energy-based DSP VAD only when model.onnx is not downloaded.",
+                requiredDependencies = "Bundled ONNX Runtime Mobile (onnxruntime-android 1.20.0)",
                 isGatedHuggingFace = false,
                 isExperimentalArchived = false,
                 downloadState = "NOT_DOWNLOADED",
                 verifiedFilesCount = 0,
                 totalFilesCount = sileroFiles.size,
                 sha256Checksum = "",
-                statusNote = "2 verified files (2.24 MB total). Standard ONNX graph ready to download & verify."
+                verificationLevel = "UNVERIFIED",
+                statusNote = "2 verified files (2.24 MB total). Download to activate genuine on-device neural Silero VAD inference."
             ),
 
             // 3. Speaker Diarization — pyannote/speaker-diarization-3.1 (GATED)
@@ -427,7 +449,7 @@ object VerifiedModelCatalog {
                 modelVersion = "pyannote/speaker-diarization-3.1 (Gated)",
                 specialistAgentNumber = 3,
                 category = "Audio-Only Speaker Diarization (Agent 3)",
-                purpose = "Audio-only speaker diarization and voice clustering without visual or face recognition.",
+                purpose = "Neural audio-only speaker diarization and voice clustering without visual or face recognition.",
                 sourceUrl = "https://huggingface.co/pyannote/speaker-diarization-3.1",
                 fileFormat = "PyTorch (.bin) + pyannote YAML Pipeline",
                 supportedLanguages = "Language-agnostic audio speaker clustering",
@@ -439,7 +461,7 @@ object VerifiedModelCatalog {
                 licenseName = "MIT (Gated) + CC-BY-4.0 (WeSpeaker)",
                 licenseNotes = "Gated Hugging Face repositories: requires accepting user conditions on both pyannote/speaker-diarization-3.1 AND pyannote/segmentation-3.0, plus a read-only HF Access Token.",
                 runtimeCompatibility = RUNTIME_REMOTE_GPU_WORKER,
-                compatibilitySummary = "Gated PyTorch model — not natively runnable on Android. Requires Remote Python/PyTorch GPU Worker + HF Access Token. Total file size is withheld until queried with your authorized HF token.",
+                compatibilitySummary = "Remote GPU Worker Only (Gated PyTorch model — not natively runnable on Android). Invoked via POST /v1/diarize when a Remote GPU Worker is configured. Total file size is withheld until queried with your authorized HF token.",
                 requiredDependencies = "pyannote.audio >= 3.1, torch, torchaudio, HF Access Token (accepted terms on speaker-diarization-3.1 & segmentation-3.0)",
                 isGatedHuggingFace = true,
                 isExperimentalArchived = false,
@@ -447,17 +469,49 @@ object VerifiedModelCatalog {
                 verifiedFilesCount = 0,
                 totalFilesCount = pyannoteFiles.size,
                 sha256Checksum = "",
-                statusNote = "Gated Hugging Face model: Accept terms on speaker-diarization-3.1 & segmentation-3.0, then enter an HF read token to inspect exact server size or download."
+                verificationLevel = "UNVERIFIED",
+                statusNote = "Gated Hugging Face model (Remote Worker Only): Accept terms on speaker-diarization-3.1 & segmentation-3.0, then enter an HF read token to inspect exact server size or stage files."
             ),
 
-            // 4. Built-In Android Local Acoustic & YIN Pitch Analyzer (0 B download)
+            // 3b. Speaker Embeddings — WeSpeaker VoxCeleb ResNet34-LM (Open Weights, Remote Worker Only)
+            ModelManifestEntity(
+                modelId = "wespeaker_voxceleb_resnet34_lm",
+                modelName = "WeSpeaker VoxCeleb ResNet34-LM",
+                modelVersion = "pyannote/wespeaker-voxceleb-resnet34-LM (main)",
+                specialistAgentNumber = 3,
+                category = "Neural Speaker Embeddings (Agent 3)",
+                purpose = "256-D neural speaker embedding backbone used by pyannote/speaker-diarization-3.1 on the remote GPU worker.",
+                sourceUrl = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM",
+                fileFormat = "PyTorch (.bin) + YAML Config",
+                supportedLanguages = "Language-agnostic audio speaker embeddings",
+                actualFilesNeededJson = wespeakerFiles.joinToString(", ") { it.relativePath },
+                filesManifestJson = serializeManifest(wespeakerFiles),
+                downloadArtifactUrl = wespeakerFiles.first().downloadUrl,
+                expectedSizeBytes = wespeakerFiles.sumOf { it.expectedBytes },
+                isSizeKnown = true,
+                licenseName = "CC-BY-4.0",
+                licenseNotes = "Open WeSpeaker ResNet34-LM speaker embedding checkpoint used alongside pyannote diarization.",
+                runtimeCompatibility = RUNTIME_REMOTE_GPU_WORKER,
+                compatibilitySummary = "Remote GPU Worker Only (PyTorch .bin checkpoint — not executed on Android). Stage locally with SHA-256 verification or deploy on your Python worker.",
+                requiredDependencies = "Python 3.10+, torch, torchaudio, pyannote.audio",
+                isGatedHuggingFace = false,
+                isExperimentalArchived = false,
+                downloadState = "NOT_DOWNLOADED",
+                verifiedFilesCount = 0,
+                totalFilesCount = wespeakerFiles.size,
+                sha256Checksum = "",
+                verificationLevel = "UNVERIFIED",
+                statusNote = "2 verified files (26.65 MB total). Remote GPU Worker Only — PyTorch neural speaker embedding weights."
+            ),
+
+            // 4. Built-In Android Local Acoustic & Pitch Feature Analyzer (0 B download, Non-Neural)
             ModelManifestEntity(
                 modelId = "android_local_acoustic_dsp",
-                modelName = "On-Device PCM Acoustic & YIN Pitch Analyzer",
-                modelVersion = "v1.0-BuiltIn-Kotlin-DSP",
+                modelName = "On-Device Acoustic F0 & Spectral Features (Non-Neural)",
+                modelVersion = "v1.1-BuiltIn-Kotlin-DSP",
                 specialistAgentNumber = 3,
-                category = "Voice & Pitch Analysis (Agent 3)",
-                purpose = "Built-in Android PCM DSP extracting F0 pitch, spectral centroid, speaking rate, and 16-D voice embeddings offline.",
+                category = "Voice & Pitch Analysis (Agent 3 Fallback)",
+                purpose = "Non-neural built-in Android DSP extracting autocorrelation F0 pitch, spectral centroid, and harmonic features offline when no remote pyannote/WeSpeaker worker is connected.",
                 sourceUrl = "Built-in Android Application Module (AudioDspEngine.kt)",
                 fileFormat = "Native Kotlin JVM / ART Bytecode (Built-in)",
                 supportedLanguages = "Language-agnostic PCM audio waveform",
@@ -467,9 +521,9 @@ object VerifiedModelCatalog {
                 expectedSizeBytes = 0L,
                 isSizeKnown = true,
                 licenseName = "App Built-in Module",
-                licenseNotes = "Runs 100% locally on Android CPU with zero external downloads.",
+                licenseNotes = "Runs 100% locally on Android CPU with zero external downloads. Does not use trained neural speaker embeddings.",
                 runtimeCompatibility = RUNTIME_ANDROID_LOCAL,
-                compatibilitySummary = "Runs natively on Android device CPU — always available offline with 0 B download.",
+                compatibilitySummary = "Runs natively on Android device CPU (Non-Neural heuristic fallback) — always available offline with 0 B download.",
                 requiredDependencies = "Android Runtime (Pre-installed)",
                 isGatedHuggingFace = false,
                 isExperimentalArchived = false,
@@ -478,8 +532,9 @@ object VerifiedModelCatalog {
                 downloadedBytes = 0L,
                 verifiedFilesCount = 0,
                 totalFilesCount = 0,
-                installedVersion = "v1.0-BuiltIn",
-                statusNote = "Built-in Android DSP active locally (0 B download required)."
+                installedVersion = "v1.1-BuiltIn",
+                verificationLevel = "BUILT_IN",
+                statusNote = "Built-in Non-Neural Android DSP fallback active locally (0 B download required)."
             ),
 
             // 5. Gemini 3.8 Flash via Firebase AI Logic (Cloud API, 0 B download)
@@ -511,6 +566,7 @@ object VerifiedModelCatalog {
                 verifiedFilesCount = 0,
                 totalFilesCount = 0,
                 installedVersion = "gemini-3.8-flash",
+                verificationLevel = "BUILT_IN",
                 statusNote = "Active via Firebase AI Logic + App Check (0 B local storage)."
             ),
 
@@ -535,7 +591,7 @@ object VerifiedModelCatalog {
                 licenseName = "CC-BY-4.0",
                 licenseNotes = "Verified CC-BY-4.0 license from SPRINGLab/F5-Hindi-24KHz model card. Attribution required.",
                 runtimeCompatibility = RUNTIME_REMOTE_GPU_WORKER,
-                compatibilitySummary = "Not natively runnable on Android (Safetensors PyTorch checkpoint). Requires Remote Python/PyTorch GPU Worker (4-6 GB VRAM). On-device Android Speech TTS (hi-IN / en-IN) runs when remote worker is offline.",
+                compatibilitySummary = "Remote GPU Worker Only (Safetensors PyTorch checkpoint — not natively runnable on Android). Requires Remote Python/PyTorch GPU Worker (4-6 GB VRAM). On-device generic Android Speech TTS (no voice cloning) runs when remote worker is offline.",
                 requiredDependencies = "Python 3.10+, f5-tts, torch, torchaudio, safetensors",
                 isGatedHuggingFace = false,
                 isExperimentalArchived = false,
@@ -543,7 +599,8 @@ object VerifiedModelCatalog {
                 verifiedFilesCount = 0,
                 totalFilesCount = f5HindiFiles.size,
                 sha256Checksum = "",
-                statusNote = "2 verified files (632.17 MB total). Selected primary Hindi TTS (Chatterbox Hindi 3.21 GB omitted to avoid duplication)."
+                verificationLevel = "UNVERIFIED",
+                statusNote = "2 verified files (632.17 MB total). Remote GPU Worker Only — not executed locally on Android."
             ),
 
             // 7. Vocal Separation — HTDemucs (adefossez/HTDemucs)
@@ -565,7 +622,7 @@ object VerifiedModelCatalog {
                 licenseName = "MIT License (Demucs)",
                 licenseNotes = "Official Hybrid Transformer Demucs weights (955717e8) with JSON architecture sidecar and htdemucs.yaml bag manifest.",
                 runtimeCompatibility = RUNTIME_REMOTE_GPU_WORKER,
-                compatibilitySummary = "Not natively runnable on Android (Safetensors PyTorch Demucs checkpoint). Requires Remote Python/PyTorch GPU Worker; built-in Android 2-stem PCM residual separator handles offline fallback.",
+                compatibilitySummary = "Remote GPU Worker Only (Safetensors PyTorch Demucs checkpoint — not natively runnable on Android). Requires Remote Python/PyTorch GPU Worker; built-in Android bandpass/residual DSP approximation handles offline fallback.",
                 requiredDependencies = "Python 3.10+, demucs, torch, torchaudio, safetensors",
                 isGatedHuggingFace = false,
                 isExperimentalArchived = false,
@@ -573,17 +630,18 @@ object VerifiedModelCatalog {
                 verifiedFilesCount = 0,
                 totalFilesCount = htdemucsFiles.size,
                 sha256Checksum = "",
-                statusNote = "3 verified files (84.04 MB total). Includes 955717e8.safetensors, 955717e8.json & htdemucs.yaml."
+                verificationLevel = "UNVERIFIED",
+                statusNote = "3 verified files (84.04 MB total). Remote GPU Worker Only — includes 955717e8.safetensors, 955717e8.json & htdemucs.yaml."
             ),
 
             // 8. Built-In Android MediaCodec / MediaMuxer & PCM Timeline Mixer (0 B download)
             ModelManifestEntity(
                 modelId = "android_local_media_mixer",
                 modelName = "Android MediaCodec / MediaMuxer & PCM Mixer",
-                modelVersion = "v1.0-Android-MediaFramework",
+                modelVersion = "v1.1-Android-MediaFramework",
                 specialistAgentNumber = 7,
                 category = "Timeline, Mixing & Export (Agent 7)",
-                purpose = "Lossless 16-bit PCM WSOLA time-stretching, multitrack timeline placement, soft-knee limiter, and MP4/WAV export.",
+                purpose = "Lossless 16-bit PCM WSOLA time-stretching, streaming additive multitrack mixer, headroom limiter, and MP4/WAV export.",
                 sourceUrl = "Built-in Android Media Framework (MediaExtractor / MediaCodec / MediaMuxer)",
                 fileFormat = "Android System Media APIs + Native Kotlin PCM",
                 supportedLanguages = "Language-agnostic PCM / AAC / MP4 container",
@@ -604,8 +662,9 @@ object VerifiedModelCatalog {
                 downloadedBytes = 0L,
                 verifiedFilesCount = 0,
                 totalFilesCount = 0,
-                installedVersion = "v1.0-BuiltIn",
-                statusNote = "Built-in Android PCM mixer & MediaMuxer active locally (0 B download required)."
+                installedVersion = "v1.1-BuiltIn",
+                verificationLevel = "BUILT_IN",
+                statusNote = "Built-in Android PCM WSOLA + Streaming Mixer & MediaMuxer active locally (0 B download required)."
             )
         )
     }

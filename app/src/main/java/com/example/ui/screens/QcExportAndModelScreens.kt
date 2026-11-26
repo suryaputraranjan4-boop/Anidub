@@ -41,6 +41,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -56,6 +57,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.local.ModelManifestEntity
@@ -517,14 +519,21 @@ private fun ModelLibraryCard(
                 )
             }
             Spacer(modifier = Modifier.width(8.dp))
+            val pillText = when {
+                model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_EXTERNAL_API -> "FIREBASE AI"
+                model.downloadState == "BUILT_IN" -> "BUILT-IN"
+                model.downloadState == "INSTALLED" && model.verificationLevel == "VERIFIED_SHA256" -> "SHA-256 VERIFIED"
+                model.downloadState == "INSTALLED" && model.verificationLevel == "VERIFIED_SIZE_ONLY" -> "SIZE VERIFIED"
+                model.downloadState == "INSTALLED" -> "INSTALLED"
+                else -> model.downloadState.replace('_', ' ')
+            }
+            val pillColor = when {
+                model.downloadState == "INSTALLED" && model.verificationLevel == "VERIFIED_SIZE_ONLY" -> StudioCyan
+                else -> stateColor
+            }
             StatusPill(
-                text = when {
-                    model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_EXTERNAL_API -> "FIREBASE AI"
-                    model.downloadState == "BUILT_IN" -> "BUILT-IN"
-                    model.downloadState == "INSTALLED" -> "VERIFIED"
-                    else -> model.downloadState.replace('_', ' ')
-                },
-                color = stateColor
+                text = pillText,
+                color = pillColor
             )
         }
 
@@ -749,6 +758,22 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                     if (model.localFilePath.isNotBlank()) {
                         DetailRow("Device Storage Directory", model.localFilePath, mono = true)
                     }
+                    if (isDownloadable) {
+                        val verLabel = when (model.verificationLevel) {
+                            "VERIFIED_SHA256" -> "SHA-256 cryptographic digest verified"
+                            "VERIFIED_SIZE_ONLY" -> "Exact byte size verified (no official upstream SHA-256 published)"
+                            else -> "Unverified / Not installed"
+                        }
+                        DetailRow(
+                            "Integrity Verification",
+                            verLabel,
+                            valueColor = when (model.verificationLevel) {
+                                "VERIFIED_SHA256" -> StudioEmerald
+                                "VERIFIED_SIZE_ONLY" -> StudioCyan
+                                else -> StudioTextMuted
+                            }
+                        )
+                    }
                     if (model.sha256Checksum.isNotBlank()) {
                         DetailRow("Verified Primary SHA-256", model.sha256Checksum, mono = true, valueColor = StudioEmerald)
                     }
@@ -912,7 +937,8 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     when {
-                                        model.downloadState == "INSTALLED" -> "Re-Verify SHA-256"
+                                        model.downloadState == "INSTALLED" && model.sha256Checksum.isNotBlank() -> "Re-Verify SHA-256"
+                                        model.downloadState == "INSTALLED" -> "Re-Verify Files"
                                         model.downloadedBytes > 0L -> "Resume Download"
                                         else -> "Download All Files"
                                     }
@@ -1031,6 +1057,8 @@ fun SettingsScreen(viewModel: StudioViewModel) {
     val scope = rememberCoroutineScope()
 
     var workerUrl by remember(config.remoteWorkerBaseUrl) { mutableStateOf(config.remoteWorkerBaseUrl) }
+    var workerToken by remember(config.remoteWorkerAuthToken) { mutableStateOf(config.remoteWorkerAuthToken) }
+    var allowLocalHttp by remember(config.allowInsecureLocalHttp) { mutableStateOf(config.allowInsecureLocalHttp) }
     val freeBytes = remember { viewModel.modelDownloadManager.getAvailableStorageBytes() }
     val modelBytes = remember { viewModel.modelDownloadManager.getModelsStorageUsedBytes() }
 
@@ -1049,7 +1077,7 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                     Text("Self-Hosted GPU Inference Worker", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        "Optional endpoint for Python/PyTorch Safetensors models (Whisper Large V3 Turbo, HTDemucs, F5-Hindi-24KHz, pyannote 3.1).",
+                        "Optional endpoint for Python/PyTorch Safetensors models (Whisper Large V3 Turbo, HTDemucs, pyannote 3.1, F5-Hindi-24KHz). Uses HTTPS by default.",
                         style = MaterialTheme.typography.bodySmall,
                         color = StudioTextSecondary
                     )
@@ -1058,29 +1086,66 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                         value = workerUrl,
                         onValueChange = { workerUrl = it },
                         label = { Text("Worker Base URL") },
-                        placeholder = { Text("http://192.168.1.100:8080") },
-                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("https://worker.yourdomain.com or http://192.168.1.100:8080") },
+                        modifier = Modifier.fillMaxWidth().testTag("settings_worker_url_input"),
                         singleLine = true
                     )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = workerToken,
+                        onValueChange = { workerToken = it },
+                        label = { Text("Bearer Auth Token (Optional)") },
+                        placeholder = { Text("Sent as Authorization: Bearer ...") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth().testTag("settings_worker_token_input"),
+                        singleLine = true
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Allow HTTP on Private LAN",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = StudioTextPrimary
+                            )
+                            Text(
+                                "Permits cleartext HTTP only for localhost/10.x/172.16-31.x/192.168.x hosts.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = StudioTextMuted
+                            )
+                        }
+                        Switch(
+                            checked = allowLocalHttp,
+                            onCheckedChange = { allowLocalHttp = it },
+                            modifier = Modifier.testTag("settings_allow_lan_http_switch")
+                        )
+                    }
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
                             onClick = {
                                 val cleanUrl = workerUrl.trim()
+                                val cleanToken = workerToken.trim()
                                 scope.launch {
                                     viewModel.prefsRepo.updateWorkerSettings(
                                         enabled = cleanUrl.isNotBlank(),
                                         url = cleanUrl,
-                                        hasAuthToken = config.remoteWorkerHasAuthToken,
+                                        authToken = cleanToken,
+                                        hasAuthToken = cleanToken.isNotBlank(),
+                                        allowInsecureLocalHttp = allowLocalHttp,
                                         gpuAvailable = config.workerGpuAvailable,
                                         maxConcurrency = config.maxProcessingConcurrency,
                                         timeoutSeconds = config.requestTimeoutSeconds,
                                         uploadLimitMb = config.maxUploadLimitMb
                                     )
                                 }
-                                viewModel.verifyRemoteWorkerHealth(cleanUrl)
+                                viewModel.verifyRemoteWorkerHealth(cleanUrl, cleanToken, allowLocalHttp)
                             },
-                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("settings_save_test_worker_btn"),
                             colors = ButtonDefaults.buttonColors(containerColor = StudioViolet, contentColor = Color(0xFF0A0B0F)),
                             shape = RoundedCornerShape(10.dp)
                         ) {
@@ -1097,6 +1162,33 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                             },
                             isError = !workerHealth!!.reachable
                         )
+                    }
+                }
+            }
+
+            item {
+                StudioCard {
+                    Text("Firebase AI Logic (Gemini Model)", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "Used for Japanese ASR fallback (Stage 5) and Roman Hinglish translation (Stage 8) via Firebase App Check.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudioTextSecondary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-argon").forEach { modelId ->
+                            FilterChip(
+                                selected = config.geminiModelName == modelId,
+                                onClick = {
+                                    scope.launch {
+                                        viewModel.prefsRepo.updateGeminiModelName(modelId)
+                                    }
+                                },
+                                label = { Text(modelId, style = MaterialTheme.typography.labelSmall) },
+                                modifier = Modifier.testTag("settings_gemini_$modelId")
+                            )
+                        }
                     }
                 }
             }

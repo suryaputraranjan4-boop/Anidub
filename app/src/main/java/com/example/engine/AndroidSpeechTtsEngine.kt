@@ -95,7 +95,7 @@ class AndroidSpeechTtsEngine(private val context: Context) {
             }
 
             // Map speaker voice profile F0 & emotion to honest pitch and speech rate parameters
-            val baseF0 = speakerProfile.f0MeanHz.coerceIn(85f, 300f)
+            val baseF0 = if (speakerProfile.f0MeanHz > 0f) speakerProfile.f0MeanHz.coerceIn(85f, 300f) else 160f
             val profilePitch = (baseF0 / 160f).coerceIn(0.72f, 1.38f)
             val (emoPitchMul, emoRateMul) = when (emotion.uppercase()) {
                 "ANGRY", "SHOUTING" -> 1.08f to 1.12f
@@ -104,7 +104,8 @@ class AndroidSpeechTtsEngine(private val context: Context) {
                 "CALM", "WHISPERING" -> 0.95f to 0.90f
                 else -> 1.0f to 1.0f
             }
-            val speechRate = ((speakerProfile.speakingSpeedSylPerSec / 4.6f) * emoRateMul).coerceIn(0.75f, 1.35f)
+            val baseSpeed = if (speakerProfile.speakingSpeedSylPerSec > 0f) speakerProfile.speakingSpeedSylPerSec else 4.6f
+            val speechRate = ((baseSpeed / 4.6f) * emoRateMul).coerceIn(0.75f, 1.35f)
             val pitch = (profilePitch * emoPitchMul).coerceIn(0.68f, 1.45f)
 
             tts.setPitch(pitch)
@@ -161,7 +162,13 @@ class AndroidSpeechTtsEngine(private val context: Context) {
                 )
             }
 
-            val rawBuffer = AudioDspEngine.readWavFile(rawTtsFile)
+            val strictRaw = AudioDspEngine.readWavFileStrict(rawTtsFile)
+            if (strictRaw.isFailure) {
+                return@withContext Result.failure(
+                    IllegalStateException("Synthesized WAV for $dialogueId failed validation: ${strictRaw.exceptionOrNull()?.localizedMessage}")
+                )
+            }
+            val rawBuffer = strictRaw.getOrThrow()
             if (rawBuffer.samples.isEmpty()) {
                 return@withContext Result.failure(
                     IllegalStateException("Synthesized WAV for $dialogueId contained 0 PCM samples.")
@@ -195,7 +202,7 @@ class AndroidSpeechTtsEngine(private val context: Context) {
                     actualDurationMs = stretchedBuffer.durationMs,
                     timeStretchRatio = stretchRatio,
                     peakDbfs = peakDbfs,
-                    engineUsed = "Android-Speech-TTS ($chosenLocaleLabel)",
+                    engineUsed = "Android-Speech-TTS Generic ($chosenLocaleLabel — No Voice Cloning)",
                     modelVersion = "android.speech.tts.TextToSpeech ($chosenLocaleLabel)",
                     syncStatus = syncStatus
                 )

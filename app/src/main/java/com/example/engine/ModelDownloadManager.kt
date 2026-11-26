@@ -146,6 +146,8 @@ class ModelDownloadManager(
 
                 when {
                     presentCount == diskStatuses.size && diskStatuses.isNotEmpty() && existing?.downloadState == "INSTALLED" -> {
+                        val level = computeVerificationLevel(VerifiedModelCatalog.parseManifest(effectiveSpec.filesManifestJson))
+                        val levelLabel = if (level == "VERIFIED_SHA256") "SHA-256 verified" else "size-verified only"
                         effectiveSpec.copy(
                             downloadState = "INSTALLED",
                             downloadProgressPercent = 100,
@@ -154,7 +156,8 @@ class ModelDownloadManager(
                             installedVersion = existing.installedVersion,
                             localFilePath = getModelDirectory(spec.modelId).absolutePath,
                             sha256Checksum = existing.sha256Checksum,
-                            statusNote = "All $presentCount/${diskStatuses.size} verified files present on disk."
+                            verificationLevel = existing.verificationLevel.takeIf { it != "UNVERIFIED" } ?: level,
+                            statusNote = "All $presentCount/${diskStatuses.size} files present on disk ($levelLabel)."
                         )
                     }
                     totalOnDisk > 0L -> {
@@ -167,6 +170,7 @@ class ModelDownloadManager(
                             downloadedBytes = totalOnDisk,
                             verifiedFilesCount = presentCount,
                             localFilePath = getModelDirectory(spec.modelId).absolutePath,
+                            verificationLevel = "UNVERIFIED",
                             statusNote = "Incomplete download ($presentCount/${diskStatuses.size} files complete). Tap Download to resume."
                         )
                     }
@@ -489,6 +493,12 @@ class ModelDownloadManager(
             }
 
             // 5. Final check: mark INSTALLED ONLY when all required files exist & match
+            val verLevel = computeVerificationLevel(artifacts)
+            val verSummary = if (verLevel == "VERIFIED_SHA256") {
+                "SHA-256 verified all $verifiedCount/${artifacts.size} files (${formatCompactSize(cumulativeVerifiedBytes)}) on disk."
+            } else {
+                "Size-verified only ($verifiedCount/${artifacts.size} files, ${formatCompactSize(cumulativeVerifiedBytes)}; official SHA-256 not available for all weight files)."
+            }
             val finalModel = model.copy(
                 downloadState = "INSTALLED",
                 downloadProgressPercent = 100,
@@ -498,7 +508,8 @@ class ModelDownloadManager(
                 installedVersion = model.modelVersion.ifBlank { "Verified" },
                 localFilePath = modelDir.absolutePath,
                 sha256Checksum = primarySha256,
-                statusNote = "Verified all $verifiedCount/${artifacts.size} files (${formatCompactSize(cumulativeVerifiedBytes)}) on disk."
+                verificationLevel = verLevel,
+                statusNote = verSummary
             )
             dao.updateModel(finalModel)
             Result.success(finalModel)
@@ -581,6 +592,12 @@ class ModelDownloadManager(
             verifiedBytes += file.length()
         }
 
+        val verLevel = computeVerificationLevel(artifacts)
+        val verNote = if (verLevel == "VERIFIED_SHA256") {
+            "Integrity check passed: all $verifiedCount/${artifacts.size} files verified (weight SHA-256 matched)."
+        } else {
+            "Size-verified only: all $verifiedCount/${artifacts.size} files match expected byte length (official SHA-256 hash unavailable for some weights)."
+        }
         val verified = model.copy(
             downloadState = "INSTALLED",
             downloadProgressPercent = 100,
@@ -589,7 +606,8 @@ class ModelDownloadManager(
             totalFilesCount = artifacts.size,
             localFilePath = modelDir.absolutePath,
             sha256Checksum = primarySha,
-            statusNote = "Integrity check passed: all $verifiedCount/${artifacts.size} files verified via SHA-256."
+            verificationLevel = verLevel,
+            statusNote = verNote
         )
         dao.updateModel(verified)
         Result.success(verified)
@@ -610,10 +628,22 @@ class ModelDownloadManager(
             installedVersion = "",
             localFilePath = "",
             sha256Checksum = "",
+            verificationLevel = "UNVERIFIED",
             statusNote = "Deleted all files from device storage. Ready to download."
         )
         dao.updateModel(reset)
         reset
+    }
+
+    private fun computeVerificationLevel(artifacts: List<ModelArtifactFile>): String {
+        val weightArtifacts = artifacts.filter { it.role == "WEIGHTS" }
+        val checkTargets = weightArtifacts.ifEmpty { artifacts }
+        if (checkTargets.isEmpty()) return "UNVERIFIED"
+        return if (checkTargets.all { it.expectedSha256.isNotBlank() }) {
+            "VERIFIED_SHA256"
+        } else {
+            "VERIFIED_SIZE_ONLY"
+        }
     }
 
     private fun queryRemoteContentLength(url: String, bearerToken: String?): Result<Long> {

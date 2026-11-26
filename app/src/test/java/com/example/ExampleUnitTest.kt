@@ -294,4 +294,140 @@ class ExampleUnitTest {
         assertTrue(speakable.contains("book"))
         assertTrue(speakable.contains("Domain Expansion"))
     }
+
+    @Test
+    fun verifyStrictWavParserRejectsCorruptFilesAndReadsValidWav() {
+        val tempDir = java.nio.file.Files.createTempDirectory("wav_strict_test").toFile()
+        try {
+            val badFile = java.io.File(tempDir, "not_a_wav.wav")
+            badFile.writeText("NOT_RIFF_DATA_AT_ALL_123456789012345678901234567890")
+            val badRes = AudioDspEngine.readWavFileStrict(badFile)
+            assertEquals("Corrupt non-RIFF file must fail strict WAV parsing", true, badRes.isFailure)
+
+            val sr = 24000
+            val sine = ShortArray(sr / 2) { i ->
+                (sin(2.0 * PI * 300.0 * (i.toDouble() / sr)) * 10000).toInt().toShort()
+            }
+            val goodFile = java.io.File(tempDir, "valid.wav")
+            AudioDspEngine.writeWavFile(goodFile, PcmAudioBuffer(sine, sr, 1))
+            val okRes = AudioDspEngine.readWavFileStrict(goodFile)
+            assertTrue("Valid WAV must parse cleanly", okRes.isSuccess)
+            assertEquals(sr, okRes.getOrThrow().sampleRateHz)
+            assertEquals(sine.size, okRes.getOrThrow().samples.size)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyWsolaTimeStretchAndSilenceF0Unmeasured() {
+        val sr = 24000
+        val silent = PcmAudioBuffer(ShortArray(sr / 2), sr, 1)
+        val silentFeat = AudioDspEngine.analyzeVoiceSegment(silent)
+        assertEquals("Silent segment must report unmeasured F0 = 0f, never invented 185f", 0f, silentFeat.f0MeanHz, 0.001f)
+
+        val tone = ShortArray(sr) { i ->
+            (sin(2.0 * PI * 180.0 * (i.toDouble() / sr)) * 14000).toInt().toShort()
+        }
+        val (stretched, ratio) = AudioDspEngine.timeStretchPcm(PcmAudioBuffer(tone, sr, 1), targetDurationMs = 1250L)
+        assertTrue("Stretched duration should be close to 1250ms, got ${stretched.durationMs}", kotlin.math.abs(stretched.durationMs - 1250L) <= 60L)
+        assertTrue("Speed factor should reflect expansion (1000/1250 = 0.80x), got $ratio", ratio in 0.75f..0.85f)
+        assertTrue("Stretched audio must remain non-silent", AudioDspEngine.computePeakDbfs(stretched) > -20f)
+    }
+
+    @Test
+    fun verifyAdditiveTwoPassMultitrackMixerProducesNonClippedOutput() {
+        val tempDir = java.nio.file.Files.createTempDirectory("mix_test").toFile()
+        try {
+            val sr = 24000
+            val bg = ShortArray(sr * 2) { i ->
+                (sin(2.0 * PI * 110.0 * (i.toDouble() / sr)) * 6000).toInt().toShort()
+            }
+            val clip1 = ShortArray(sr / 2) { i ->
+                (sin(2.0 * PI * 440.0 * (i.toDouble() / sr)) * 20000).toInt().toShort()
+            }
+            val clip2 = ShortArray(sr / 2) { i ->
+                (sin(2.0 * PI * 520.0 * (i.toDouble() / sr)) * 20000).toInt().toShort()
+            }
+            val bgFile = AudioDspEngine.writeWavFile(java.io.File(tempDir, "bg.wav"), PcmAudioBuffer(bg, sr, 1))
+            val c1File = AudioDspEngine.writeWavFile(java.io.File(tempDir, "c1.wav"), PcmAudioBuffer(clip1, sr, 1))
+            val c2File = AudioDspEngine.writeWavFile(java.io.File(tempDir, "c2.wav"), PcmAudioBuffer(clip2, sr, 1))
+            val outFile = java.io.File(tempDir, "mixed.wav")
+
+            val result = AudioDspEngine.mixMultitrackTimeline(
+                episodeDurationMs = 2000L,
+                sampleRateHz = sr,
+                backgroundStemFile = bgFile,
+                backgroundGain = 0.8f,
+                dialoguePlacements = listOf(
+                    com.example.engine.MixPlacementItem("A-001", "A", c1File, startMs = 200L, trackGain = 1.0f),
+                    com.example.engine.MixPlacementItem("B-002", "B", c2File, startMs = 300L, trackGain = 1.0f)
+                ),
+                outputFile = outFile
+            )
+            assertTrue("Mixed WAV must exist and be non-empty", outFile.exists() && outFile.length() > 44L)
+            assertTrue("Mixed peak must be safe (<= 0 dBFS)", result.peakDbfs <= 0.01f)
+            assertTrue("Mixed audio must be audible", result.peakDbfs > -20f)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifySubtitleValidatorRejectsPlaceholdersAndOutOfBoundsCues() {
+        val tempDir = java.nio.file.Files.createTempDirectory("sub_placeholder_test").toFile()
+        try {
+            val placeholderSrt = java.io.File(tempDir, "placeholder.srt")
+            placeholderSrt.writeText("1\n00:00:01,000 --> 00:00:02,000\n[Unrecognized]\n")
+            val res = com.example.engine.SubtitleGenerator.validateSubtitleFile(placeholderSrt, expectedCueCount = 1, episodeDurationMs = 5000L)
+            assertEquals("Placeholder text must fail subtitle validation", false, res.isValid)
+
+            val outOfBoundsSrt = java.io.File(tempDir, "oob.srt")
+            outOfBoundsSrt.writeText("1\n00:00:10,000 --> 00:00:15,000\nReal spoken line\n")
+            val oobRes = com.example.engine.SubtitleGenerator.validateSubtitleFile(outOfBoundsSrt, expectedCueCount = 1, episodeDurationMs = 5000L)
+            assertEquals("Out-of-bounds cue must fail subtitle validation", false, oobRes.isValid)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyRemoteWorkerSecurityPolicyEnforcesHttpsAndSameOrigin() {
+        // Public HTTP must be rejected even if allowInsecureLocalHttp = true
+        val publicHttp = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl(
+            "http://example.com:8080",
+            allowInsecureLocalHttp = true
+        )
+        assertTrue("Public HTTP must be rejected", publicHttp.isFailure)
+
+        // Private LAN HTTP rejected by default, allowed when explicitly opted-in
+        val lanBlocked = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl(
+            "http://192.168.1.50:8080",
+            allowInsecureLocalHttp = false
+        )
+        assertTrue("Private LAN HTTP must require explicit opt-in", lanBlocked.isFailure)
+        val lanAllowed = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl(
+            "http://192.168.1.50:8080",
+            allowInsecureLocalHttp = true
+        )
+        assertTrue("Private LAN HTTP allowed when opted-in", lanAllowed.isSuccess)
+
+        // HTTPS allowed
+        val httpsOk = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl("https://gpu.studio.example/api")
+        assertTrue("HTTPS worker URL must be accepted", httpsOk.isSuccess)
+
+        // Same-origin download protection blocks SSRF to other hosts
+        val ssrfBlocked = com.example.data.remote.RemoteWorkerClient.resolveAndValidateSameOriginUrl(
+            "https://gpu.studio.example",
+            "http://169.254.169.254/latest/meta-data/"
+        )
+        assertTrue("Cross-origin SSRF URL must be blocked", ssrfBlocked.isFailure)
+
+        val sameOriginOk = com.example.data.remote.RemoteWorkerClient.resolveAndValidateSameOriginUrl(
+            "https://gpu.studio.example",
+            "/files/vocals.wav"
+        )
+        assertTrue("Relative same-origin artifact path must be accepted", sameOriginOk.isSuccess)
+    }
 }
+

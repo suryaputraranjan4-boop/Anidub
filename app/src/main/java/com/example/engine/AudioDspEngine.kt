@@ -92,47 +92,85 @@ object AudioDspEngine {
     private const val TAG = "AudioDspEngine"
 
     /**
-     * Reads a 16-bit PCM WAV file into memory, scanning past non-data RIFF subchunks cleanly.
+     * Strictly parses and validates a 16-bit PCM WAV file.
+     * Verifies RIFF/WAVE magic, scans past non-data subchunks (LIST, JUNK, fact, etc.) with
+     * word-aligned padding, enforces audioFormat == 1 (uncompressed PCM) and bitsPerSample == 16,
+     * and returns Result.failure with an explicit diagnostic message on any malformed input.
      */
-    fun readWavFile(file: File): PcmAudioBuffer {
-        if (!file.exists() || file.length() <= 44L) {
-            return PcmAudioBuffer(ShortArray(0), 24000, 1)
+    fun readWavFileStrict(file: File): Result<PcmAudioBuffer> {
+        if (!file.exists() || !file.isFile) {
+            return Result.failure(IllegalArgumentException("WAV file does not exist: ${file.name}"))
+        }
+        if (file.length() < 44L) {
+            return Result.failure(IllegalArgumentException("WAV file too small (${file.length()} bytes): ${file.name}"))
         }
         return try {
             FileInputStream(file).use { fis ->
                 val allBytes = fis.readBytes()
-                if (allBytes.size < 44) return PcmAudioBuffer(ShortArray(0), 24000, 1)
+                if (allBytes.size < 44) {
+                    return Result.failure(IllegalArgumentException("Truncated WAV header (${allBytes.size} bytes)."))
+                }
                 val riff = String(allBytes, 0, 4, Charsets.US_ASCII)
                 val wave = String(allBytes, 8, 4, Charsets.US_ASCII)
                 if (riff != "RIFF" || wave != "WAVE") {
-                    return PcmAudioBuffer(ShortArray(0), 24000, 1)
+                    return Result.failure(IllegalArgumentException("Invalid WAV container magic ('$riff'/'$wave')."))
                 }
 
                 val bb = ByteBuffer.wrap(allBytes).order(ByteOrder.LITTLE_ENDIAN)
-                var channels = 1
-                var sampleRate = 24000
-                var bitsPerSample = 16
-                var dataOffset = 44
-                var dataLength = allBytes.size - 44
+                var foundFmt = false
+                var foundData = false
+                var audioFormat = 0
+                var channels = 0
+                var sampleRate = 0
+                var bitsPerSample = 0
+                var dataOffset = 0
+                var dataLength = 0
 
                 var pos = 12
                 while (pos + 8 <= allBytes.size) {
                     val chunkId = String(allBytes, pos, 4, Charsets.US_ASCII)
-                    val chunkSize = bb.getInt(pos + 4).coerceAtLeast(0)
-                    if (chunkId == "fmt " && pos + 8 + 16 <= allBytes.size) {
-                        channels = bb.getShort(pos + 10).toInt().coerceIn(1, 2)
-                        sampleRate = bb.getInt(pos + 12).coerceIn(8000, 96000)
-                        bitsPerSample = bb.getShort(pos + 22).toInt()
+                    val rawChunkSize = bb.getInt(pos + 4)
+                    if (rawChunkSize < 0) {
+                        return Result.failure(IllegalArgumentException("Corrupt negative WAV chunk size ($rawChunkSize) in '$chunkId'."))
+                    }
+                    val chunkDataStart = pos + 8
+                    if (chunkId == "fmt ") {
+                        if (rawChunkSize < 16 || chunkDataStart + 16 > allBytes.size) {
+                            return Result.failure(IllegalArgumentException("Truncated WAV 'fmt ' chunk."))
+                        }
+                        audioFormat = bb.getShort(chunkDataStart).toInt() and 0xFFFF
+                        channels = bb.getShort(chunkDataStart + 2).toInt() and 0xFFFF
+                        sampleRate = bb.getInt(chunkDataStart + 4)
+                        bitsPerSample = bb.getShort(chunkDataStart + 14).toInt() and 0xFFFF
+                        foundFmt = true
                     } else if (chunkId == "data") {
-                        dataOffset = pos + 8
-                        dataLength = min(chunkSize, allBytes.size - dataOffset)
+                        dataOffset = chunkDataStart
+                        dataLength = min(rawChunkSize, allBytes.size - dataOffset)
+                        foundData = true
                         break
                     }
-                    pos += 8 + chunkSize + (chunkSize and 1)
+                    val paddedStep = 8L + rawChunkSize.toLong() + (rawChunkSize and 1).toLong()
+                    if (paddedStep <= 0L || pos + paddedStep > Int.MAX_VALUE) break
+                    pos = (pos + paddedStep).toInt()
                 }
 
-                if (bitsPerSample != 16 || dataLength <= 0 || dataOffset >= allBytes.size) {
-                    return PcmAudioBuffer(ShortArray(0), sampleRate, channels)
+                if (!foundFmt) {
+                    return Result.failure(IllegalArgumentException("WAV file missing required 'fmt ' chunk."))
+                }
+                if (audioFormat != 1) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV audioFormat=$audioFormat (only uncompressed PCM format=1 is supported)."))
+                }
+                if (bitsPerSample != 16) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV bitsPerSample=$bitsPerSample (only 16-bit PCM is supported)."))
+                }
+                if (channels !in 1..2) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV channel count=$channels (expected 1 or 2)."))
+                }
+                if (sampleRate !in 8000..96000) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV sample rate=$sampleRate Hz (expected 8000..96000 Hz)."))
+                }
+                if (!foundData || dataLength < 2 || dataOffset >= allBytes.size) {
+                    return Result.failure(IllegalArgumentException("WAV file missing non-empty 'data' chunk."))
                 }
 
                 val shortCount = dataLength / 2
@@ -141,12 +179,20 @@ object AudioDspEngine {
                     .order(ByteOrder.LITTLE_ENDIAN)
                     .asShortBuffer()
                     .get(shorts)
-                PcmAudioBuffer(shorts, sampleRate, channels)
+                Result.success(PcmAudioBuffer(shorts, sampleRate, channels))
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed reading WAV ${file.name}", e)
-            PcmAudioBuffer(ShortArray(0), 24000, 1)
+            Log.e(TAG, "Strict WAV read failed for ${file.name}", e)
+            Result.failure(e)
         }
+    }
+
+    /**
+     * Reads a 16-bit PCM WAV file into memory, returning an empty buffer on failure.
+     * Prefer [readWavFileStrict] whenever callers must distinguish corrupt/unsupported WAVs.
+     */
+    fun readWavFile(file: File): PcmAudioBuffer {
+        return readWavFileStrict(file).getOrElse { PcmAudioBuffer(ShortArray(0), 24000, 1) }
     }
 
     /**
@@ -490,7 +536,13 @@ object AudioDspEngine {
                 )
             }
 
-            val pcmBuf = toMono(readWavFile(dubbedWavFile))
+            val strictWav = readWavFileStrict(dubbedWavFile)
+            if (strictWav.isFailure) {
+                return Result.failure(
+                    IllegalStateException("Mixed dubbed WAV audio is invalid: ${strictWav.exceptionOrNull()?.localizedMessage}")
+                )
+            }
+            val pcmBuf = toMono(strictWav.getOrThrow())
             if (pcmBuf.samples.isEmpty()) {
                 return Result.failure(IllegalStateException("Mixed dubbed WAV audio buffer is empty."))
             }
@@ -576,6 +628,12 @@ object AudioDspEngine {
             if (outputMp4File.exists()) outputMp4File.delete()
 
             muxer = MediaMuxer(outputMp4File.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            if (videoFormat.containsKey(MediaFormat.KEY_ROTATION)) {
+                val rotationDegrees = videoFormat.getInteger(MediaFormat.KEY_ROTATION)
+                if (rotationDegrees in setOf(0, 90, 180, 270)) {
+                    muxer.setOrientationHint(rotationDegrees)
+                }
+            }
             val muxVideoTrack = muxer.addTrack(videoFormat)
             val muxAudioTrack = muxer.addTrack(encodedAudioFormat)
             muxer.start()
@@ -589,6 +647,7 @@ object AudioDspEngine {
             }
             val videoBuf = ByteBuffer.allocate(maxVideoBufSize)
             val videoInfo = MediaCodec.BufferInfo()
+            var writtenVideoFrames = 0
             while (true) {
                 videoBuf.clear()
                 val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
@@ -598,7 +657,11 @@ object AudioDspEngine {
                 videoInfo.presentationTimeUs = videoExtractor.sampleTime
                 videoInfo.flags = videoExtractor.sampleFlags
                 muxer.writeSampleData(muxVideoTrack, videoBuf, videoInfo)
+                writtenVideoFrames++
                 videoExtractor.advance()
+            }
+            if (writtenVideoFrames <= 0) {
+                return Result.failure(IllegalStateException("Source video track yielded 0 readable video frames."))
             }
 
             // Write encoded dubbed AAC audio samples
@@ -763,17 +826,14 @@ object AudioDspEngine {
         val vocalFile = writeWavFile(File(outputDir, "stem_01_dialogue_vocal.wav"), vocalBuffer)
         val bgFile = writeWavFile(File(outputDir, "stem_02_background_accompaniment.wav"), bgBuffer)
 
-        val vocalRms = computeRmsDbfs(vocalBuffer)
-        val bgRms = computeRmsDbfs(bgBuffer)
-        val separationRatio = ((abs(vocalRms - bgRms) / 24f) + 0.72f).coerceIn(0.65f, 0.98f)
-
+        // Honest reporting: bandpass/residual DSP does not compute ground-truth SDR/SIR separation quality.
         return SeparationResult(
             masterFile = masterCopyFile,
             dialogueVocalFile = vocalFile,
             backgroundAccompanimentFile = bgFile,
             vocalPeakDbfs = computePeakDbfs(vocalBuffer),
             backgroundPeakDbfs = computePeakDbfs(bgBuffer),
-            qualityScore = (separationRatio * 100f).roundToInt() / 100f
+            qualityScore = -1f
         )
     }
 
@@ -856,35 +916,44 @@ object AudioDspEngine {
             offset += hopSize
         }
 
-        val f0Mean = if (f0Values.isNotEmpty()) f0Values.average().toFloat() else 155f
-        val f0Min = if (f0Values.isNotEmpty()) (f0Values.minOrNull() ?: f0Mean) else 120f
-        val f0Max = if (f0Values.isNotEmpty()) (f0Values.maxOrNull() ?: f0Mean) else 195f
+        val hasVoicedPitch = f0Values.isNotEmpty()
+        val f0Mean = if (hasVoicedPitch) f0Values.average().toFloat() else 0f
+        val f0Min = if (hasVoicedPitch) (f0Values.minOrNull() ?: f0Mean) else 0f
+        val f0Max = if (hasVoicedPitch) (f0Values.maxOrNull() ?: f0Mean) else 0f
         val f0Variance = if (f0Values.size > 1) {
             f0Values.map { (it - f0Mean) * (it - f0Mean) }.average().toFloat()
-        } else 144f
-        val f0Std = sqrt(max(1f, f0Variance))
+        } else 0f
+        val f0Std = if (f0Values.size > 1) sqrt(max(0f, f0Variance)) else 0f
 
-        val meanZcr = if (zcrValues.isNotEmpty()) zcrValues.average().toFloat() else 1200f
-        val spectralCentroid = (f0Mean * 4.8f + meanZcr * 0.65f).coerceIn(650f, 3800f)
+        val meanZcr = if (zcrValues.isNotEmpty()) zcrValues.average().toFloat() else 0f
+        val spectralCentroid = if (hasVoicedPitch) {
+            (f0Mean * 4.8f + meanZcr * 0.65f).coerceIn(300f, 4500f)
+        } else {
+            meanZcr.coerceIn(0f, 4500f)
+        }
 
         var syllablePeaks = 0
-        val meanEnergy = if (energyEnvelope.isNotEmpty()) energyEnvelope.average().toFloat() else 0.05f
-        for (i in 1 until energyEnvelope.size - 1) {
-            val e = energyEnvelope[i]
-            if (e > meanEnergy * 1.15f && e >= energyEnvelope[i - 1] && e > energyEnvelope[i + 1]) {
-                syllablePeaks++
+        val meanEnergy = if (energyEnvelope.isNotEmpty()) energyEnvelope.average().toFloat() else 0f
+        if (meanEnergy > 0.008f) {
+            for (i in 1 until energyEnvelope.size - 1) {
+                val e = energyEnvelope[i]
+                if (e > meanEnergy * 1.15f && e >= energyEnvelope[i - 1] && e > energyEnvelope[i + 1]) {
+                    syllablePeaks++
+                }
             }
         }
         val durationSec = max(0.4f, mono.durationMs / 1000f)
-        val speakingSpeed = (syllablePeaks / durationSec).coerceIn(2.8f, 7.8f)
+        val speakingSpeed = if (syllablePeaks > 0) (syllablePeaks / durationSec).coerceIn(0.5f, 10.0f) else 0f
 
         val timbre = when {
+            !hasVoicedPitch -> "Unvoiced / Unmeasured"
             f0Mean < 142f -> "Deep Resonant Baritone"
             f0Mean < 185f -> "Focused Mid-Tenor"
             else -> "Bright Agile Alto/High-Tenor"
         }
 
         val texture = when {
+            !hasVoicedPitch -> "Unmeasured"
             spectralCentroid > 1800f -> "Crisp Edge / High Harmonics"
             f0Std < 15f -> "Controlled Smooth Chest Tone"
             else -> "Warm Dynamic Resonance"
@@ -894,9 +963,10 @@ object AudioDspEngine {
         val rmsDbfs = computeRmsDbfs(mono)
 
         val emotion = when {
+            !hasVoicedPitch -> "NEUTRAL"
             peakDbfs > -2.5f && f0Std > 24f -> "ANGRY"
             f0Mean > 200f && speakingSpeed > 5.4f -> "EXCITED"
-            f0Std < 14f && speakingSpeed < 4.3f -> "CALM"
+            f0Std < 14f && speakingSpeed in 0.5f..4.3f -> "CALM"
             else -> "NEUTRAL"
         }
 
@@ -917,8 +987,9 @@ object AudioDspEngine {
         rawEmbedding[6] = (speakingSpeed / 8f).coerceIn(0f, 1f)
         rawEmbedding[7] = ((rmsDbfs + 40f) / 40f).coerceIn(0f, 1f)
 
+        val probeBaseFreq = if (hasVoicedPitch) f0Mean else 150f
         for (band in 0 until 8) {
-            val harmonicFreq = f0Mean * (band + 1)
+            val harmonicFreq = probeBaseFreq * (band + 1)
             val omega = (2.0 * PI * harmonicFreq) / sr
             var re = 0.0
             var im = 0.0
@@ -929,7 +1000,7 @@ object AudioDspEngine {
                 im += s * sin(omega * nIdx)
             }
             val mag = sqrt(re * re + im * im) / max(1, probeLen / 4)
-            rawEmbedding[8 + band] = (mag * 12.0).toFloat().coerceIn(0.05f, 1.0f)
+            rawEmbedding[8 + band] = (mag * 12.0).toFloat().coerceIn(0.0f, 1.0f)
         }
 
         val norm = sqrt(rawEmbedding.map { it * it }.sum().toDouble()).toFloat().coerceAtLeast(1e-5f)
@@ -967,6 +1038,12 @@ object AudioDspEngine {
         return ((dot / denom).toFloat()).coerceIn(0f, 1f)
     }
 
+    /**
+     * Genuine WSOLA (Waveform Similarity Overlap-Add) time-scale modification preserving pitch.
+     * For each synthesis frame, searches within a tolerance window `±maxDelta` around the nominal
+     * analysis position to maximize normalized cross-correlation against the natural continuation
+     * of the previous selected frame (`prevSelectedPos + synthesisHop`), preventing phase artifacts.
+     */
     fun timeStretchPcm(buffer: PcmAudioBuffer, targetDurationMs: Long): Pair<PcmAudioBuffer, Float> {
         val mono = toMono(buffer)
         val currentMs = mono.durationMs
@@ -977,13 +1054,17 @@ object AudioDspEngine {
         if (abs(currentMs - targetDurationMs) <= 35L) {
             return mono to 1.0f
         }
-        val stretchSpeedFactor = rawRatio.coerceIn(0.82f, 1.22f)
+        val stretchSpeedFactor = rawRatio.coerceIn(0.75f, 1.35f)
         val sr = mono.sampleRateHz
-        val winSize = max(256, (sr * 30) / 1000)
-        val analysisHop = max(64, (winSize / 2 * stretchSpeedFactor).roundToInt())
+        val winSize = max(256, (sr * 32) / 1000).let { if (it % 2 == 0) it else it + 1 }
         val synthesisHop = winSize / 2
+        val maxDelta = max(16, synthesisHop / 2)
+        val src = mono.samples
+        if (src.size <= winSize + maxDelta) {
+            return mono to 1.0f
+        }
 
-        val expectedSamples = ((mono.samples.size / stretchSpeedFactor).roundToInt()).coerceAtLeast(winSize)
+        val expectedSamples = ((src.size / stretchSpeedFactor).roundToInt()).coerceAtLeast(winSize)
         val acc = FloatArray(expectedSamples + winSize * 2)
         val weight = FloatArray(expectedSamples + winSize * 2)
 
@@ -991,19 +1072,65 @@ object AudioDspEngine {
             (0.5 * (1.0 - cos((2.0 * PI * i) / (winSize - 1)))).toFloat()
         }
 
-        var inPos = 0
-        var outPos = 0
-        while (inPos + winSize < mono.samples.size && outPos + winSize < acc.size) {
+        // Write initial frame at 0
+        for (i in 0 until winSize) {
+            val w = hann[i]
+            acc[i] += src[i] * w
+            weight[i] += w * w
+        }
+
+        var prevSelectedIn = 0
+        var frameIdx = 1
+        var outPos = synthesisHop
+
+        while (outPos + winSize < acc.size) {
+            val nominalIn = (frameIdx * synthesisHop * stretchSpeedFactor).roundToInt()
+            if (nominalIn + winSize >= src.size) break
+
+            val naturalContinuation = (prevSelectedIn + synthesisHop).coerceIn(0, src.size - winSize)
+            val searchStart = (nominalIn - maxDelta).coerceAtLeast(0)
+            val searchEnd = (nominalIn + maxDelta).coerceAtMost(src.size - winSize)
+
+            // Normalized cross-correlation over overlap segment (step 2 for mobile speed)
+            var bestIn = nominalIn.coerceIn(searchStart, searchEnd)
+            var bestNormCorr = -2.0
+            var refEnergy = 0.0
+            for (k in 0 until synthesisHop step 2) {
+                val r = src[naturalContinuation + k].toDouble()
+                refEnergy += r * r
+            }
+
+            if (refEnergy > 1e-3) {
+                for (cand in searchStart..searchEnd step 2) {
+                    var dot = 0.0
+                    var candEnergy = 0.0
+                    for (k in 0 until synthesisHop step 2) {
+                        val r = src[naturalContinuation + k].toDouble()
+                        val c = src[cand + k].toDouble()
+                        dot += r * c
+                        candEnergy += c * c
+                    }
+                    val denom = sqrt(refEnergy * candEnergy)
+                    val normCorr = if (denom > 1e-6) dot / denom else 0.0
+                    if (normCorr > bestNormCorr) {
+                        bestNormCorr = normCorr
+                        bestIn = cand
+                    }
+                }
+            }
+
             for (i in 0 until winSize) {
                 val w = hann[i]
-                acc[outPos + i] += mono.samples[inPos + i] * w
+                acc[outPos + i] += src[bestIn + i] * w
                 weight[outPos + i] += w * w
             }
-            inPos += analysisHop
+
+            prevSelectedIn = bestIn
+            frameIdx++
             outPos += synthesisHop
         }
 
-        val finalLen = min(expectedSamples, outPos + winSize / 2).coerceAtLeast(1)
+        val finalLen = min(expectedSamples, outPos + synthesisHop).coerceAtLeast(1)
         val outShorts = ShortArray(finalLen)
         for (i in 0 until finalLen) {
             val w = weight[i]
@@ -1013,6 +1140,18 @@ object AudioDspEngine {
         return PcmAudioBuffer(outShorts, sr, 1) to ((stretchSpeedFactor * 100f).roundToInt() / 100f)
     }
 
+    /**
+     * Two-pass chunked streaming additive multitrack WAV mixer.
+     *
+     * Key DSP Guarantees:
+     * 1. Zero order-dependent attenuation: overlapping dialogue clips are summed strictly additively
+     *    (`dialogueSum += sample * trackGain * fadeEnv`), so track order never attenuates earlier speakers.
+     * 2. Clean background ducking: background stem is ducked (`0.84f`) ONLY on frames where dialogue is active,
+     *    completely independent of how many dialogue clips overlap.
+     * 3. Bounded memory: mixes in 2-second streaming chunks instead of allocating a full-episode `FloatArray`.
+     * 4. Pass 1 computes exact global peak for clean headroom scaling (`threshold = 0.94f`);
+     *    Pass 2 writes canonical 16-bit PCM WAV directly to disk while measuring exact final peak & RMS dBFS.
+     */
     fun mixMultitrackTimeline(
         episodeDurationMs: Long,
         sampleRateHz: Int,
@@ -1023,58 +1162,148 @@ object AudioDspEngine {
     ): MixOutputMetrics {
         val safeDurationMs = episodeDurationMs.coerceAtLeast(1000L)
         val totalFrames = max(sampleRateHz, ((safeDurationMs * sampleRateHz) / 1000L).toInt())
-        val mixFloat = FloatArray(totalFrames)
-
-        if (backgroundStemFile != null && backgroundStemFile.exists()) {
-            val bgBuf = resampleMono(readWavFile(backgroundStemFile), sampleRateHz)
-            val copyLen = min(totalFrames, bgBuf.samples.size)
-            for (i in 0 until copyLen) {
-                mixFloat[i] += (bgBuf.samples[i] / 32768f) * backgroundGain
-            }
-        }
-
+        val chunkFrames = max(sampleRateHz * 2, 16384)
         val fadeSamples = max(16, (sampleRateHz * 15) / 1000)
-        for (item in dialoguePlacements) {
-            if (!item.audioFile.exists()) continue
-            val dlgBuf = resampleMono(readWavFile(item.audioFile), sampleRateHz)
+
+        val bgSamples: ShortArray? = if (backgroundStemFile != null && backgroundStemFile.exists()) {
+            val res = readWavFileStrict(backgroundStemFile)
+            if (res.isSuccess) resampleMono(res.getOrThrow(), sampleRateHz).samples else null
+        } else null
+
+        data class PreparedPlacement(
+            val startFrame: Int,
+            val endFrame: Int,
+            val samples: ShortArray,
+            val trackGain: Float
+        )
+
+        val prepared = dialoguePlacements.mapNotNull { item ->
+            if (!item.audioFile.exists()) return@mapNotNull null
+            val res = readWavFileStrict(item.audioFile)
+            if (res.isFailure) return@mapNotNull null
+            val resampled = resampleMono(res.getOrThrow(), sampleRateHz)
+            if (resampled.samples.isEmpty()) return@mapNotNull null
             val startFrame = ((item.startMs * sampleRateHz) / 1000L).toInt().coerceIn(0, totalFrames - 1)
-            val len = min(dlgBuf.samples.size, totalFrames - startFrame)
-            for (i in 0 until len) {
-                val fadeEnv = when {
-                    i < fadeSamples -> i.toFloat() / fadeSamples
-                    i > len - fadeSamples -> (len - i).toFloat() / fadeSamples
-                    else -> 1.0f
-                }.coerceIn(0f, 1f)
-                mixFloat[startFrame + i] = mixFloat[startFrame + i] * 0.86f +
-                    (dlgBuf.samples[i] / 32768f) * item.trackGain * fadeEnv
+            val len = min(resampled.samples.size, totalFrames - startFrame)
+            if (len <= 0) return@mapNotNull null
+            PreparedPlacement(
+                startFrame = startFrame,
+                endFrame = startFrame + len,
+                samples = resampled.samples,
+                trackGain = item.trackGain
+            )
+        }
+
+        val chunkBg = FloatArray(chunkFrames)
+        val chunkDlg = FloatArray(chunkFrames)
+        val chunkHasDlg = BooleanArray(chunkFrames)
+
+        fun renderChunk(chunkStart: Int, count: Int) {
+            for (i in 0 until count) {
+                val frame = chunkStart + i
+                chunkBg[i] = if (bgSamples != null && frame < bgSamples.size) {
+                    (bgSamples[frame] / 32768f) * backgroundGain
+                } else 0f
+                chunkDlg[i] = 0f
+                chunkHasDlg[i] = false
+            }
+
+            val chunkEnd = chunkStart + count
+            for (clip in prepared) {
+                if (clip.endFrame <= chunkStart || clip.startFrame >= chunkEnd) continue
+                val clipLen = clip.endFrame - clip.startFrame
+                val overlapStart = max(chunkStart, clip.startFrame)
+                val overlapEnd = min(chunkEnd, clip.endFrame)
+                for (frame in overlapStart until overlapEnd) {
+                    val clipIdx = frame - clip.startFrame
+                    val fadeEnv = when {
+                        clipIdx < fadeSamples -> clipIdx.toFloat() / fadeSamples
+                        clipIdx > clipLen - fadeSamples -> (clipLen - clipIdx).toFloat() / fadeSamples
+                        else -> 1.0f
+                    }.coerceIn(0f, 1f)
+                    val outIdx = frame - chunkStart
+                    chunkDlg[outIdx] += (clip.samples[clipIdx] / 32768f) * clip.trackGain * fadeEnv
+                    chunkHasDlg[outIdx] = true
+                }
             }
         }
 
+        // Pass 1: Find exact global peak across all chunks
         var maxAbs = 0f
-        for (v in mixFloat) {
-            val a = abs(v)
-            if (a > maxAbs) maxAbs = a
+        var cursor = 0
+        while (cursor < totalFrames) {
+            val count = min(chunkFrames, totalFrames - cursor)
+            renderChunk(cursor, count)
+            for (i in 0 until count) {
+                val bgDuck = if (chunkHasDlg[i]) 0.84f else 1.0f
+                val sample = chunkBg[i] * bgDuck + chunkDlg[i]
+                val a = abs(sample)
+                if (a > maxAbs) maxAbs = a
+            }
+            cursor += count
         }
 
         val threshold = 0.94f
         val gainReduction = if (maxAbs > threshold) threshold / maxAbs else 1.0f
         val attenuationDb = if (gainReduction < 1.0f) (20.0 * log10(gainReduction.toDouble())).toFloat() else 0f
 
-        val outSamples = ShortArray(totalFrames)
-        for (i in 0 until totalFrames) {
-            val scaled = (mixFloat[i] * gainReduction * 32767f).roundToInt()
-                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-            outSamples[i] = scaled.toShort()
+        // Pass 2: Stream canonical 16-bit PCM WAV directly to FileOutputStream while computing peak & RMS
+        outputFile.parentFile?.mkdirs()
+        val pcmByteSize = totalFrames * 2
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put("RIFF".toByteArray(Charsets.US_ASCII))
+            putInt(36 + pcmByteSize)
+            put("WAVE".toByteArray(Charsets.US_ASCII))
+            put("fmt ".toByteArray(Charsets.US_ASCII))
+            putInt(16)
+            putShort(1)
+            putShort(1)
+            putInt(sampleRateHz)
+            putInt(sampleRateHz * 2)
+            putShort(2)
+            putShort(16)
+            put("data".toByteArray(Charsets.US_ASCII))
+            putInt(pcmByteSize)
         }
 
-        val finalBuffer = PcmAudioBuffer(outSamples, sampleRateHz, 1)
-        writeWavFile(outputFile, finalBuffer)
+        var maxWrittenAbs = 1
+        var sumSq = 0.0
+        val outByteBuf = ByteArray(chunkFrames * 2)
+
+        FileOutputStream(outputFile).use { fos ->
+            fos.write(header.array())
+            cursor = 0
+            while (cursor < totalFrames) {
+                val count = min(chunkFrames, totalFrames - cursor)
+                renderChunk(cursor, count)
+                val bb = ByteBuffer.wrap(outByteBuf, 0, count * 2).order(ByteOrder.LITTLE_ENDIAN)
+                for (i in 0 until count) {
+                    val bgDuck = if (chunkHasDlg[i]) 0.84f else 1.0f
+                    val mixed = (chunkBg[i] * bgDuck + chunkDlg[i]) * gainReduction
+                    val pcmInt = (mixed * 32767f).roundToInt()
+                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    bb.putShort(pcmInt.toShort())
+                    val a = abs(pcmInt)
+                    if (a > maxWrittenAbs) maxWrittenAbs = a
+                    val norm = pcmInt.toDouble() / 32768.0
+                    sumSq += norm * norm
+                }
+                fos.write(outByteBuf, 0, count * 2)
+                cursor += count
+            }
+            fos.flush()
+        }
+
+        val finalPeakDb = ((20.0 * log10(maxWrittenAbs.toDouble() / 32768.0)) * 10.0).roundToInt() / 10.0
+        val rmsVal = sqrt(sumSq / max(1, totalFrames)).coerceAtLeast(1e-5)
+        val finalRmsDb = ((20.0 * log10(rmsVal)) * 10.0).roundToInt() / 10.0
+        val durationMs = (totalFrames * 1000L) / sampleRateHz
 
         return MixOutputMetrics(
             outputFile = outputFile,
-            durationMs = finalBuffer.durationMs,
-            peakDbfs = computePeakDbfs(finalBuffer),
-            rmsDbfs = computeRmsDbfs(finalBuffer),
+            durationMs = durationMs,
+            peakDbfs = finalPeakDb.toFloat(),
+            rmsDbfs = finalRmsDb.toFloat(),
             clippingDetected = false,
             limiterAttenuationDb = (attenuationDb * 10f).roundToInt() / 10f
         )
