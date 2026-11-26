@@ -4,6 +4,8 @@ import android.content.Context
 import android.os.StatFs
 import com.example.data.local.AnimeDubDao
 import com.example.data.local.ModelManifestEntity
+import com.example.data.remote.DirectGeminiApiClient
+import com.example.data.remote.GeminiConnectionState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -100,7 +102,12 @@ class ModelDownloadManager(
      */
     suspend fun reconcileCatalogWithDisk(
         geminiApiConfigured: Boolean = false,
-        geminiModelName: String = "gemini-2.5-flash"
+        geminiModelName: String = DirectGeminiApiClient.DEFAULT_MODEL_ID,
+        geminiConnectionState: GeminiConnectionState = if (geminiApiConfigured) {
+            GeminiConnectionState.API_KEY_SAVED_UNVERIFIED
+        } else {
+            GeminiConnectionState.API_KEY_MISSING
+        }
     ) = withContext(Dispatchers.IO) {
         val catalog = VerifiedModelCatalog.buildVerifiedModelCatalog()
         val validIds = catalog.map { it.modelId }
@@ -125,24 +132,12 @@ class ModelDownloadManager(
         val reconciled = catalog.map { spec ->
             when (spec.runtimeCompatibility) {
                 VerifiedModelCatalog.RUNTIME_DIRECT_GEMINI_API -> {
-                    if (geminiApiConfigured) {
-                        spec.copy(
-                            modelVersion = geminiModelName,
-                            installedVersion = geminiModelName,
-                            downloadState = VerifiedModelCatalog.STATE_READY,
-                            downloadProgressPercent = 100,
-                            verificationLevel = "API_KEY_CONFIGURED",
-                            statusNote = "Direct Gemini API key configured ($geminiModelName). Use Settings -> Test Connection to verify live reachability."
-                        )
-                    } else {
-                        spec.copy(
-                            modelVersion = geminiModelName,
-                            downloadState = VerifiedModelCatalog.STATE_NOT_DOWNLOADED,
-                            downloadProgressPercent = 0,
-                            verificationLevel = "API_KEY_REQUIRED",
-                            statusNote = "No Gemini API key configured. Open Settings -> Direct Gemini API to add your key."
-                        )
-                    }
+                    buildDirectGeminiCatalogEntity(
+                        base = spec,
+                        connectionState = geminiConnectionState,
+                        modelName = geminiModelName,
+                        connectionMessage = null
+                    )
                 }
                 VerifiedModelCatalog.RUNTIME_ANDROID_LOCAL,
                 VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID -> spec
@@ -210,35 +205,86 @@ class ModelDownloadManager(
         dao.insertModels(reconciled)
     }
 
-    suspend fun updateDirectGeminiCatalogStatus(
-        isConfigured: Boolean,
+    private fun buildDirectGeminiCatalogEntity(
+        base: ModelManifestEntity,
+        connectionState: GeminiConnectionState,
         modelName: String,
-        connectionMessage: String? = null,
-        isError: Boolean = false
+        connectionMessage: String?
+    ): ModelManifestEntity {
+        val (newState, pct, verLevel, defaultNote) = when (connectionState) {
+            GeminiConnectionState.VERIFIED_CONNECTED -> Quad(
+                VerifiedModelCatalog.STATE_READY,
+                100,
+                "VERIFIED_CONNECTED",
+                "Verified live connection to Direct Gemini API ($modelName)."
+            )
+            GeminiConnectionState.API_KEY_SAVED_UNVERIFIED -> Quad(
+                VerifiedModelCatalog.STATE_KEY_SAVED_UNVERIFIED,
+                50,
+                "KEY_SAVED_UNVERIFIED",
+                "API key saved for $modelName, but not yet verified against Gemini API. Run Test Connection in Settings."
+            )
+            GeminiConnectionState.TESTING -> Quad(
+                VerifiedModelCatalog.STATE_VERIFYING,
+                75,
+                "TESTING",
+                "Testing live connection to Direct Gemini API ($modelName)..."
+            )
+            GeminiConnectionState.AUTH_FAILED -> Quad(
+                VerifiedModelCatalog.STATE_FAILED,
+                0,
+                "AUTH_FAILED",
+                "Gemini API authentication failed (401/403). Check your API key in Settings."
+            )
+            GeminiConnectionState.QUOTA_OR_RATE_LIMITED -> Quad(
+                VerifiedModelCatalog.STATE_FAILED,
+                0,
+                "QUOTA_OR_RATE_LIMITED",
+                "Gemini API quota or rate limit reached (429). Retry later or check billing."
+            )
+            GeminiConnectionState.NETWORK_UNAVAILABLE -> Quad(
+                VerifiedModelCatalog.STATE_FAILED,
+                0,
+                "NETWORK_UNAVAILABLE",
+                "Network unavailable or timed out reaching Gemini API."
+            )
+            GeminiConnectionState.MODEL_UNAVAILABLE -> Quad(
+                VerifiedModelCatalog.STATE_FAILED,
+                0,
+                "MODEL_UNAVAILABLE",
+                "Selected Gemini model '$modelName' is retired or unavailable. Select an active model in Settings."
+            )
+            GeminiConnectionState.API_KEY_MISSING -> Quad(
+                VerifiedModelCatalog.STATE_NOT_DOWNLOADED,
+                0,
+                "API_KEY_REQUIRED",
+                "No Gemini API key configured. Open Settings -> Direct Gemini API to add your key."
+            )
+        }
+        return base.copy(
+            modelVersion = modelName,
+            installedVersion = if (connectionState == GeminiConnectionState.VERIFIED_CONNECTED) modelName else "",
+            downloadState = newState,
+            downloadProgressPercent = pct,
+            verificationLevel = verLevel,
+            statusNote = connectionMessage?.takeIf { it.isNotBlank() } ?: defaultNote
+        )
+    }
+
+    private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+
+    suspend fun updateDirectGeminiCatalogStatus(
+        connectionState: GeminiConnectionState,
+        modelName: String,
+        connectionMessage: String? = null
     ) = withContext(Dispatchers.IO) {
         val existing = dao.getModelById("direct_gemini_api") ?: return@withContext
-        val newState = when {
-            !isConfigured -> VerifiedModelCatalog.STATE_NOT_DOWNLOADED
-            isError -> VerifiedModelCatalog.STATE_FAILED
-            else -> VerifiedModelCatalog.STATE_READY
-        }
-        val note = connectionMessage ?: if (isConfigured) {
-            "Direct Gemini API key configured ($modelName). Ready for translation, review & audio ASR."
-        } else {
-            "No Gemini API key configured. Open Settings -> Direct Gemini API to add your key."
-        }
         dao.updateModel(
-            existing.copy(
-                modelVersion = modelName,
-                installedVersion = if (isConfigured) modelName else "",
-                downloadState = newState,
-                downloadProgressPercent = if (isConfigured && !isError) 100 else 0,
-                verificationLevel = when {
-                    !isConfigured -> "API_KEY_REQUIRED"
-                    isError -> "CONNECTION_FAILED"
-                    else -> "API_VERIFIED"
-                },
-                statusNote = note
+            buildDirectGeminiCatalogEntity(
+                base = existing,
+                connectionState = connectionState,
+                modelName = modelName,
+                connectionMessage = connectionMessage
             )
         )
     }

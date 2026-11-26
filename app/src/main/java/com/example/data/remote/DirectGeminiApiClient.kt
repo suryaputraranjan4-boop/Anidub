@@ -32,10 +32,27 @@ enum class GeminiErrorKind {
     RATE_LIMITED,
     QUOTA_OR_BILLING,
     MODEL_NOT_FOUND,
-    NETWORK_OR_TIMEOUT,
+    NETWORK_UNAVAILABLE,
+    TIMEOUT,
+    SAFETY_BLOCKED,
     SERVER_ERROR,
     INVALID_RESPONSE,
     CANCELLED
+}
+
+/**
+ * Explicit 8-state Direct Gemini API connection & credential status for UI consistency.
+ * Prevents ever showing "CONNECTED" or "API READY" merely because a key string is saved.
+ */
+enum class GeminiConnectionState(val pillLabel: String) {
+    API_KEY_MISSING("KEY MISSING"),
+    API_KEY_SAVED_UNVERIFIED("KEY SAVED (UNVERIFIED)"),
+    TESTING("TESTING…"),
+    VERIFIED_CONNECTED("VERIFIED CONNECTED"),
+    AUTH_FAILED("AUTH FAILED"),
+    QUOTA_OR_RATE_LIMITED("QUOTA / RATE LIMIT"),
+    NETWORK_UNAVAILABLE("NETWORK UNAVAILABLE"),
+    MODEL_UNAVAILABLE("MODEL UNAVAILABLE")
 }
 
 class GeminiApiException(
@@ -58,7 +75,8 @@ data class GeminiConnectionTestResult(
     val remoteDisplayName: String,
     val latencyMs: Long,
     val message: String,
-    val errorKind: GeminiErrorKind? = null
+    val errorKind: GeminiErrorKind? = null,
+    val connectionState: GeminiConnectionState = if (isConnected) GeminiConnectionState.VERIFIED_CONNECTED else GeminiConnectionState.API_KEY_SAVED_UNVERIFIED
 )
 
 data class GeminiDialogueTranslationItem(
@@ -105,7 +123,11 @@ class DirectGeminiApiClient(
         .build()
 
     suspend fun testConnection(requestedModelName: String): Result<GeminiConnectionTestResult> = withContext(Dispatchers.IO) {
-        val modelId = normalizeModelName(requestedModelName)
+        val modelValidation = validateModelSelection(requestedModelName)
+        if (modelValidation.isFailure) {
+            return@withContext Result.failure(modelValidation.exceptionOrNull()!!)
+        }
+        val modelId = modelValidation.getOrThrow()
         val apiKey = keyStore.getEffectiveApiKey()
         if (apiKey.isBlank()) {
             val ex = GeminiApiException(
@@ -140,7 +162,8 @@ class DirectGeminiApiClient(
                     modelId = modelId,
                     remoteDisplayName = displayName,
                     latencyMs = latencyMs,
-                    message = "Connected to $displayName ($modelId) in ${latencyMs} ms."
+                    message = "Verified connection to $displayName ($modelId) in ${latencyMs} ms.",
+                    connectionState = GeminiConnectionState.VERIFIED_CONNECTED
                 )
             )
         } catch (e: CancellationException) {
@@ -520,7 +543,11 @@ CRITICAL HONESTY RULES:
         audioBase64: String? = null,
         audioMimeType: String? = null
     ): Result<String> = withContext(Dispatchers.IO) {
-        val normalizedModel = normalizeModelName(modelName)
+        val modelValidation = validateModelSelection(modelName)
+        if (modelValidation.isFailure) {
+            return@withContext Result.failure(modelValidation.exceptionOrNull()!!)
+        }
+        val normalizedModel = modelValidation.getOrThrow()
         val apiKey = keyStore.getEffectiveApiKey()
         if (apiKey.isBlank()) {
             return@withContext Result.failure(
@@ -644,13 +671,14 @@ CRITICAL HONESTY RULES:
                     attempt++
                     continue
                 }
-                val friendly = when (e) {
-                    is UnknownHostException -> "Device appears offline or cannot reach generativelanguage.googleapis.com. Check your internet connection."
-                    is SocketTimeoutException -> "Direct Gemini API request timed out after ${elapsedMs / 1000}s. Retry when network is stable."
-                    else -> "Network error communicating with Direct Gemini API: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                val isTimeout = e is SocketTimeoutException
+                val friendly = when {
+                    e is UnknownHostException -> "Device appears offline or cannot reach generativelanguage.googleapis.com. Check your internet connection."
+                    isTimeout -> "Direct Gemini API request timed out after ${elapsedMs / 1000}s. Retry when network is stable."
+                    else -> "Network unavailable communicating with Direct Gemini API: ${e.localizedMessage ?: e.javaClass.simpleName}"
                 }
                 throw GeminiApiException(
-                    kind = GeminiErrorKind.NETWORK_OR_TIMEOUT,
+                    kind = if (isTimeout) GeminiErrorKind.TIMEOUT else GeminiErrorKind.NETWORK_UNAVAILABLE,
                     message = friendly,
                     cause = e
                 )
@@ -694,8 +722,8 @@ CRITICAL HONESTY RULES:
         val blockReason = promptFeedback?.optString("blockReason", "").orEmpty()
         if (blockReason.isNotBlank()) {
             throw GeminiApiException(
-                kind = GeminiErrorKind.INVALID_RESPONSE,
-                message = "Gemini blocked this request ($blockReason)."
+                kind = GeminiErrorKind.SAFETY_BLOCKED,
+                message = "Gemini safety filter blocked this request ($blockReason). Edit the line manually or adjust context."
             )
         }
         val candidates = root.optJSONArray("candidates")
@@ -704,6 +732,13 @@ CRITICAL HONESTY RULES:
             throw GeminiApiException(GeminiErrorKind.INVALID_RESPONSE, message = "Gemini returned an empty candidates array.")
         }
         val first = candidates.getJSONObject(0)
+        val finishReason = first.optString("finishReason", "").uppercase(Locale.US)
+        if (finishReason in setOf("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION")) {
+            throw GeminiApiException(
+                kind = GeminiErrorKind.SAFETY_BLOCKED,
+                message = "Gemini blocked candidate output due to safety/policy filter (finishReason=$finishReason)."
+            )
+        }
         val content = first.optJSONObject("content")
         val parts = content?.optJSONArray("parts")
         val sb = StringBuilder()
@@ -716,10 +751,9 @@ CRITICAL HONESTY RULES:
         }
         val text = sb.toString().trim()
         if (text.isEmpty()) {
-            val finishReason = first.optString("finishReason", "UNKNOWN")
             throw GeminiApiException(
                 kind = GeminiErrorKind.INVALID_RESPONSE,
-                message = "Gemini returned empty text output (finishReason=$finishReason)."
+                message = "Gemini returned empty text output (finishReason=${finishReason.ifBlank { "UNKNOWN" }})."
             )
         }
         return text
@@ -731,42 +765,128 @@ CRITICAL HONESTY RULES:
         private const val HEADER_API_KEY = "x-goog-api-key"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
-        const val DEFAULT_MODEL_ID = "gemini-2.5-flash"
+        const val DEFAULT_MODEL_ID = "gemini-3.8-flash"
 
+        /**
+         * Verified active official Gemini Developer API models (2026).
+         * Deprecated/retired legacy IDs (gemini-2.5-*, gemini-2.0-*, gemini-1.5-*) are excluded
+         * from selection and flagged explicitly by [validateModelSelection].
+         */
         val SUPPORTED_MODELS: List<GeminiModelOption> = listOf(
             GeminiModelOption(
-                modelId = "gemini-2.5-flash",
-                displayName = "Gemini 2.5 Flash (Recommended)",
-                description = "Fast, high-accuracy Devanagari Hindi + English translation, sentence splitting, review, and multimodal Japanese audio transcription."
+                modelId = "gemini-3.8-flash",
+                displayName = "Gemini 3.8 Flash (Recommended)",
+                description = "Recommended fast multimodal model for Devanagari Hindi + English translation, sentence splitting, dialogue review, and Japanese audio transcription."
             ),
             GeminiModelOption(
-                modelId = "gemini-2.5-pro",
-                displayName = "Gemini 2.5 Pro",
-                description = "Highest reasoning quality for nuanced anime localization, character style adaptation, and complex dialogue review."
+                modelId = "gemini-3.5-flash-lite",
+                displayName = "Gemini 3.5 Flash-Lite",
+                description = "Ultra-low-latency, cost-efficient model for rapid batch translation and mixed-script proofreading."
             ),
             GeminiModelOption(
-                modelId = "gemini-2.5-flash-lite",
-                displayName = "Gemini 2.5 Flash-Lite",
-                description = "Lowest latency and cost for rapid batch translation and script verification."
+                modelId = "gemini-4-hydrogen",
+                displayName = "Gemini 4 Hydrogen",
+                description = "Fast next-generation multimodal model for high-accuracy dialogue adaptation and audio transcription."
             ),
             GeminiModelOption(
-                modelId = "gemini-2.0-flash",
-                displayName = "Gemini 2.0 Flash",
-                description = "Stable multimodal Gemini Flash generation for text and audio tasks."
+                modelId = "gemini-4-neon",
+                displayName = "Gemini 4 Neon",
+                description = "Frontier fast reasoning model for nuanced anime dialogue, humor, honorifics, and complex context."
+            ),
+            GeminiModelOption(
+                modelId = "gemini-4-argon",
+                displayName = "Gemini 4 Argon",
+                description = "Deep reasoning model for complex localization review and subtle tone preservation."
+            ),
+            GeminiModelOption(
+                modelId = "gemini-4-carbon",
+                displayName = "Gemini 4 Carbon",
+                description = "Frontier deep reasoning model for highest-precision dialogue review and script QA."
             )
+        )
+
+        val SUPPORTED_MODEL_IDS: Set<String> = SUPPORTED_MODELS.map { it.modelId }.toSet()
+
+        val RETIRED_OR_DEPRECATED_MODELS: Set<String> = setOf(
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+            "gemini-1.0-pro"
         )
 
         private val VALID_EMOTIONS = setOf(
             "NEUTRAL", "CALM", "EXCITED", "ANGRY", "SAD", "FEARFUL", "HAPPY", "WHISPERING", "SHOUTING"
         )
 
+        /**
+         * Preserves valid model IDs without ever rewriting newer models back to older models.
+         * Strips only optional `models/` prefix and surrounding whitespace; returns [DEFAULT_MODEL_ID]
+         * only when the input is null or blank.
+         */
         fun normalizeModelName(raw: String?): String {
-            val trimmed = raw?.trim().orEmpty()
-                .removePrefix("models/")
-            if (trimmed.isEmpty() || trimmed.equals("gemini-3.8-flash", ignoreCase = true)) {
-                return DEFAULT_MODEL_ID
-            }
+            val trimmed = raw?.trim().orEmpty().removePrefix("models/").trim()
+            if (trimmed.isEmpty()) return DEFAULT_MODEL_ID
             return trimmed
+        }
+
+        fun isRetiredOrDeprecatedModel(modelId: String?): Boolean {
+            val clean = normalizeModelName(modelId).lowercase(Locale.US)
+            return clean in RETIRED_OR_DEPRECATED_MODELS
+        }
+
+        fun isSupportedModel(modelId: String?): Boolean {
+            val clean = normalizeModelName(modelId)
+            return clean in SUPPORTED_MODEL_IDS
+        }
+
+        /**
+         * Explicitly validates a requested Gemini model ID before sending a request.
+         * Rejects retired/deprecated or malformed model IDs with a clear [GeminiErrorKind.MODEL_NOT_FOUND] error
+         * instead of silently rewriting newer models to older ones.
+         */
+        fun validateModelSelection(raw: String?): Result<String> {
+            val clean = normalizeModelName(raw)
+            val lower = clean.lowercase(Locale.US)
+            if (lower in RETIRED_OR_DEPRECATED_MODELS) {
+                return Result.failure(
+                    GeminiApiException(
+                        kind = GeminiErrorKind.MODEL_NOT_FOUND,
+                        message = "Selected model '$clean' is deprecated/retired on the Gemini API. Select an active model such as $DEFAULT_MODEL_ID in Settings."
+                    )
+                )
+            }
+            if (!Regex("^[a-zA-Z0-9][a-zA-Z0-9._-]{2,64}$").matches(clean)) {
+                return Result.failure(
+                    GeminiApiException(
+                        kind = GeminiErrorKind.MODEL_NOT_FOUND,
+                        message = "Invalid Gemini model ID '$clean'. Select a verified active model in Settings."
+                    )
+                )
+            }
+            if (clean !in SUPPORTED_MODEL_IDS) {
+                return Result.failure(
+                    GeminiApiException(
+                        kind = GeminiErrorKind.MODEL_NOT_FOUND,
+                        message = "Unsupported Gemini model '$clean'. Choose one of the verified active models (${SUPPORTED_MODEL_IDS.joinToString(", ")}) in Settings."
+                    )
+                )
+            }
+            return Result.success(clean)
+        }
+
+        fun mapErrorToConnectionState(errorKind: GeminiErrorKind?): GeminiConnectionState = when (errorKind) {
+            GeminiErrorKind.MISSING_API_KEY -> GeminiConnectionState.API_KEY_MISSING
+            GeminiErrorKind.INVALID_API_KEY -> GeminiConnectionState.AUTH_FAILED
+            GeminiErrorKind.RATE_LIMITED,
+            GeminiErrorKind.QUOTA_OR_BILLING -> GeminiConnectionState.QUOTA_OR_RATE_LIMITED
+            GeminiErrorKind.NETWORK_UNAVAILABLE,
+            GeminiErrorKind.TIMEOUT -> GeminiConnectionState.NETWORK_UNAVAILABLE
+            GeminiErrorKind.MODEL_NOT_FOUND -> GeminiConnectionState.MODEL_UNAVAILABLE
+            else -> GeminiConnectionState.API_KEY_SAVED_UNVERIFIED
         }
 
         fun normalizeEmotion(raw: String?): String {
@@ -827,7 +947,7 @@ CRITICAL HONESTY RULES:
                     GeminiApiException(
                         kind = GeminiErrorKind.MODEL_NOT_FOUND,
                         httpCode = httpCode,
-                        message = "Selected Gemini model was not found or is unsupported (HTTP $httpCode). Switch to gemini-2.5-flash in Settings."
+                        message = "Selected Gemini model was not found or is unavailable for your key (HTTP $httpCode). Switch to $DEFAULT_MODEL_ID in Settings."
                     )
                 }
                 httpCode == 429 -> {

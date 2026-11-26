@@ -228,13 +228,13 @@ fun QcAndExportView(viewModel: StudioViewModel) {
                     FilterChip(
                         selected = exportFormat == "WAV_AUDIO_ONLY",
                         onClick = { exportFormat = "WAV_AUDIO_ONLY" },
-                        label = { Text("Audio-Only WAV (Lossless)") },
+                        label = { Text("Audio-Only WAV (PCM)") },
                         modifier = Modifier.weight(1f)
                     )
                     FilterChip(
                         selected = exportFormat == "MP4_VIDEO",
                         onClick = { exportFormat = "MP4_VIDEO" },
-                        label = { Text("Final Video MP4") },
+                        label = { Text("Video MP4 (Passthrough)") },
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -242,9 +242,9 @@ fun QcAndExportView(viewModel: StudioViewModel) {
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
                     text = if (exportFormat == "MP4_VIDEO") {
-                        "Muxes the original source video track with AAC-LC encoded dubbed audio into an MP4 container. Requires an imported file with a video stream."
+                        "Muxes the original source video stream directly via passthrough (original video codec/bitrate preserved, no re-encoding) with newly encoded AAC-LC dubbed audio into an MP4 container. Requires an imported file with a video stream and passed Stage 13 QC."
                     } else {
-                        "Exports a lossless 16-bit PCM WAV master containing synchronized dubbed dialogue and preserved background accompaniment."
+                        "Exports a 16-bit PCM WAV master containing synchronized dubbed dialogue and preserved background accompaniment (direct lossless copy when sample rate matches master, or linear-resampled when a different rate is selected). Requires passed Stage 13 QC."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = StudioTextSecondary
@@ -276,7 +276,7 @@ fun QcAndExportView(viewModel: StudioViewModel) {
                         viewModel.exportFinalDubbedEpisode(
                             exportFormat = exportFormat,
                             resolution = ep.resolution,
-                            videoBitrateKbps = 8500,
+                            videoBitrateKbps = 0, // Video passthrough: actual source bitrate is probed during muxing
                             audioCodec = if (exportFormat == "MP4_VIDEO") "AAC-LC" else "PCM 16-bit WAV",
                             audioBitrateKbps = audioBitrate,
                             audioSampleRateHz = sampleRate,
@@ -344,8 +344,11 @@ fun QcAndExportView(viewModel: StudioViewModel) {
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
+                            val videoSummary = if (exp.exportFormat == "MP4_VIDEO") {
+                                if (exp.videoBitrateKbps > 0) " • Passthrough ${exp.videoBitrateKbps} kbps" else " • Video Passthrough"
+                            } else ""
                             Text(
-                                text = "${exp.exportFormat.replace('_', ' ')} • ${exp.audioCodec} • ${formatBytes(exp.fileSizeBytes)} • ${formatDurationCompact(exp.durationMs)}",
+                                text = "${exp.exportFormat.replace('_', ' ')}$videoSummary • ${exp.audioCodec} • ${formatBytes(exp.fileSizeBytes)} • ${formatDurationCompact(exp.durationMs)}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = StudioTextSecondary
                             )
@@ -401,7 +404,7 @@ fun QcAndExportView(viewModel: StudioViewModel) {
 @Composable
 fun ModelLibraryScreen(viewModel: StudioViewModel) {
     val models by viewModel.models.collectAsState()
-    val geminiKeyState by viewModel.geminiKeyState.collectAsState()
+    val geminiConnectionState by viewModel.geminiConnectionState.collectAsState()
 
     val onDeviceLocalModels = remember(models) {
         models.filter { ModelDownloadManager.isLocalRuntime(it.runtimeCompatibility) }
@@ -434,7 +437,7 @@ fun ModelLibraryScreen(viewModel: StudioViewModel) {
             MetadataChipRow(
                 items = listOf(
                     "Local Ready" to "$readyLocalCount / ${onDeviceLocalModels.size}",
-                    "Gemini API" to if (geminiKeyState.isConfigured) "Key Set" else "Key Missing",
+                    "Gemini API" to geminiConnectionState.pillLabel,
                     "Disk Free" to formatBytes(freeBytes)
                 )
             )
@@ -483,6 +486,7 @@ fun ModelLibraryScreen(viewModel: StudioViewModel) {
             items(directGeminiModels, key = { it.modelId }) { model ->
                 ModelLibraryCard(
                     model = model,
+                    geminiConnectionState = geminiConnectionState,
                     onOpenDetail = { viewModel.openModelDetail(model.modelId) },
                     onDownload = {},
                     onCancel = {},
@@ -532,6 +536,7 @@ fun ModelLibraryScreen(viewModel: StudioViewModel) {
 @Composable
 private fun ModelLibraryCard(
     model: ModelManifestEntity,
+    geminiConnectionState: com.example.data.remote.GeminiConnectionState? = null,
     onOpenDetail: () -> Unit,
     onDownload: () -> Unit,
     onCancel: () -> Unit,
@@ -573,8 +578,10 @@ private fun ModelLibraryCard(
             Spacer(modifier = Modifier.width(8.dp))
             val pillText = when {
                 isUnsupported -> "UNSUPPORTED"
-                isDirectGemini && isReady -> "API READY"
-                isDirectGemini -> "KEY REQUIRED"
+                isDirectGemini && geminiConnectionState != null -> geminiConnectionState.pillLabel
+                isDirectGemini && model.downloadState == VerifiedModelCatalog.STATE_KEY_SAVED_UNVERIFIED -> "KEY SAVED (UNVERIFIED)"
+                isDirectGemini && isReady -> "VERIFIED CONNECTED"
+                isDirectGemini -> model.downloadState.replace('_', ' ')
                 model.downloadState == "BUILT_IN" -> "BUILT-IN"
                 isReady && model.verificationLevel == "VERIFIED_SHA256" -> "READY (ONNX)"
                 isReady -> "READY"
@@ -582,7 +589,7 @@ private fun ModelLibraryCard(
             }
             val pillColor = when {
                 isUnsupported -> StudioAmber
-                isDirectGemini && !isReady -> StudioAmber
+                isDirectGemini && geminiConnectionState != null -> statusColorFor(geminiConnectionState.name)
                 else -> stateColor
             }
             StatusPill(
@@ -734,6 +741,7 @@ private fun ModelLibraryCard(
 fun ModelDetailScreen(viewModel: StudioViewModel) {
     val models by viewModel.models.collectAsState()
     val selectedId by viewModel.selectedModelId.collectAsState()
+    val geminiConnectionState by viewModel.geminiConnectionState.collectAsState()
     val model = models.find { it.modelId == selectedId }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -784,7 +792,10 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatusPill(text = VerifiedModelCatalog.runtimeBadgeLabel(model.runtimeCompatibility), color = if (isUnsupported) StudioAmber else StudioCyan)
-                        StatusPill(text = model.downloadState.replace('_', ' '), color = statusColorFor(model.downloadState))
+                        StatusPill(
+                            text = if (isDirectGemini) geminiConnectionState.pillLabel else model.downloadState.replace('_', ' '),
+                            color = if (isDirectGemini) statusColorFor(geminiConnectionState.name) else statusColorFor(model.downloadState)
+                        )
                     }
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(model.purpose, style = MaterialTheme.typography.bodyMedium, color = StudioTextSecondary)
@@ -1094,12 +1105,16 @@ fun SettingsScreen(viewModel: StudioViewModel) {
     val config by viewModel.studioConfig.collectAsState()
     val geminiKeyState by viewModel.geminiKeyState.collectAsState()
     val geminiConnection by viewModel.geminiConnectionStatus.collectAsState()
+    val geminiConnectionState by viewModel.geminiConnectionState.collectAsState()
     val isTestingGemini by viewModel.isTestingGeminiConnection.collectAsState()
     val scope = rememberCoroutineScope()
 
     var apiKeyInput by remember { mutableStateOf("") }
     val freeBytes = remember { viewModel.modelDownloadManager.getAvailableStorageBytes() }
     val modelBytes = remember { viewModel.modelDownloadManager.getModelsStorageUsedBytes() }
+    val modelValidation = remember(config.geminiModelName) {
+        DirectGeminiApiClient.validateModelSelection(config.geminiModelName)
+    }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1127,22 +1142,14 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                             Text("Direct Gemini API", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                         }
                         StatusPill(
-                            text = when {
-                                geminiConnection?.isConnected == true -> "CONNECTED"
-                                geminiKeyState.isConfigured -> "KEY SAVED"
-                                else -> "NOT CONFIGURED"
-                            },
-                            color = when {
-                                geminiConnection?.isConnected == true -> StudioEmerald
-                                geminiKeyState.isConfigured -> StudioCyan
-                                else -> StudioAmber
-                            }
+                            text = geminiConnectionState.pillLabel,
+                            color = statusColorFor(geminiConnectionState.name)
                         )
                     }
 
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "The ONLY online AI service used by AnimeDub Studio. Connects directly to Google's official Gemini REST API (generativelanguage.googleapis.com) with no Firebase or external worker proxy.",
+                        text = "The ONLY online AI service used by AnimeDub Studio. Connects directly to Google's official Gemini REST API (generativelanguage.googleapis.com) with no Firebase or external worker proxy. Changing the API key or model resets verification until re-tested.",
                         style = MaterialTheme.typography.bodySmall,
                         color = StudioTextSecondary
                     )
@@ -1161,6 +1168,23 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                         style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
                         color = if (geminiKeyState.isConfigured) StudioEmerald else StudioAmber
                     )
+
+                    if (!geminiKeyState.keystoreError.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        WarningBanner(
+                            message = "Keystore error: ${geminiKeyState.keystoreError}",
+                            isError = true
+                        )
+                    }
+
+                    if (modelValidation.isFailure) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        WarningBanner(
+                            message = modelValidation.exceptionOrNull()?.message
+                                ?: "Selected model '${config.geminiModelName}' is retired or unsupported. Choose an active model below.",
+                            isError = true
+                        )
+                    }
 
                     Spacer(modifier = Modifier.height(10.dp))
                     OutlinedTextField(

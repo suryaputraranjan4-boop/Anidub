@@ -166,6 +166,15 @@ interface AnimeDubDao {
     @Query("DELETE FROM dictionary_entries WHERE id = :id")
     suspend fun deleteDictionaryEntry(id: Long)
 
+    @Transaction
+    suspend fun applyDictionaryImportPlanAtomic(
+        toInsert: List<DictionaryEntryEntity>,
+        toUpdate: List<DictionaryEntryEntity>
+    ) {
+        toUpdate.forEach { updateDictionaryEntry(it) }
+        toInsert.forEach { insertDictionaryEntry(it) }
+    }
+
     // Voice Generation Records (Agent 5)
     @Query("SELECT * FROM voice_generation_records WHERE episodeId = :episodeId ORDER BY characterBatchNumber ASC, orderInCharacterBatch ASC, createdAt DESC")
     fun observeVoiceGenerationRecords(episodeId: Long): Flow<List<VoiceGenerationRecordEntity>>
@@ -236,6 +245,9 @@ interface AnimeDubDao {
     // Agent Job Records (Processing Center & History)
     @Query("SELECT * FROM agent_job_records WHERE episodeId = :episodeId ORDER BY stageNumber ASC, id DESC")
     fun observeAgentJobsForEpisode(episodeId: Long): Flow<List<AgentJobRecordEntity>>
+
+    @Query("SELECT * FROM agent_job_records WHERE episodeId = :episodeId ORDER BY stageNumber ASC, id DESC")
+    suspend fun getAgentJobsForEpisodeOnce(episodeId: Long): List<AgentJobRecordEntity>
 
     @Query("SELECT * FROM agent_job_records ORDER BY updatedAt DESC LIMIT 100")
     fun observeAllAgentJobHistory(): Flow<List<AgentJobRecordEntity>>

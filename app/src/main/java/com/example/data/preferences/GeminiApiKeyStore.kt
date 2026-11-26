@@ -24,7 +24,8 @@ data class GeminiApiKeyState(
     val maskedKey: String = "",
     val hasUserStoredKey: Boolean = false,
     val hasBuildConfigFallback: Boolean = false,
-    val storageStatusNote: String = "No Gemini API key configured."
+    val storageStatusNote: String = "No Gemini API key configured.",
+    val keystoreError: String? = null
 )
 
 /**
@@ -40,6 +41,8 @@ class GeminiApiKeyStore(context: Context) {
 
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    @Volatile
+    private var lastKeystoreError: String? = null
 
     fun saveApiKey(rawKey: String): Result<GeminiApiKeyState> {
         val cleaned = rawKey.trim()
@@ -63,18 +66,29 @@ class GeminiApiKeyStore(context: Context) {
             val iv = cipher.iv
             val cipherBytes = cipher.doFinal(cleaned.toByteArray(StandardCharsets.UTF_8))
 
-            prefs.edit()
+            val persisted = prefs.edit()
                 .putString(KEY_CIPHERTEXT_B64, Base64.encodeToString(cipherBytes, Base64.NO_WRAP))
                 .putString(KEY_IV_B64, Base64.encodeToString(iv, Base64.NO_WRAP))
-                .apply()
+                .commit()
 
+            if (!persisted) {
+                lastKeystoreError = "Failed to persist encrypted API key to app-private storage."
+                return Result.failure(IllegalStateException(lastKeystoreError))
+            }
+
+            // Verify round-trip Android Keystore decryption immediately
+            val verifiedKey = readDecryptedUserKey()
+            if (verifiedKey != cleaned) {
+                lastKeystoreError = "Android Keystore round-trip verification failed after saving key."
+                return Result.failure(IllegalStateException(lastKeystoreError))
+            }
+
+            lastKeystoreError = null
             Result.success(getCurrentState())
         } catch (e: Exception) {
+            lastKeystoreError = "Unable to encrypt Gemini API key with Android Keystore: ${e.javaClass.simpleName}"
             Result.failure(
-                IllegalStateException(
-                    "Unable to encrypt Gemini API key with Android Keystore: ${e.localizedMessage ?: e.javaClass.simpleName}",
-                    e
-                )
+                IllegalStateException(lastKeystoreError, e)
             )
         }
     }
@@ -83,7 +97,8 @@ class GeminiApiKeyStore(context: Context) {
         prefs.edit()
             .remove(KEY_CIPHERTEXT_B64)
             .remove(KEY_IV_B64)
-            .apply()
+            .commit()
+        lastKeystoreError = null
         return getCurrentState()
     }
 
@@ -105,7 +120,8 @@ class GeminiApiKeyStore(context: Context) {
                 maskedKey = maskApiKey(userKey),
                 hasUserStoredKey = true,
                 hasBuildConfigFallback = !buildKey.isNullOrBlank(),
-                storageStatusNote = "Stored encrypted locally via Android Keystore (AES-256-GCM)."
+                storageStatusNote = "Stored encrypted locally via Android Keystore (AES-256-GCM).",
+                keystoreError = null
             )
             !buildKey.isNullOrBlank() -> GeminiApiKeyState(
                 isConfigured = true,
@@ -113,7 +129,8 @@ class GeminiApiKeyStore(context: Context) {
                 maskedKey = maskApiKey(buildKey),
                 hasUserStoredKey = false,
                 hasBuildConfigFallback = true,
-                storageStatusNote = "Using build-configured GEMINI_API_KEY secret. You can override it with your own key below."
+                storageStatusNote = "Using build-configured GEMINI_API_KEY secret. You can override it with your own key below.",
+                keystoreError = lastKeystoreError
             )
             else -> GeminiApiKeyState(
                 isConfigured = false,
@@ -121,7 +138,9 @@ class GeminiApiKeyStore(context: Context) {
                 maskedKey = "",
                 hasUserStoredKey = false,
                 hasBuildConfigFallback = false,
-                storageStatusNote = "No Gemini API key configured. Enter your Google AI Studio API key in Settings to enable Gemini translation, transcription, and review."
+                storageStatusNote = lastKeystoreError
+                    ?: "No Gemini API key configured. Enter your Google AI Studio API key in Settings to enable Gemini translation, transcription, and review.",
+                keystoreError = lastKeystoreError
             )
         }
     }
@@ -130,16 +149,22 @@ class GeminiApiKeyStore(context: Context) {
         val cipherB64 = prefs.getString(KEY_CIPHERTEXT_B64, null) ?: return null
         val ivB64 = prefs.getString(KEY_IV_B64, null) ?: return null
         return try {
-            val secretKey = getExistingSecretKey() ?: return null
+            val secretKey = getExistingSecretKey()
+            if (secretKey == null) {
+                lastKeystoreError = "Android Keystore key alias was unavailable. Please re-enter your Gemini API key."
+                return null
+            }
             val iv = Base64.decode(ivB64, Base64.NO_WRAP)
             val cipherBytes = Base64.decode(cipherB64, Base64.NO_WRAP)
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
             val plainBytes = cipher.doFinal(cipherBytes)
+            lastKeystoreError = null
             String(plainBytes, StandardCharsets.UTF_8).trim().takeIf { it.isNotEmpty() }
-        } catch (_: Exception) {
-            // Keystore entry invalidated or unreadable; clear stale ciphertext safely
-            prefs.edit().remove(KEY_CIPHERTEXT_B64).remove(KEY_IV_B64).apply()
+        } catch (e: Exception) {
+            // Keystore entry invalidated or unreadable; clear stale ciphertext safely and report error
+            prefs.edit().remove(KEY_CIPHERTEXT_B64).remove(KEY_IV_B64).commit()
+            lastKeystoreError = "Saved API key could not be decrypted by Android Keystore (${e.javaClass.simpleName}). Please re-enter your key."
             null
         }
     }

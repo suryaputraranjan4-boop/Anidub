@@ -1,6 +1,7 @@
 package com.example.engine
 
 import com.example.data.local.ModelManifestEntity
+import com.example.data.remote.DirectGeminiApiClient
 
 /**
  * Represents a single verified file belonging to an AI model package
@@ -59,6 +60,7 @@ object VerifiedModelCatalog {
     const val STATE_FAILED = "FAILED"
     const val STATE_UNSUPPORTED_ON_ANDROID = "UNSUPPORTED_ON_ANDROID"
     const val STATE_BUILT_IN = "BUILT_IN"
+    const val STATE_KEY_SAVED_UNVERIFIED = "KEY_SAVED_UNVERIFIED"
 
     fun isLocalOrBuiltIn(runtimeCompatibility: String): Boolean {
         return runtimeCompatibility in setOf(RUNTIME_ANDROID_LOCAL, RUNTIME_ONNX_COMPATIBLE)
@@ -243,7 +245,7 @@ object VerifiedModelCatalog {
             ModelManifestEntity(
                 modelId = "direct_gemini_api",
                 modelName = "Direct Gemini API (Google AI Studio)",
-                modelVersion = "gemini-2.5-flash",
+                modelVersion = DirectGeminiApiClient.DEFAULT_MODEL_ID,
                 specialistAgentNumber = 4,
                 category = "Mixed-Script Translation, Review & Audio ASR (Online)",
                 purpose = "Centralized Direct Gemini REST API for Japanese->Devanagari+English translation, 1..N sentence splitting, dialogue rewriting/review, script verification, and optional online Japanese audio transcription.",

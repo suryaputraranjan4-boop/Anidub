@@ -203,7 +203,7 @@ private val FOURTEEN_STAGES = listOf(
     PipelineStageSpec(5, "Dialogue Segmentation & Overlaps", "Agent 2 • Timestamps", ProductionSection.TRANSCRIPT),
     PipelineStageSpec(6, "Audio-Only Speaker Analysis", "Agent 3 • Voice Profiling", ProductionSection.SPEAKERS),
     PipelineStageSpec(7, "Global Sequential ID Numbering", "Coordinator", ProductionSection.TRANSCRIPT),
-    PipelineStageSpec(8, "Mixed-Script Hindi-English Translation", "Agent 4 • Gemini 3.8 Flash", ProductionSection.TRANSLATION),
+    PipelineStageSpec(8, "Mixed-Script Hindi-English Translation", "Agent 4 • Direct Gemini API", ProductionSection.TRANSLATION),
     PipelineStageSpec(9, "Voice Reference Preparation", "Agent 5 • Reference Setup", ProductionSection.SPEAKERS),
     PipelineStageSpec(10, "Character-Wise Batch Voice Gen", "Agent 5 • Batch TTS", ProductionSection.VOICE_GEN),
     PipelineStageSpec(11, "Chronological Timeline Restore", "Agent 7 • Timeline", null),
@@ -316,16 +316,26 @@ fun ProductionPipelineView(viewModel: StudioViewModel) {
             val job = latestJobByStage[stage.number]
             val isCompleted = (ep.completedStagesMask and (1 shl stage.number)) != 0
             val isRunning = banner.isRunning && banner.activeStageNumber == stage.number
-            val isFailed = job?.status == "FAILED" && !isCompleted
+            val jobStatus = job?.status?.uppercase().orEmpty()
+            val isFailed = jobStatus == "FAILED" && !isCompleted
+            val isPartial = jobStatus == "PARTIAL" && !isCompleted
+            val isCancelled = jobStatus == "CANCELLED" && !isCompleted
+            val isUnsupported = jobStatus == "UNSUPPORTED" && !isCompleted
+            val isSkipped = jobStatus == "SKIPPED" && !isCompleted
             val prevCompleted = stage.number == 1 || (ep.completedStagesMask and (1 shl (stage.number - 1))) != 0
 
             val stageStatus = when {
                 isRunning -> "RUNNING"
                 isFailed -> "FAILED"
+                isPartial -> "PARTIAL"
+                isCancelled -> "CANCELLED"
+                isUnsupported -> "UNSUPPORTED"
+                isSkipped -> "SKIPPED"
                 isCompleted -> "COMPLETED"
                 prevCompleted -> "READY"
                 else -> "WAITING"
             }
+            val needsRetry = isFailed || isPartial || isCancelled
             val color = statusColorFor(stageStatus)
             val isExpanded = expandedStage == stage.number
 
@@ -334,6 +344,7 @@ fun ProductionPipelineView(viewModel: StudioViewModel) {
                 accentBorder = when {
                     isRunning -> StudioCyan.copy(alpha = 0.65f)
                     isFailed -> StudioCrimson.copy(alpha = 0.6f)
+                    isPartial || isCancelled || isUnsupported -> StudioAmber.copy(alpha = 0.6f)
                     else -> null
                 },
                 onClick = { expandedStage = if (isExpanded) null else stage.number }
@@ -354,8 +365,8 @@ fun ProductionPipelineView(viewModel: StudioViewModel) {
                     ) {
                         if (isCompleted && !isRunning) {
                             Icon(Icons.Default.Check, contentDescription = "Completed", tint = color, modifier = Modifier.size(16.dp))
-                        } else if (isFailed) {
-                            Icon(Icons.Default.ErrorOutline, contentDescription = "Failed", tint = color, modifier = Modifier.size(16.dp))
+                        } else if (isFailed || isPartial) {
+                            Icon(Icons.Default.ErrorOutline, contentDescription = stageStatus, tint = color, modifier = Modifier.size(16.dp))
                         } else {
                             Text(
                                 text = "%02d".format(stage.number),
@@ -440,12 +451,16 @@ fun ProductionPipelineView(viewModel: StudioViewModel) {
                                         .weight(1f)
                                         .heightIn(min = 48.dp),
                                     colors = ButtonDefaults.buttonColors(
-                                        containerColor = if (isFailed) StudioCrimson else StudioViolet,
+                                        containerColor = when {
+                                            isFailed -> StudioCrimson
+                                            isPartial || isCancelled -> StudioAmber
+                                            else -> StudioViolet
+                                        },
                                         contentColor = Color(0xFF0A0B0F)
                                     ),
                                     shape = RoundedCornerShape(10.dp)
                                 ) {
-                                    Text(if (isFailed) "Retry Stage ${stage.number}" else "Run Stage ${stage.number}")
+                                    Text(if (needsRetry) "Retry Stage ${stage.number}" else "Run Stage ${stage.number}")
                                 }
                             }
                             if (stage.targetSection != null) {

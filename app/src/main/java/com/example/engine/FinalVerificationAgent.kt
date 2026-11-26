@@ -23,27 +23,49 @@ data class FinalVerificationReport(
 /**
  * Agent 22 — Final Verification Agent.
  *
- * Strictly inspects the ACTUAL written output media file (`.wav` or `.mp4`), dialogue audio files,
- * and subtitle files before allowing an episode to be marked COMPLETED.
+ * Strictly inspects the ACTUAL written output media file (`.wav` or `.mp4`), EVERY dialogue audio file,
+ * and subtitle files before allowing an episode export to succeed.
  *
  * Checks performed:
- * 1. Exported output file exists on disk with valid non-zero byte length.
- * 2. Audio integrity:
- *    - WAV: re-reads PCM samples via `AudioDspEngine.readWavFile()`, checks non-zero sample count,
- *      non-silent RMS (> -60 dBFS), safe peak headroom (<= 0.0 dBFS), and duration match.
- *    - MP4: re-opens container via `MediaExtractor`, verifies both video and audio MIME tracks
- *      exist with valid durations and sample rate.
- * 3. Dialogue completeness: verifies every dialogue segment has a real generated audio file on disk.
+ * 1. Output file existence & minimum size on disk.
+ * 2. Media stream & audio integrity:
+ *    - WAV: bounded-memory strict WAV decode (`AudioDspEngine.validateAudioFileStrict`), verifying
+ *      RIFF/WAVE/PCM header, sample rate, channel count, non-zero sample count, non-silent RMS (> -55 dBFS),
+ *      peak headroom (<= 0.0 dBFS), and duration consistency.
+ *    - MP4: re-opens container via `MediaExtractor`, verifies both video & audio MIME tracks decode real frames,
+ *      INDEPENDENTLY measures video vs audio durations against [MP4_DURATION_SYNC_TOLERANCE_MS] (250 ms),
+ *      and verifies start/end presentation timestamps against [MP4_START_PTS_OFFSET_TOLERANCE_MS] (120 ms).
+ * 3. Dialogue completeness (MANDATORY for dubbed exports — background audio alone NEVER passes):
+ *    - Rejects empty dialogue lists for dubbed export.
+ *    - Strictly decodes EVERY dialogue WAV (valid header, non-empty samples, non-silent RMS > -55 dBFS,
+ *      valid sample rate/channels, positive duration).
  * 4. Subtitle verification: runs `SubtitleGenerator.validateSubtitleFile()` on all generated `.srt`/`.ass` files.
  */
 object FinalVerificationAgent {
+
+    /**
+     * Documented MP4 video-vs-audio duration tolerance (250 ms accounts for AAC 1024-sample frame padding
+     * + final video GOP frame duration rounding without hiding real sync drift or truncation).
+     */
+    const val MP4_DURATION_SYNC_TOLERANCE_MS = 250L
+
+    /**
+     * Maximum allowed start presentation-timestamp offset between video and audio tracks (120 ms).
+     */
+    const val MP4_START_PTS_OFFSET_TOLERANCE_MS = 120L
+
+    /**
+     * Minimum RMS threshold (-55.0 dBFS) for real non-silent dubbed speech / mixed audio.
+     */
+    const val NON_SILENT_RMS_THRESHOLD_DBFS = -55.0f
 
     fun verifyExportedOutput(
         outputFile: File,
         exportFormat: String,
         expectedDurationMs: Long,
         dialogues: List<DialogueSegmentEntity>,
-        subtitleFiles: List<File>
+        subtitleFiles: List<File>,
+        requireDubbedDialogues: Boolean = true
     ): FinalVerificationReport {
         val checks = mutableListOf<VerificationCheckItem>()
 
@@ -77,28 +99,75 @@ object FinalVerificationAgent {
             )
         }
 
-        // 3. Dialogue completeness & text/timeline sanity
-        if (dialogues.isNotEmpty()) {
-            val missingDialogues = dialogues.filter { dlg ->
+        // 3. Dialogue completeness — background audio alone CANNOT allow empty dubbed dialogue to pass!
+        if (dialogues.isEmpty()) {
+            checks.add(
+                VerificationCheckItem(
+                    checkName = "Dialogue Audio, Mixed-Script & Sync Completeness",
+                    passed = !requireDubbedDialogues,
+                    detail = if (requireDubbedDialogues) {
+                        "Export blocked: 0 dubbed dialogue segments exist. Background audio alone cannot pass dubbed episode verification."
+                    } else {
+                        "No dialogues required for non-dubbed export."
+                    }
+                )
+            )
+        } else {
+            val invalidAudioDetails = mutableListOf<String>()
+            val silentDialogues = mutableListOf<String>()
+            var lowestDialogueRms = 0f
+
+            for (dlg in dialogues) {
                 val p = dlg.generatedAudioPath
-                p.isNullOrBlank() || !File(p).exists() || File(p).length() <= 44L
+                if (p.isNullOrBlank()) {
+                    invalidAudioDetails.add("${dlg.dialogueId}(missing path)")
+                    continue
+                }
+                val f = File(p)
+                val decoded = AudioDspEngine.validateAudioFileStrict(f)
+                if (decoded.isFailure) {
+                    invalidAudioDetails.add("${dlg.dialogueId}(${decoded.exceptionOrNull()?.localizedMessage?.take(40) ?: "invalid WAV"})")
+                    continue
+                }
+                val metrics = decoded.getOrThrow()
+                if (metrics.sampleCount <= 0L || metrics.durationMs <= 0L) {
+                    invalidAudioDetails.add("${dlg.dialogueId}(0 samples)")
+                } else if (metrics.rmsDbfs < NON_SILENT_RMS_THRESHOLD_DBFS) {
+                    silentDialogues.add("${dlg.dialogueId}(${metrics.rmsDbfs} dBFS)")
+                }
+                if (lowestDialogueRms == 0f || metrics.rmsDbfs < lowestDialogueRms) {
+                    lowestDialogueRms = metrics.rmsDbfs
+                }
             }
-            val missingHinglish = dialogues.filter { it.romanHinglishText.isBlank() }
+
+            val unidentifiedSpeakers = dialogues.filter {
+                it.speakerLabel.isBlank() || it.speakerLabel.equals("UNIDENTIFIED", ignoreCase = true)
+            }
+            val missingMixedText = dialogues.filter { it.romanHinglishText.isBlank() }
             val scriptViolations = dialogues.filter { dlg ->
                 dlg.romanHinglishText.isNotBlank() && !MixedScriptLanguageEngine.validateMixedScript(dlg.romanHinglishText).isValid
             }
             val outOfBounds = if (expectedDurationMs > 0L) {
                 dialogues.filter { it.timelineStartMs < 0L || it.timelineStartMs > expectedDurationMs + 500L }
             } else emptyList()
-            val allDialoguesOk = missingDialogues.isEmpty() && missingHinglish.isEmpty() && scriptViolations.isEmpty() && outOfBounds.isEmpty()
+
+            val allDialoguesOk = invalidAudioDetails.isEmpty() &&
+                silentDialogues.isEmpty() &&
+                unidentifiedSpeakers.isEmpty() &&
+                missingMixedText.isEmpty() &&
+                scriptViolations.isEmpty() &&
+                outOfBounds.isEmpty()
+
             checks.add(
                 VerificationCheckItem(
                     checkName = "Dialogue Audio, Mixed-Script & Sync Completeness",
                     passed = allDialoguesOk,
                     detail = when {
-                        allDialoguesOk -> "All ${dialogues.size} dialogue clips verified on disk with Mixed-Script Hindi-English text and valid timeline positions."
-                        missingDialogues.isNotEmpty() -> "${missingDialogues.size} of ${dialogues.size} dialogue clips missing audio (${missingDialogues.take(4).joinToString { it.dialogueId }})."
-                        missingHinglish.isNotEmpty() -> "${missingHinglish.size} dialogue(s) missing translated text (${missingHinglish.take(4).joinToString { it.dialogueId }})."
+                        allDialoguesOk -> "All ${dialogues.size} dialogue WAVs strictly decoded (min RMS ${lowestDialogueRms} dBFS), valid speakers, Mixed-Script text, and timeline bounds."
+                        invalidAudioDetails.isNotEmpty() -> "${invalidAudioDetails.size}/${dialogues.size} dialogue WAVs failed strict decode: ${invalidAudioDetails.take(3).joinToString(", ")}."
+                        silentDialogues.isNotEmpty() -> "${silentDialogues.size}/${dialogues.size} dialogue WAVs are silent (< $NON_SILENT_RMS_THRESHOLD_DBFS dBFS): ${silentDialogues.take(3).joinToString(", ")}."
+                        unidentifiedSpeakers.isNotEmpty() -> "${unidentifiedSpeakers.size} dialogue(s) have UNIDENTIFIED speaker (${unidentifiedSpeakers.take(4).joinToString { it.dialogueId }})."
+                        missingMixedText.isNotEmpty() -> "${missingMixedText.size} dialogue(s) missing translated text (${missingMixedText.take(4).joinToString { it.dialogueId }})."
                         scriptViolations.isNotEmpty() -> "${scriptViolations.size} dialogue(s) violate Mixed-Script Devanagari+English rule (${scriptViolations.take(4).joinToString { it.dialogueId }})."
                         else -> "${outOfBounds.size} dialogue(s) fall outside episode duration bounds (${expectedDurationMs}ms)."
                     }
@@ -147,7 +216,7 @@ object FinalVerificationAgent {
 
     private fun verifyWavOutput(wavFile: File, expectedDurationMs: Long): List<VerificationCheckItem> {
         val items = mutableListOf<VerificationCheckItem>()
-        val strictRes = AudioDspEngine.readWavFileStrict(wavFile)
+        val strictRes = AudioDspEngine.validateAudioFileStrict(wavFile)
         if (strictRes.isFailure) {
             items.add(
                 VerificationCheckItem(
@@ -158,41 +227,82 @@ object FinalVerificationAgent {
             )
             return items
         }
-        val buf = strictRes.getOrThrow()
-        if (buf.samples.isEmpty()) {
-            items.add(VerificationCheckItem("WAV PCM Decode", false, "WAV file contains 0 readable PCM samples."))
-            return items
-        }
-
-        val rmsDbfs = AudioDspEngine.computeRmsDbfs(buf)
-        val peakDbfs = AudioDspEngine.computePeakDbfs(buf)
-        val notSilent = rmsDbfs > -60.0f
-        val safePeak = peakDbfs <= 0.0f
-        val durationDeltaMs = if (expectedDurationMs > 0L) abs(buf.durationMs - expectedDurationMs) else 0L
+        val metrics = strictRes.getOrThrow()
+        val notSilent = metrics.rmsDbfs > NON_SILENT_RMS_THRESHOLD_DBFS
+        val safePeak = metrics.peakDbfs <= 0.0f
+        val durationDeltaMs = if (expectedDurationMs > 0L) abs(metrics.durationMs - expectedDurationMs) else 0L
         val durationOk = expectedDurationMs <= 0L || durationDeltaMs <= 500L
 
         items.add(
             VerificationCheckItem(
                 checkName = "WAV Audio Energy (Non-Silent)",
                 passed = notSilent,
-                detail = if (notSilent) "Measured RMS: $rmsDbfs dBFS (non-silent audio verified)." else "Output audio appears silent ($rmsDbfs dBFS)."
+                detail = if (notSilent) {
+                    "Measured RMS: ${metrics.rmsDbfs} dBFS (${metrics.sampleCount} PCM samples verified)."
+                } else {
+                    "Output audio appears silent (${metrics.rmsDbfs} dBFS < $NON_SILENT_RMS_THRESHOLD_DBFS dBFS)."
+                }
             )
         )
         items.add(
             VerificationCheckItem(
-                checkName = "Peak Headroom & Clipping",
+                checkName = "Peak Headroom & Format",
                 passed = safePeak,
-                detail = "Measured Peak: $peakDbfs dBFS (${buf.sampleRateHz} Hz, ${buf.channels} ch)."
+                detail = "Measured Peak: ${metrics.peakDbfs} dBFS • ${metrics.sampleRateHz} Hz • ${metrics.channels} ch • 16-bit PCM WAV."
             )
         )
         items.add(
             VerificationCheckItem(
                 checkName = "Audio Duration Consistency",
                 passed = durationOk,
-                detail = "Output ${buf.durationMs} ms vs expected ${expectedDurationMs} ms (delta ${durationDeltaMs} ms)."
+                detail = "Output ${metrics.durationMs} ms vs expected ${expectedDurationMs} ms (delta ${durationDeltaMs} ms, tolerance 500 ms)."
             )
         )
         return items
+    }
+
+    private data class TrackTimingStats(
+        val packetCount: Int,
+        val startPtsUs: Long,
+        val endPtsUs: Long,
+        val headerDurationMs: Long
+    ) {
+        val measuredSpanMs: Long
+            get() = if (packetCount > 0 && endPtsUs >= startPtsUs) {
+                ((endPtsUs - startPtsUs) / 1000L).takeIf { it > 0L } ?: headerDurationMs
+            } else headerDurationMs
+    }
+
+    private fun inspectTrackTimings(mp4File: File, trackIndex: Int, format: MediaFormat): TrackTimingStats {
+        val headerDurMs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+            format.getLong(MediaFormat.KEY_DURATION) / 1000L
+        } else 0L
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(mp4File.absolutePath)
+            extractor.selectTrack(trackIndex)
+            var count = 0
+            var firstPts = -1L
+            var lastPts = 0L
+            while (true) {
+                val pts = extractor.sampleTime
+                if (pts < 0L) break
+                if (firstPts < 0L) firstPts = pts
+                if (pts > lastPts) lastPts = pts
+                count++
+                if (!extractor.advance()) break
+            }
+            TrackTimingStats(
+                packetCount = count,
+                startPtsUs = firstPts.coerceAtLeast(0L),
+                endPtsUs = lastPts,
+                headerDurationMs = headerDurMs
+            )
+        } catch (_: Exception) {
+            TrackTimingStats(0, 0L, 0L, headerDurMs)
+        } finally {
+            try { extractor.release() } catch (_: Exception) {}
+        }
     }
 
     private fun verifyMp4Container(mp4File: File, expectedDurationMs: Long): List<VerificationCheckItem> {
@@ -206,61 +316,95 @@ object FinalVerificationAgent {
             var audioTrackIndex = -1
             var videoFormat: MediaFormat? = null
             var audioFormat: MediaFormat? = null
-            var videoDurationMs = 0L
-            var audioDurationMs = 0L
             for (i in 0 until extractor.trackCount) {
                 val fmt = extractor.getTrackFormat(i)
                 val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                val dur = if (fmt.containsKey(MediaFormat.KEY_DURATION)) fmt.getLong(MediaFormat.KEY_DURATION) / 1000L else 0L
                 if (mime.startsWith("video/") && !hasVideo) {
                     hasVideo = true
                     videoTrackIndex = i
                     videoFormat = fmt
-                    videoDurationMs = dur
                 } else if (mime.startsWith("audio/") && !hasAudio) {
                     hasAudio = true
                     audioTrackIndex = i
                     audioFormat = fmt
-                    audioDurationMs = dur
                 }
             }
+
+            if (!hasVideo || !hasAudio || videoFormat == null || audioFormat == null) {
+                items.add(
+                    VerificationCheckItem(
+                        checkName = "MP4 Video & Audio Tracks",
+                        passed = false,
+                        detail = "Missing required track(s): VideoTrack=$hasVideo, AudioTrack=$hasAudio."
+                    )
+                )
+                return items
+            }
+
+            val videoStats = inspectTrackTimings(mp4File, videoTrackIndex, videoFormat)
+            val audioStats = inspectTrackTimings(mp4File, audioTrackIndex, audioFormat)
+            val videoDurMs = videoStats.headerDurationMs.takeIf { it > 0L } ?: videoStats.measuredSpanMs
+            val audioDurMs = audioStats.headerDurationMs.takeIf { it > 0L } ?: audioStats.measuredSpanMs
+
             items.add(
                 VerificationCheckItem(
                     checkName = "MP4 Video & Audio Tracks",
-                    passed = hasVideo && hasAudio,
-                    detail = "VideoTrack=$hasVideo (${videoDurationMs}ms), AudioTrack=$hasAudio (${audioDurationMs}ms)."
+                    passed = videoStats.packetCount > 0 && audioStats.packetCount > 0,
+                    detail = "Video=${videoDurMs}ms (${videoStats.packetCount} pkts), Audio=${audioDurMs}ms (${audioStats.packetCount} pkts)."
                 )
             )
-            val measuredDur = maxOf(videoDurationMs, audioDurationMs)
-            val delta = if (expectedDurationMs > 0L && measuredDur > 0L) abs(measuredDur - expectedDurationMs) else 0L
+
+            // Independently compare video vs audio duration against documented sync tolerance
+            val avDurationDiffMs = abs(videoDurMs - audioDurMs)
+            val avSyncOk = videoDurMs > 0L && audioDurMs > 0L && avDurationDiffMs <= MP4_DURATION_SYNC_TOLERANCE_MS
             items.add(
                 VerificationCheckItem(
-                    checkName = "MP4 Duration Consistency",
-                    passed = measuredDur > 0L && (expectedDurationMs <= 0L || delta <= 1500L),
-                    detail = "Container duration ${measuredDur}ms vs expected ${expectedDurationMs}ms (delta ${delta}ms)."
+                    checkName = "MP4 Video vs Audio Sync & Truncation",
+                    passed = avSyncOk,
+                    detail = "Video=${videoDurMs}ms vs Audio=${audioDurMs}ms (diff=${avDurationDiffMs}ms, tolerance<=${MP4_DURATION_SYNC_TOLERANCE_MS}ms)."
                 )
             )
+
+            // Inspect start presentation timestamps to detect unintended start offset
+            val startOffsetMs = abs(videoStats.startPtsUs - audioStats.startPtsUs) / 1000L
+            val startSyncOk = startOffsetMs <= MP4_START_PTS_OFFSET_TOLERANCE_MS
+            items.add(
+                VerificationCheckItem(
+                    checkName = "MP4 Start Presentation Timestamp Alignment",
+                    passed = startSyncOk,
+                    detail = "VideoStart=${videoStats.startPtsUs / 1000L}ms, AudioStart=${audioStats.startPtsUs / 1000L}ms (offset=${startOffsetMs}ms, tolerance<=${MP4_START_PTS_OFFSET_TOLERANCE_MS}ms)."
+                )
+            )
+
+            if (expectedDurationMs > 0L) {
+                val expectedDeltaMs = abs(audioDurMs - expectedDurationMs)
+                val expectedOk = expectedDeltaMs <= 1000L
+                items.add(
+                    VerificationCheckItem(
+                        checkName = "MP4 Expected Episode Duration",
+                        passed = expectedOk,
+                        detail = "Audio=${audioDurMs}ms, Video=${videoDurMs}ms vs Episode=${expectedDurationMs}ms (delta=${expectedDeltaMs}ms)."
+                    )
+                )
+            }
+
             // Actual frame-decoding validation for both video & audio streams (not metadata-only)
-            if (videoTrackIndex >= 0 && videoFormat != null) {
-                val videoDecoded = verifyTrackDecodable(mp4File, videoTrackIndex, videoFormat)
-                items.add(
-                    VerificationCheckItem(
-                        checkName = "MP4 Video Stream Decode",
-                        passed = videoDecoded.first,
-                        detail = videoDecoded.second
-                    )
+            val videoDecoded = verifyTrackDecodable(mp4File, videoTrackIndex, videoFormat)
+            items.add(
+                VerificationCheckItem(
+                    checkName = "MP4 Video Stream Decode",
+                    passed = videoDecoded.first,
+                    detail = videoDecoded.second
                 )
-            }
-            if (audioTrackIndex >= 0 && audioFormat != null) {
-                val audioDecoded = verifyTrackDecodable(mp4File, audioTrackIndex, audioFormat)
-                items.add(
-                    VerificationCheckItem(
-                        checkName = "MP4 Audio Stream Decode",
-                        passed = audioDecoded.first,
-                        detail = audioDecoded.second
-                    )
+            )
+            val audioDecoded = verifyTrackDecodable(mp4File, audioTrackIndex, audioFormat)
+            items.add(
+                VerificationCheckItem(
+                    checkName = "MP4 Audio Stream Decode",
+                    passed = audioDecoded.first,
+                    detail = audioDecoded.second
                 )
-            }
+            )
         } catch (e: Exception) {
             items.add(
                 VerificationCheckItem(

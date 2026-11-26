@@ -26,8 +26,8 @@ data class StudioConfig(
     val selectedAsrVariant: String = "Silero VAD ONNX + Direct Gemini Audio",
     val selectedTtsEngine: String = "Android-Speech-TTS",
     val selectedSeparationModel: String = "On-Device Bandpass/Residual DSP",
-    val defaultExportResolution: String = "1920x1080 (1080p Full HD)",
-    val defaultVideoBitrateKbps: Int = 8500,
+    val defaultExportResolution: String = "Source Passthrough",
+    val defaultVideoBitrateKbps: Int = 0,
     val defaultAudioCodec: String = "AAC-LC / PCM 16-bit",
     val defaultAudioBitrateKbps: Int = 320,
     val defaultAudioSampleRateHz: Int = 48000
@@ -79,8 +79,8 @@ class StudioPreferencesRepository(private val context: Context) {
             selectedAsrVariant = effectiveAsr,
             selectedTtsEngine = effectiveTts,
             selectedSeparationModel = effectiveSep,
-            defaultExportResolution = prefs[Keys.EXPORT_RES] ?: "1920x1080 (1080p Full HD)",
-            defaultVideoBitrateKbps = prefs[Keys.VIDEO_BITRATE] ?: 8500,
+            defaultExportResolution = prefs[Keys.EXPORT_RES] ?: "Source Passthrough",
+            defaultVideoBitrateKbps = prefs[Keys.VIDEO_BITRATE] ?: 0,
             defaultAudioCodec = prefs[Keys.AUDIO_CODEC] ?: "AAC-LC / PCM 16-bit",
             defaultAudioBitrateKbps = prefs[Keys.AUDIO_BITRATE] ?: 320,
             defaultAudioSampleRateHz = prefs[Keys.AUDIO_SR] ?: 48000

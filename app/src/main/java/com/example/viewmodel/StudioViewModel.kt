@@ -9,6 +9,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.agents.SevenSpecialistAgentsCoordinator
+import com.example.agents.StageStatus
 import com.example.data.local.AgentJobRecordEntity
 import com.example.data.local.AnimeDubDatabase
 import com.example.data.local.AudioStemEntity
@@ -29,6 +30,7 @@ import com.example.data.preferences.StudioConfig
 import com.example.data.preferences.StudioPreferencesRepository
 import com.example.data.remote.DirectGeminiApiClient
 import com.example.data.remote.GeminiApiException
+import com.example.data.remote.GeminiConnectionState
 import com.example.data.remote.GeminiConnectionTestResult
 import com.example.data.remote.GeminiDialogueRewriteResult
 import com.example.engine.AudioDspEngine
@@ -184,6 +186,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val _geminiKeyState = MutableStateFlow(geminiKeyStore.getCurrentState())
     val geminiKeyState: StateFlow<GeminiApiKeyState> = _geminiKeyState.asStateFlow()
 
+    private val _geminiConnectionState = MutableStateFlow(
+        if (geminiKeyStore.hasConfiguredKey()) GeminiConnectionState.API_KEY_SAVED_UNVERIFIED
+        else GeminiConnectionState.API_KEY_MISSING
+    )
+    val geminiConnectionState: StateFlow<GeminiConnectionState> = _geminiConnectionState.asStateFlow()
+
     private val _geminiConnectionStatus = MutableStateFlow<GeminiConnectionTestResult?>(null)
     val geminiConnectionStatus: StateFlow<GeminiConnectionTestResult?> = _geminiConnectionStatus.asStateFlow()
 
@@ -287,9 +295,15 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val savedConfig = prefsRepo.configFlow.first()
             val keyState = geminiKeyStore.getCurrentState()
             _geminiKeyState.value = keyState
+            val initialConnState = computeUnverifiedConnectionState(
+                hasKey = keyState.isConfigured,
+                modelName = savedConfig.geminiModelName
+            )
+            _geminiConnectionState.value = initialConnState
             modelDownloadManager.reconcileCatalogWithDisk(
                 geminiApiConfigured = keyState.isConfigured,
-                geminiModelName = savedConfig.geminiModelName
+                geminiModelName = savedConfig.geminiModelName,
+                geminiConnectionState = initialConnState
             )
 
             val savedEp = if (savedConfig.activeEpisodeId > 0L) dao.getEpisodeById(savedConfig.activeEpisodeId) else null
@@ -783,13 +797,37 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
             result.fold(
-                onSuccess = { ep ->
-                    _pipelineBanner.value = PipelineBannerState(
-                        isRunning = false,
-                        activeStageNumber = ep.currentStageNumber,
-                        activeStageTitle = ep.currentStageName,
-                        statusBannerMessage = "Completed through ${ep.currentStageName}."
-                    )
+                onSuccess = { stageRes ->
+                    val ep = stageRes.episode
+                    when (stageRes.status) {
+                        StageStatus.COMPLETED -> {
+                            _pipelineBanner.value = PipelineBannerState(
+                                isRunning = false,
+                                activeStageNumber = ep.currentStageNumber,
+                                activeStageTitle = ep.currentStageName,
+                                statusBannerMessage = stageRes.message.ifBlank { "Completed through ${ep.currentStageName}." },
+                                isError = false
+                            )
+                        }
+                        StageStatus.PARTIAL -> {
+                            _pipelineBanner.value = PipelineBannerState(
+                                isRunning = false,
+                                activeStageNumber = stageRes.stageNumber,
+                                activeStageTitle = ep.currentStageName,
+                                statusBannerMessage = "Stage ${stageRes.stageNumber} PARTIAL (${stageRes.completedCount}/${stageRes.totalCount}): ${stageRes.message}",
+                                isError = true
+                            )
+                        }
+                        else -> {
+                            _pipelineBanner.value = PipelineBannerState(
+                                isRunning = false,
+                                activeStageNumber = stageRes.stageNumber,
+                                activeStageTitle = ep.currentStageName,
+                                statusBannerMessage = "Stage ${stageRes.stageNumber} ${stageRes.status.name}: ${stageRes.message}",
+                                isError = true
+                            )
+                        }
+                    }
                 },
                 onFailure = { err ->
                     _pipelineBanner.value = PipelineBannerState(
@@ -1257,29 +1295,23 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 return@launch
             }
             val incoming = parsed.getOrThrow()
-            var importedCount = 0
-            val existingAll = dao.getAllDictionaryEntriesOnce().toMutableList()
-            for (entry in incoming) {
-                val preferred = MixedScriptLanguageEngine.preferredDisplayTerm(entry)
-                val key = MixedScriptLanguageEngine.normalizedTermKey(entry.japaneseSourceTerm, preferred)
-                val dup = existingAll.find { ex ->
-                    ex.dictionaryLevel.equals(entry.dictionaryLevel, ignoreCase = true) &&
-                        ex.projectId == entry.projectId &&
-                        (ex.animeSeriesName?.trim() ?: "").equals(entry.animeSeriesName?.trim() ?: "", ignoreCase = true) &&
-                        MixedScriptLanguageEngine.normalizedTermKey(
-                            ex.japaneseSourceTerm,
-                            MixedScriptLanguageEngine.preferredDisplayTerm(ex)
-                        ) == key
-                }
-                val toSave = if (dup != null) entry.copy(id = dup.id) else entry
-                dao.insertDictionaryEntry(toSave)
-                importedCount++
-            }
+            val existingAll = dao.getAllDictionaryEntriesOnce()
+            val plan = MixedScriptLanguageEngine.planDictionaryImport(
+                incomingEntries = incoming,
+                existingEntries = existingAll
+            )
+            dao.applyDictionaryImportPlanAtomic(
+                toInsert = plan.toInsert,
+                toUpdate = plan.toUpdate
+            )
+            val totalWritten = plan.importedCount + plan.updatedCount
+            val summary = "Dictionary import complete — Imported: ${plan.importedCount}, Updated: ${plan.updatedCount}, Skipped: ${plan.skippedCount}, Failed: ${plan.failedCount}."
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = false,
-                statusBannerMessage = "Imported $importedCount dictionary term(s) into 3-tier glossary."
+                statusBannerMessage = summary,
+                isError = totalWritten == 0 && plan.failedCount > 0
             )
-            onDone(Result.success(importedCount))
+            onDone(Result.success(totalWritten))
         }
     }
 
@@ -1521,23 +1553,36 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     // --- Direct Gemini API Key & Connection Management ---
 
+    private fun computeUnverifiedConnectionState(hasKey: Boolean, modelName: String): GeminiConnectionState {
+        return when {
+            !hasKey -> GeminiConnectionState.API_KEY_MISSING
+            DirectGeminiApiClient.validateModelSelection(modelName).isFailure -> GeminiConnectionState.MODEL_UNAVAILABLE
+            else -> GeminiConnectionState.API_KEY_SAVED_UNVERIFIED
+        }
+    }
+
     fun saveGeminiApiKey(rawKey: String, onDone: (Result<GeminiApiKeyState>) -> Unit = {}) {
         viewModelScope.launch(Dispatchers.IO) {
             val res = geminiKeyStore.saveApiKey(rawKey)
             res.fold(
                 onSuccess = { newState ->
+                    val currentModel = studioConfig.value.geminiModelName
+                    val nextConnState = computeUnverifiedConnectionState(newState.isConfigured, currentModel)
                     _geminiKeyState.value = newState
+                    // Immediately invalidate prior verification status when key changes
                     _geminiConnectionStatus.value = null
+                    _geminiConnectionState.value = nextConnState
                     modelDownloadManager.updateDirectGeminiCatalogStatus(
-                        isConfigured = newState.isConfigured,
-                        modelName = studioConfig.value.geminiModelName
+                        connectionState = nextConnState,
+                        modelName = currentModel
                     )
                     _pipelineBanner.value = PipelineBannerState(
                         isRunning = false,
-                        statusBannerMessage = "Gemini API key saved encrypted in Android Keystore. Tap Test Connection to verify."
+                        statusBannerMessage = "Gemini API key saved encrypted in Android Keystore (unverified). Tap Test Connection to verify."
                     )
                 },
                 onFailure = { err ->
+                    _geminiKeyState.value = geminiKeyStore.getCurrentState()
                     _pipelineBanner.value = PipelineBannerState(
                         isRunning = false,
                         statusBannerMessage = err.localizedMessage ?: "Invalid Gemini API key.",
@@ -1552,16 +1597,19 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun removeGeminiApiKey() {
         viewModelScope.launch(Dispatchers.IO) {
             val newState = geminiKeyStore.removeApiKey()
+            val currentModel = studioConfig.value.geminiModelName
+            val nextConnState = computeUnverifiedConnectionState(newState.isConfigured, currentModel)
             _geminiKeyState.value = newState
             _geminiConnectionStatus.value = null
+            _geminiConnectionState.value = nextConnState
             modelDownloadManager.updateDirectGeminiCatalogStatus(
-                isConfigured = newState.isConfigured,
-                modelName = studioConfig.value.geminiModelName
+                connectionState = nextConnState,
+                modelName = currentModel
             )
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = false,
                 statusBannerMessage = if (newState.isConfigured) {
-                    "Removed custom key; falling back to build-configured GEMINI_API_KEY."
+                    "Removed custom key; falling back to build-configured GEMINI_API_KEY (unverified)."
                 } else {
                     "Gemini API key removed from Android Keystore."
                 }
@@ -1571,28 +1619,48 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateSelectedGeminiModel(modelName: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            prefsRepo.updateGeminiModelName(modelName)
             val normalized = DirectGeminiApiClient.normalizeModelName(modelName)
+            prefsRepo.updateGeminiModelName(normalized)
+            // Immediately invalidate prior connection verification when selected model changes!
+            _geminiConnectionStatus.value = null
+            val hasKey = geminiKeyStore.hasConfiguredKey()
+            val nextConnState = computeUnverifiedConnectionState(hasKey, normalized)
+            _geminiConnectionState.value = nextConnState
+            val validation = DirectGeminiApiClient.validateModelSelection(normalized)
             modelDownloadManager.updateDirectGeminiCatalogStatus(
-                isConfigured = geminiKeyStore.hasConfiguredKey(),
-                modelName = normalized
+                connectionState = nextConnState,
+                modelName = normalized,
+                connectionMessage = validation.exceptionOrNull()?.localizedMessage
             )
+            if (validation.isFailure) {
+                _pipelineBanner.value = PipelineBannerState(
+                    isRunning = false,
+                    statusBannerMessage = validation.exceptionOrNull()?.localizedMessage ?: "Selected model is unavailable.",
+                    isError = true
+                )
+            }
         }
     }
 
     fun testGeminiConnection(modelName: String = studioConfig.value.geminiModelName) {
         if (_isTestingGeminiConnection.value) return
         viewModelScope.launch {
+            val normalized = DirectGeminiApiClient.normalizeModelName(modelName)
             _isTestingGeminiConnection.value = true
-            val res = geminiClient.testConnection(modelName)
+            _geminiConnectionState.value = GeminiConnectionState.TESTING
+            modelDownloadManager.updateDirectGeminiCatalogStatus(
+                connectionState = GeminiConnectionState.TESTING,
+                modelName = normalized
+            )
+            val res = geminiClient.testConnection(normalized)
             res.fold(
                 onSuccess = { ok ->
                     _geminiConnectionStatus.value = ok
+                    _geminiConnectionState.value = GeminiConnectionState.VERIFIED_CONNECTED
                     modelDownloadManager.updateDirectGeminiCatalogStatus(
-                        isConfigured = true,
+                        connectionState = GeminiConnectionState.VERIFIED_CONNECTED,
                         modelName = ok.modelId,
-                        connectionMessage = ok.message,
-                        isError = false
+                        connectionMessage = ok.message
                     )
                     _pipelineBanner.value = PipelineBannerState(
                         isRunning = false,
@@ -1601,20 +1669,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 },
                 onFailure = { err ->
                     val kind = (err as? GeminiApiException)?.kind
+                    val errConnState = DirectGeminiApiClient.mapErrorToConnectionState(kind)
                     val msg = err.localizedMessage ?: "Gemini connection test failed."
+                    _geminiConnectionState.value = errConnState
                     _geminiConnectionStatus.value = GeminiConnectionTestResult(
                         isConnected = false,
-                        modelId = DirectGeminiApiClient.normalizeModelName(modelName),
+                        modelId = normalized,
                         remoteDisplayName = "",
                         latencyMs = 0L,
                         message = msg,
-                        errorKind = kind
+                        errorKind = kind,
+                        connectionState = errConnState
                     )
                     modelDownloadManager.updateDirectGeminiCatalogStatus(
-                        isConfigured = geminiKeyStore.hasConfiguredKey(),
-                        modelName = DirectGeminiApiClient.normalizeModelName(modelName),
-                        connectionMessage = msg,
-                        isError = true
+                        connectionState = errConnState,
+                        modelName = normalized,
+                        connectionMessage = msg
                     )
                     _pipelineBanner.value = PipelineBannerState(
                         isRunning = false,

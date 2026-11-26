@@ -124,6 +124,7 @@ fun HomeDashboardScreen(viewModel: StudioViewModel) {
     val activeEpisode by viewModel.activeEpisode.collectAsState()
     val activeProject by viewModel.activeProject.collectAsState()
     val geminiKeyState by viewModel.geminiKeyState.collectAsState()
+    val geminiConnectionState by viewModel.geminiConnectionState.collectAsState()
 
     val availableBytes = remember { viewModel.modelDownloadManager.getAvailableStorageBytes() }
     val modelsUsedBytes = remember(models) { viewModel.modelDownloadManager.getModelsStorageUsedBytes() }
@@ -356,7 +357,7 @@ fun HomeDashboardScreen(viewModel: StudioViewModel) {
                 MetadataChipRow(
                     items = listOf(
                         "Local Ready" to "$localReadyCount modules",
-                        "Gemini API" to if (geminiKeyState.isConfigured) "Key Set" else "Key Missing",
+                        "Gemini API" to geminiConnectionState.pillLabel,
                         "Free Space" to formatBytes(availableBytes)
                     )
                 )

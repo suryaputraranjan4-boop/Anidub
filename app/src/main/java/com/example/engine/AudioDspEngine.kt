@@ -4,12 +4,14 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.PI
@@ -87,9 +89,260 @@ data class MixOutputMetrics(
     val limiterAttenuationDb: Float
 )
 
+data class WavHeaderInfo(
+    val sampleRateHz: Int,
+    val channels: Int,
+    val bitsPerSample: Int,
+    val dataOffsetBytes: Long,
+    val dataByteSize: Long,
+    val totalFrames: Long,
+    val durationMs: Long
+)
+
+data class StrictWavMetrics(
+    val header: WavHeaderInfo,
+    val sampleCount: Long,
+    val peakDbfs: Float,
+    val rmsDbfs: Float
+) {
+    val sampleRateHz: Int get() = header.sampleRateHz
+    val channels: Int get() = header.channels
+    val durationMs: Long get() = header.durationMs
+}
+
+data class WavExportMetadata(
+    val outputFile: File,
+    val sampleRateHz: Int,
+    val channels: Int,
+    val bitsPerSample: Int,
+    val durationMs: Long,
+    val wasResampled: Boolean,
+    val wasMonoConverted: Boolean,
+    val sourceSampleRateHz: Int,
+    val sourceChannels: Int,
+    val formatDescription: String
+)
+
+data class Mp4MuxMetadata(
+    val outputFile: File,
+    val videoCodec: String,
+    val videoResolution: String,
+    val videoBitrateKbpsActual: Int,
+    val videoPassthrough: Boolean,
+    val audioCodec: String,
+    val audioSampleRateHz: Int,
+    val audioChannels: Int,
+    val videoDurationMs: Long,
+    val audioDurationMs: Long,
+    val videoStartPtsUs: Long,
+    val audioStartPtsUs: Long,
+    val videoEndPtsUs: Long,
+    val audioEndPtsUs: Long,
+    val writtenVideoFrames: Int,
+    val writtenAudioFrames: Int
+)
+
 object AudioDspEngine {
 
     private const val TAG = "AudioDspEngine"
+
+    /**
+     * Parses and strictly validates a 16-bit PCM WAV file's RIFF/WAVE/'fmt '/'data' headers
+     * using bounded-memory seeks (never loads PCM audio into heap).
+     */
+    fun inspectWavHeader(file: File): Result<WavHeaderInfo> {
+        if (!file.exists() || !file.isFile) {
+            return Result.failure(IllegalArgumentException("WAV file does not exist: ${file.name}"))
+        }
+        val fileLen = file.length()
+        if (fileLen < 44L) {
+            return Result.failure(IllegalArgumentException("WAV file too small ($fileLen bytes): ${file.name}"))
+        }
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                val riffHeader = ByteArray(12)
+                raf.readFully(riffHeader)
+                val riff = String(riffHeader, 0, 4, Charsets.US_ASCII)
+                val wave = String(riffHeader, 8, 4, Charsets.US_ASCII)
+                if (riff != "RIFF" || wave != "WAVE") {
+                    return Result.failure(IllegalArgumentException("Invalid WAV container magic ('$riff'/'$wave')."))
+                }
+
+                var foundFmt = false
+                var foundData = false
+                var audioFormat = 0
+                var channels = 0
+                var sampleRate = 0
+                var bitsPerSample = 0
+                var dataOffset = 0L
+                var dataLength = 0L
+
+                val chunkHdr = ByteArray(8)
+                var pos = 12L
+                while (pos + 8L <= fileLen) {
+                    raf.seek(pos)
+                    raf.readFully(chunkHdr)
+                    val chunkId = String(chunkHdr, 0, 4, Charsets.US_ASCII)
+                    val rawChunkSize = ByteBuffer.wrap(chunkHdr, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                    if (rawChunkSize < 0) {
+                        return Result.failure(IllegalArgumentException("Corrupt negative WAV chunk size ($rawChunkSize) in '$chunkId'."))
+                    }
+                    val chunkSizeUnsigned = rawChunkSize.toLong() and 0xFFFFFFFFL
+                    val chunkDataStart = pos + 8L
+
+                    if (chunkId == "fmt ") {
+                        if (chunkSizeUnsigned < 16L || chunkDataStart + 16L > fileLen) {
+                            return Result.failure(IllegalArgumentException("Truncated WAV 'fmt ' chunk."))
+                        }
+                        val fmtBytes = ByteArray(16)
+                        raf.readFully(fmtBytes)
+                        val fb = ByteBuffer.wrap(fmtBytes).order(ByteOrder.LITTLE_ENDIAN)
+                        audioFormat = fb.getShort(0).toInt() and 0xFFFF
+                        channels = fb.getShort(2).toInt() and 0xFFFF
+                        sampleRate = fb.getInt(4)
+                        bitsPerSample = fb.getShort(14).toInt() and 0xFFFF
+                        foundFmt = true
+                    } else if (chunkId == "data") {
+                        dataOffset = chunkDataStart
+                        dataLength = min(chunkSizeUnsigned, fileLen - dataOffset)
+                        foundData = true
+                        break
+                    }
+
+                    val paddedStep = 8L + chunkSizeUnsigned + (chunkSizeUnsigned and 1L)
+                    if (paddedStep <= 0L) break
+                    pos += paddedStep
+                }
+
+                if (!foundFmt) {
+                    return Result.failure(IllegalArgumentException("WAV file missing required 'fmt ' chunk."))
+                }
+                if (audioFormat != 1) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV audioFormat=$audioFormat (only uncompressed PCM format=1 is supported)."))
+                }
+                if (bitsPerSample != 16) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV bitsPerSample=$bitsPerSample (only 16-bit PCM is supported)."))
+                }
+                if (channels !in 1..2) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV channel count=$channels (expected 1 or 2)."))
+                }
+                if (sampleRate !in 8000..96000) {
+                    return Result.failure(IllegalArgumentException("Unsupported WAV sample rate=$sampleRate Hz (expected 8000..96000 Hz)."))
+                }
+                val bytesPerFrame = channels * (bitsPerSample / 8)
+                if (!foundData || dataLength < bytesPerFrame.toLong() || dataOffset >= fileLen) {
+                    return Result.failure(IllegalArgumentException("WAV file missing non-empty 'data' chunk."))
+                }
+
+                val totalFrames = dataLength / bytesPerFrame.toLong()
+                val durationMs = if (sampleRate > 0) (totalFrames * 1000L) / sampleRate.toLong() else 0L
+                Result.success(
+                    WavHeaderInfo(
+                        sampleRateHz = sampleRate,
+                        channels = channels,
+                        bitsPerSample = bitsPerSample,
+                        dataOffsetBytes = dataOffset,
+                        dataByteSize = totalFrames * bytesPerFrame.toLong(),
+                        totalFrames = totalFrames,
+                        durationMs = durationMs
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Bounded-memory streaming WAV decoder & integrity validator.
+     * Validates header, sample rate, channel count, actual readable sample count, peak dBFS, and RMS dBFS
+     * using a fixed 64 KB buffer (never allocates full-file heap arrays).
+     */
+    fun validateAudioFileStrict(file: File): Result<StrictWavMetrics> {
+        val headerRes = inspectWavHeader(file)
+        if (headerRes.isFailure) return Result.failure(headerRes.exceptionOrNull()!!)
+        val header = headerRes.getOrThrow()
+
+        return try {
+            FileInputStream(file).use { fis ->
+                var toSkip = header.dataOffsetBytes
+                while (toSkip > 0L) {
+                    val skipped = fis.skip(toSkip)
+                    if (skipped <= 0L) {
+                        val b = fis.read()
+                        if (b == -1) return Result.failure(IllegalArgumentException("Unexpected EOF before WAV data chunk."))
+                        toSkip -= 1L
+                    } else {
+                        toSkip -= skipped
+                    }
+                }
+
+                val buf = ByteArray(64 * 1024)
+                var remaining = header.dataByteSize
+                var totalSamples = 0L
+                var maxAbs = 0
+                var sumSq = 0.0
+                var carryByte: Int? = null
+
+                while (remaining > 0L) {
+                    val req = min(buf.size.toLong(), remaining).toInt()
+                    val read = fis.read(buf, 0, req)
+                    if (read <= 0) break
+                    remaining -= read.toLong()
+
+                    var offset = 0
+                    if (carryByte != null && read > 0) {
+                        val low = carryByte and 0xFF
+                        val high = buf[0].toInt()
+                        val sample = (high shl 8) or low
+                        val a = abs(sample)
+                        if (a > maxAbs) maxAbs = a
+                        val norm = sample.toDouble() / 32768.0
+                        sumSq += norm * norm
+                        totalSamples++
+                        carryByte = null
+                        offset = 1
+                    }
+
+                    var i = offset
+                    while (i + 1 < read) {
+                        val low = buf[i].toInt() and 0xFF
+                        val high = buf[i + 1].toInt()
+                        val sample = (high shl 8) or low
+                        val a = abs(sample)
+                        if (a > maxAbs) maxAbs = a
+                        val norm = sample.toDouble() / 32768.0
+                        sumSq += norm * norm
+                        totalSamples++
+                        i += 2
+                    }
+                    if (i < read) {
+                        carryByte = buf[i].toInt() and 0xFF
+                    }
+                }
+
+                if (totalSamples <= 0L) {
+                    return Result.failure(IllegalArgumentException("WAV file '${file.name}' decoded 0 PCM samples."))
+                }
+
+                val safeMax = max(1, maxAbs)
+                val peakDb = ((20.0 * log10(safeMax.toDouble() / 32768.0)) * 10.0).roundToInt() / 10.0
+                val rms = sqrt(sumSq / totalSamples.toDouble()).coerceAtLeast(1e-5)
+                val rmsDb = ((20.0 * log10(rms)) * 10.0).roundToInt() / 10.0
+
+                Result.success(
+                    StrictWavMetrics(
+                        header = header,
+                        sampleCount = totalSamples,
+                        peakDbfs = peakDb.toFloat(),
+                        rmsDbfs = rmsDb.toFloat()
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 
     /**
      * Strictly parses and validates a 16-bit PCM WAV file.
@@ -196,7 +449,8 @@ object AudioDspEngine {
     }
 
     /**
-     * Writes a 16-bit signed PCM WAV file with canonical RIFF header.
+     * Writes a 16-bit signed PCM WAV file with canonical RIFF header using bounded-memory
+     * streaming 64 KB chunks (never allocates a duplicate full-file ByteArray in heap).
      */
     fun writeWavFile(file: File, buffer: PcmAudioBuffer): File {
         file.parentFile?.mkdirs()
@@ -219,15 +473,106 @@ object AudioDspEngine {
         header.put("data".toByteArray(Charsets.US_ASCII))
         header.putInt(pcmByteSize)
 
-        val pcmBytes = ByteBuffer.allocate(pcmByteSize).order(ByteOrder.LITTLE_ENDIAN)
-        pcmBytes.asShortBuffer().put(buffer.samples)
+        val chunkShorts = 32_768
+        val chunkBytes = ByteArray(chunkShorts * 2)
+        val chunkBb = ByteBuffer.wrap(chunkBytes).order(ByteOrder.LITTLE_ENDIAN)
 
         FileOutputStream(file).use { fos ->
             fos.write(header.array())
-            fos.write(pcmBytes.array())
+            var offset = 0
+            while (offset < buffer.samples.size) {
+                val count = min(chunkShorts, buffer.samples.size - offset)
+                chunkBb.clear()
+                chunkBb.asShortBuffer().put(buffer.samples, offset, count)
+                fos.write(chunkBytes, 0, count * 2)
+                offset += count
+            }
             fos.flush()
         }
         return file
+    }
+
+    /**
+     * Exports a validated 16-bit PCM WAV master to [outputWavFile] with accurate transformation metadata.
+     * - If [targetSampleRateHz] matches the source WAV sample rate, streams directly on disk in 64 KB
+     *   chunks with zero full-file heap allocation.
+     * - If resampling is needed, records `wasResampled = true` honestly (never claims lossless source preservation).
+     */
+    fun exportWavWithMetadata(
+        sourceWavFile: File,
+        outputWavFile: File,
+        targetSampleRateHz: Int
+    ): Result<WavExportMetadata> {
+        val headerRes = inspectWavHeader(sourceWavFile)
+        if (headerRes.isFailure) {
+            return Result.failure(
+                IllegalStateException("Source mixed WAV is invalid: ${headerRes.exceptionOrNull()?.localizedMessage}")
+            )
+        }
+        val srcHdr = headerRes.getOrThrow()
+        val effectiveTargetSr = targetSampleRateHz.takeIf { it in 8000..96000 } ?: srcHdr.sampleRateHz
+
+        return try {
+            outputWavFile.parentFile?.mkdirs()
+            if (srcHdr.sampleRateHz == effectiveTargetSr) {
+                // Direct bounded-memory file stream copy preserving exact PCM samples, sample rate, and channels
+                if (sourceWavFile.canonicalPath != outputWavFile.canonicalPath) {
+                    FileInputStream(sourceWavFile).use { fis ->
+                        FileOutputStream(outputWavFile).use { fos ->
+                            val buf = ByteArray(64 * 1024)
+                            var r: Int
+                            while (fis.read(buf).also { r = it } != -1) {
+                                fos.write(buf, 0, r)
+                            }
+                            fos.flush()
+                        }
+                    }
+                }
+                val chLabel = if (srcHdr.channels == 1) "Mono (1 ch)" else "Stereo (${srcHdr.channels} ch)"
+                Result.success(
+                    WavExportMetadata(
+                        outputFile = outputWavFile,
+                        sampleRateHz = srcHdr.sampleRateHz,
+                        channels = srcHdr.channels,
+                        bitsPerSample = srcHdr.bitsPerSample,
+                        durationMs = srcHdr.durationMs,
+                        wasResampled = false,
+                        wasMonoConverted = srcHdr.channels == 1,
+                        sourceSampleRateHz = srcHdr.sampleRateHz,
+                        sourceChannels = srcHdr.channels,
+                        formatDescription = "Uncompressed PCM 16-bit WAV • ${srcHdr.sampleRateHz} Hz • $chLabel (direct master copy)"
+                    )
+                )
+            } else {
+                val strictBuf = readWavFileStrict(sourceWavFile).getOrThrow()
+                val resampled = resampleMono(strictBuf, effectiveTargetSr)
+                writeWavFile(outputWavFile, resampled)
+                val wasMonoDownmix = srcHdr.channels > 1
+                val notes = buildList {
+                    add("resampled ${srcHdr.sampleRateHz}→${effectiveTargetSr} Hz")
+                    if (wasMonoDownmix) add("downmixed ${srcHdr.channels}ch→mono") else add("mono 1 ch")
+                }.joinToString(", ")
+                Result.success(
+                    WavExportMetadata(
+                        outputFile = outputWavFile,
+                        sampleRateHz = resampled.sampleRateHz,
+                        channels = resampled.channels,
+                        bitsPerSample = 16,
+                        durationMs = resampled.durationMs,
+                        wasResampled = true,
+                        wasMonoConverted = wasMonoDownmix,
+                        sourceSampleRateHz = srcHdr.sampleRateHz,
+                        sourceChannels = srcHdr.channels,
+                        formatDescription = "Uncompressed PCM 16-bit WAV • ${resampled.sampleRateHz} Hz ($notes)"
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            if (outputWavFile.exists() && sourceWavFile.canonicalPath != outputWavFile.canonicalPath) {
+                runCatching { outputWavFile.delete() }
+            }
+            Result.failure(e)
+        }
     }
 
     /**
@@ -495,26 +840,40 @@ object AudioDspEngine {
     }
 
     /**
-     * Muxes the original video track from [sourceVideoFile] with the mixed dubbed WAV audio
-     * encoded to AAC-LC into a real MP4 container using Android MediaExtractor, MediaCodec, and MediaMuxer.
-     * Honestly returns Result.failure if the source file has no video track or muxing fails.
+     * Bounded-memory streaming MP4 muxer:
+     * - Streams original compressed video packets directly (video passthrough — ZERO re-encoding,
+     *   accurate measured video bitrate/codec metadata returned in [Mp4MuxMetadata]).
+     * - Streams 16-bit PCM WAV samples directly from disk in fixed small chunks into MediaCodec AAC-LC
+     *   and writes encoded AAC packets directly to MediaMuxer as they emerge — ZERO whole-file ShortArray,
+     *   ZERO duplicate full-file pcmBytes array, ZERO in-memory list of all encoded AAC packets.
+     * - Interleaves video & audio packets by PTS for optimal MP4 playback compatibility.
+     * - Releases all extractors, codecs, muxers, and streams in `finally`, and deletes partial output on failure.
      */
     fun muxVideoWithDubbedAudio(
         sourceVideoFile: File,
         dubbedWavFile: File,
         outputMp4File: File,
         audioBitrateKbps: Int = 192
-    ): Result<File> {
+    ): Result<Mp4MuxMetadata> {
         if (!sourceVideoFile.exists() || sourceVideoFile.length() == 0L) {
             return Result.failure(IllegalStateException("Original video source file does not exist."))
         }
-        if (!dubbedWavFile.exists() || dubbedWavFile.length() <= 44L) {
-            return Result.failure(IllegalStateException("Mixed dubbed WAV audio file does not exist."))
+        val wavHdrRes = inspectWavHeader(dubbedWavFile)
+        if (wavHdrRes.isFailure) {
+            return Result.failure(
+                IllegalStateException("Mixed dubbed WAV audio is invalid: ${wavHdrRes.exceptionOrNull()?.localizedMessage}")
+            )
+        }
+        val wavHdr = wavHdrRes.getOrThrow()
+        if (wavHdr.totalFrames <= 0L) {
+            return Result.failure(IllegalStateException("Mixed dubbed WAV audio contains 0 PCM frames."))
         }
 
         val videoExtractor = MediaExtractor()
         var muxer: MediaMuxer? = null
+        var muxerStarted = false
         var aacEncoder: MediaCodec? = null
+        var wavStream: FileInputStream? = null
 
         return try {
             videoExtractor.setDataSource(sourceVideoFile.absolutePath)
@@ -536,20 +895,50 @@ object AudioDspEngine {
                 )
             }
 
-            val strictWav = readWavFileStrict(dubbedWavFile)
-            if (strictWav.isFailure) {
-                return Result.failure(
-                    IllegalStateException("Mixed dubbed WAV audio is invalid: ${strictWav.exceptionOrNull()?.localizedMessage}")
-                )
-            }
-            val pcmBuf = toMono(strictWav.getOrThrow())
-            if (pcmBuf.samples.isEmpty()) {
-                return Result.failure(IllegalStateException("Mixed dubbed WAV audio buffer is empty."))
+            // Read actual source video metadata accurately (never fabricate a re-encoded bitrate)
+            val videoMime = videoFormat.getString(MediaFormat.KEY_MIME) ?: "video/unknown"
+            val videoCodecLabel = videoMime.substringAfter("video/").uppercase()
+            val vWidth = if (videoFormat.containsKey(MediaFormat.KEY_WIDTH)) videoFormat.getInteger(MediaFormat.KEY_WIDTH) else 0
+            val vHeight = if (videoFormat.containsKey(MediaFormat.KEY_HEIGHT)) videoFormat.getInteger(MediaFormat.KEY_HEIGHT) else 0
+            val actualResolution = if (vWidth > 0 && vHeight > 0) "${vWidth}x${vHeight}" else "Original Video"
+
+            var actualVideoBitrateKbps = if (videoFormat.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                (videoFormat.getInteger(MediaFormat.KEY_BIT_RATE) / 1000).coerceAtLeast(0)
+            } else 0
+            if (actualVideoBitrateKbps <= 0) {
+                val mmr = MediaMetadataRetriever()
+                try {
+                    mmr.setDataSource(sourceVideoFile.absolutePath)
+                    val overallBps = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
+                    if (overallBps > 0L) {
+                        actualVideoBitrateKbps = (overallBps / 1000L).toInt().coerceAtLeast(1)
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { mmr.release() } catch (_: Exception) {}
+                }
             }
 
-            // Encode PCM WAV -> AAC-LC
-            val sampleRate = pcmBuf.sampleRateHz.coerceIn(16000, 48000)
-            val aacFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
+            // Prepare streaming WAV PCM reader positioned directly at 'data' chunk offset
+            wavStream = FileInputStream(dubbedWavFile)
+            var skipRem = wavHdr.dataOffsetBytes
+            while (skipRem > 0L) {
+                val s = wavStream.skip(skipRem)
+                if (s <= 0L) {
+                    if (wavStream.read() == -1) {
+                        return Result.failure(IllegalStateException("Unexpected EOF seeking WAV PCM payload."))
+                    }
+                    skipRem -= 1L
+                } else {
+                    skipRem -= s
+                }
+            }
+
+            val sampleRate = wavHdr.sampleRateHz.coerceIn(16000, 48000)
+            val audioChannels = wavHdr.channels.coerceIn(1, 2)
+            val bytesPerFrame = audioChannels * 2
+
+            val aacFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, audioChannels).apply {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                 setInteger(MediaFormat.KEY_BIT_RATE, audioBitrateKbps.coerceIn(64, 320) * 1000)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
@@ -558,71 +947,6 @@ object AudioDspEngine {
             aacEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
             aacEncoder.configure(aacFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             aacEncoder.start()
-
-            // First encode all AAC frames in memory along with presentation timestamps and output MediaFormat
-            data class EncodedPacket(val bytes: ByteArray, val ptsUs: Long, val flags: Int)
-            val encodedAudioPackets = mutableListOf<EncodedPacket>()
-            var encodedAudioFormat: MediaFormat? = null
-
-            val pcmBytes = ByteBuffer.allocate(pcmBuf.samples.size * 2)
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .apply { asShortBuffer().put(pcmBuf.samples) }
-                .array()
-
-            val info = MediaCodec.BufferInfo()
-            var byteOffset = 0
-            var inputDone = false
-            var outputDone = false
-            var loops = 0
-
-            while (!outputDone && loops < 200_000) {
-                loops++
-                if (!inputDone) {
-                    val inIdx = aacEncoder.dequeueInputBuffer(10_000L)
-                    if (inIdx >= 0) {
-                        val inBuf = aacEncoder.getInputBuffer(inIdx)
-                        if (inBuf != null) {
-                            inBuf.clear()
-                            val remaining = pcmBytes.size - byteOffset
-                            if (remaining <= 0) {
-                                aacEncoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                inputDone = true
-                            } else {
-                                val chunkLen = min(remaining, min(inBuf.capacity(), 4096))
-                                val ptsUs = ((byteOffset / 2L) * 1_000_000L) / sampleRate
-                                inBuf.put(pcmBytes, byteOffset, chunkLen)
-                                aacEncoder.queueInputBuffer(inIdx, 0, chunkLen, ptsUs, 0)
-                                byteOffset += chunkLen
-                            }
-                        }
-                    }
-                }
-
-                val outIdx = aacEncoder.dequeueOutputBuffer(info, 10_000L)
-                when {
-                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        encodedAudioFormat = aacEncoder.outputFormat
-                    }
-                    outIdx >= 0 -> {
-                        val outBuf = aacEncoder.getOutputBuffer(outIdx)
-                        if (outBuf != null && info.size > 0 && (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                            outBuf.position(info.offset)
-                            outBuf.limit(info.offset + info.size)
-                            val packetData = ByteArray(info.size)
-                            outBuf.get(packetData)
-                            encodedAudioPackets.add(EncodedPacket(packetData, info.presentationTimeUs, info.flags))
-                        }
-                        aacEncoder.releaseOutputBuffer(outIdx, false)
-                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            outputDone = true
-                        }
-                    }
-                }
-            }
-
-            if (encodedAudioFormat == null || encodedAudioPackets.isEmpty()) {
-                return Result.failure(IllegalStateException("AAC audio encoding produced no output frames."))
-            }
 
             outputMp4File.parentFile?.mkdirs()
             if (outputMp4File.exists()) outputMp4File.delete()
@@ -634,73 +958,212 @@ object AudioDspEngine {
                     muxer.setOrientationHint(rotationDegrees)
                 }
             }
-            val muxVideoTrack = muxer.addTrack(videoFormat)
-            val muxAudioTrack = muxer.addTrack(encodedAudioFormat)
-            muxer.start()
 
-            // Copy video samples directly (lossless video passthrough)
             videoExtractor.selectTrack(videoTrackIndex)
             val maxVideoBufSize = if (videoFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
                 videoFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceAtLeast(256 * 1024)
             } else {
-                1024 * 1024
+                512 * 1024
             }
             val videoBuf = ByteBuffer.allocate(maxVideoBufSize)
             val videoInfo = MediaCodec.BufferInfo()
+            val pcmReadChunk = ByteArray(4096)
+            val aacInfo = MediaCodec.BufferInfo()
+
+            var muxVideoTrack = -1
+            var muxAudioTrack = -1
+            var remainingWavBytes = wavHdr.dataByteSize
+            var framesFed = 0L
+            var audioInputDone = false
+            var audioOutputDone = false
+            var videoDone = false
+
             var writtenVideoFrames = 0
-            while (true) {
-                videoBuf.clear()
-                val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
-                if (sampleSize < 0) break
-                videoInfo.offset = 0
-                videoInfo.size = sampleSize
-                videoInfo.presentationTimeUs = videoExtractor.sampleTime
-                videoInfo.flags = videoExtractor.sampleFlags
-                muxer.writeSampleData(muxVideoTrack, videoBuf, videoInfo)
-                writtenVideoFrames++
-                videoExtractor.advance()
-            }
-            if (writtenVideoFrames <= 0) {
-                return Result.failure(IllegalStateException("Source video track yielded 0 readable video frames."))
+            var writtenAudioFrames = 0
+            var videoStartPtsUs = -1L
+            var videoEndPtsUs = 0L
+            var audioStartPtsUs = -1L
+            var audioEndPtsUs = 0L
+
+            // Bounded helper: writes up to [maxPackets] video passthrough packets whose PTS <= targetPtsUs
+            fun pumpVideoUpTo(targetPtsUs: Long) {
+                if (videoDone || !muxerStarted || muxVideoTrack < 0) return
+                var pumped = 0
+                while (!videoDone && pumped < 16) {
+                    val nextPts = videoExtractor.sampleTime
+                    if (nextPts < 0L) {
+                        videoDone = true
+                        break
+                    }
+                    if (targetPtsUs != Long.MAX_VALUE && nextPts > targetPtsUs) {
+                        break
+                    }
+                    videoBuf.clear()
+                    val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
+                    if (sampleSize < 0) {
+                        videoDone = true
+                        break
+                    }
+                    videoInfo.offset = 0
+                    videoInfo.size = sampleSize
+                    videoInfo.presentationTimeUs = nextPts
+                    videoInfo.flags = videoExtractor.sampleFlags
+                    muxer!!.writeSampleData(muxVideoTrack, videoBuf, videoInfo)
+                    if (videoStartPtsUs < 0L) videoStartPtsUs = nextPts
+                    if (nextPts > videoEndPtsUs) videoEndPtsUs = nextPts
+                    writtenVideoFrames++
+                    videoExtractor.advance()
+                    pumped++
+                }
             }
 
-            // Write encoded dubbed AAC audio samples
-            val audioInfo = MediaCodec.BufferInfo()
-            for (pkt in encodedAudioPackets) {
-                audioInfo.offset = 0
-                audioInfo.size = pkt.bytes.size
-                audioInfo.presentationTimeUs = pkt.ptsUs
-                audioInfo.flags = pkt.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM.inv()
-                muxer.writeSampleData(muxAudioTrack, ByteBuffer.wrap(pkt.bytes), audioInfo)
+            // Streaming loop: feed small PCM chunks -> drain AAC directly to MediaMuxer -> interleave video packets
+            var safetyLoops = 0
+            while (!audioOutputDone && safetyLoops < 500_000) {
+                safetyLoops++
+                if (!audioInputDone) {
+                    val inIdx = aacEncoder.dequeueInputBuffer(10_000L)
+                    if (inIdx >= 0) {
+                        val inBuf = aacEncoder.getInputBuffer(inIdx)
+                        if (inBuf != null) {
+                            inBuf.clear()
+                            if (remainingWavBytes <= 0L) {
+                                aacEncoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                audioInputDone = true
+                            } else {
+                                val maxBytes = min(remainingWavBytes, min(inBuf.capacity().toLong(), pcmReadChunk.size.toLong())).toInt()
+                                val alignedReq = (maxBytes / bytesPerFrame) * bytesPerFrame
+                                val read = if (alignedReq > 0) wavStream.read(pcmReadChunk, 0, alignedReq) else -1
+                                if (read <= 0) {
+                                    aacEncoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                    audioInputDone = true
+                                } else {
+                                    val validRead = (read / bytesPerFrame) * bytesPerFrame
+                                    val ptsUs = (framesFed * 1_000_000L) / sampleRate.toLong()
+                                    inBuf.put(pcmReadChunk, 0, validRead)
+                                    aacEncoder.queueInputBuffer(inIdx, 0, validRead, ptsUs, 0)
+                                    framesFed += (validRead / bytesPerFrame).toLong()
+                                    remainingWavBytes -= validRead.toLong()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val outIdx = aacEncoder.dequeueOutputBuffer(aacInfo, 10_000L)
+                when {
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        if (!muxerStarted) {
+                            val encodedAudioFormat = aacEncoder.outputFormat
+                            muxVideoTrack = muxer.addTrack(videoFormat)
+                            muxAudioTrack = muxer.addTrack(encodedAudioFormat)
+                            muxer.start()
+                            muxerStarted = true
+                        }
+                    }
+                    outIdx >= 0 -> {
+                        val outBuf = aacEncoder.getOutputBuffer(outIdx)
+                        val isCodecConfig = (aacInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                        if (outBuf != null && aacInfo.size > 0 && !isCodecConfig && muxerStarted) {
+                            outBuf.position(aacInfo.offset)
+                            outBuf.limit(aacInfo.offset + aacInfo.size)
+                            val cleanFlags = aacInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM.inv()
+                            val writeInfo = MediaCodec.BufferInfo().apply {
+                                set(aacInfo.offset, aacInfo.size, aacInfo.presentationTimeUs, cleanFlags)
+                            }
+                            // Interleave video packets up to this audio PTS so container stays interleaved
+                            pumpVideoUpTo(aacInfo.presentationTimeUs)
+                            muxer.writeSampleData(muxAudioTrack, outBuf, writeInfo)
+                            if (audioStartPtsUs < 0L) audioStartPtsUs = aacInfo.presentationTimeUs
+                            if (aacInfo.presentationTimeUs > audioEndPtsUs) audioEndPtsUs = aacInfo.presentationTimeUs
+                            writtenAudioFrames++
+                        }
+                        aacEncoder.releaseOutputBuffer(outIdx, false)
+                        if ((aacInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            audioOutputDone = true
+                        }
+                    }
+                }
+            }
+
+            if (!muxerStarted || writtenAudioFrames <= 0) {
+                if (outputMp4File.exists()) outputMp4File.delete()
+                return Result.failure(IllegalStateException("AAC audio encoding produced no output frames."))
+            }
+
+            // Drain any remaining video passthrough packets after audio finishes
+            while (!videoDone) {
+                pumpVideoUpTo(Long.MAX_VALUE)
+            }
+
+            if (writtenVideoFrames <= 0) {
+                if (outputMp4File.exists()) outputMp4File.delete()
+                return Result.failure(IllegalStateException("Source video track yielded 0 readable video frames."))
             }
 
             muxer.stop()
             muxer.release()
             muxer = null
+            muxerStarted = false
 
             if (!outputMp4File.exists() || outputMp4File.length() == 0L) {
+                if (outputMp4File.exists()) outputMp4File.delete()
                 return Result.failure(IllegalStateException("MP4 muxer finished without writing a valid output file."))
             }
 
-            Result.success(outputMp4File)
+            val videoDurMs = if (videoStartPtsUs >= 0L) {
+                ((videoEndPtsUs - videoStartPtsUs).coerceAtLeast(0L) / 1000L).takeIf { it > 0L }
+                    ?: (if (videoFormat.containsKey(MediaFormat.KEY_DURATION)) videoFormat.getLong(MediaFormat.KEY_DURATION) / 1000L else wavHdr.durationMs)
+            } else wavHdr.durationMs
+            val audioDurMs = if (audioStartPtsUs >= 0L) {
+                // Add one AAC frame duration (~1024 samples) to last packet PTS for accurate total track span
+                val aacFrameUs = (1024L * 1_000_000L) / sampleRate.toLong()
+                (((audioEndPtsUs + aacFrameUs) - audioStartPtsUs).coerceAtLeast(0L) / 1000L)
+            } else wavHdr.durationMs
+
+            Result.success(
+                Mp4MuxMetadata(
+                    outputFile = outputMp4File,
+                    videoCodec = videoCodecLabel,
+                    videoResolution = actualResolution,
+                    videoBitrateKbpsActual = actualVideoBitrateKbps,
+                    videoPassthrough = true,
+                    audioCodec = "AAC-LC",
+                    audioSampleRateHz = sampleRate,
+                    audioChannels = audioChannels,
+                    videoDurationMs = videoDurMs,
+                    audioDurationMs = audioDurMs,
+                    videoStartPtsUs = videoStartPtsUs.coerceAtLeast(0L),
+                    audioStartPtsUs = audioStartPtsUs.coerceAtLeast(0L),
+                    videoEndPtsUs = videoEndPtsUs,
+                    audioEndPtsUs = audioEndPtsUs,
+                    writtenVideoFrames = writtenVideoFrames,
+                    writtenAudioFrames = writtenAudioFrames
+                )
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "MP4 video muxing failed", e)
-            if (outputMp4File.exists()) outputMp4File.delete()
+            Log.e(TAG, "Streaming MP4 video muxing failed", e)
+            if (outputMp4File.exists()) {
+                runCatching { outputMp4File.delete() }
+            }
             Result.failure(IllegalStateException("MP4 muxing failed: ${e.localizedMessage ?: "Unsupported video container"}"))
         } finally {
+            try { wavStream?.close() } catch (_: Exception) {}
             try {
                 aacEncoder?.stop()
                 aacEncoder?.release()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
+            try {
+                if (muxerStarted) {
+                    muxer?.stop()
+                }
+            } catch (_: Exception) {}
             try {
                 muxer?.release()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
             try {
                 videoExtractor.release()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
         }
     }
 

@@ -404,34 +404,71 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun verifyDirectGeminiApiErrorClassificationAndModelNormalization() {
+    fun verifyDirectGeminiApiErrorClassificationAndActiveModelValidation() {
+        // Blank/null resolves to current active default (gemini-3.8-flash)
         assertEquals(
-            "gemini-2.5-flash",
-            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("gemini-3.8-flash")
-        )
-        assertEquals(
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
             com.example.data.remote.DirectGeminiApiClient.normalizeModelName("")
         )
         assertEquals(
-            "gemini-2.5-pro",
-            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("models/gemini-2.5-pro")
+            "gemini-3.8-flash",
+            com.example.data.remote.DirectGeminiApiClient.normalizeModelName(null)
         )
+        // Newer models are NEVER silently rewritten back to outdated models
+        assertEquals(
+            "gemini-3.8-flash",
+            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("gemini-3.8-flash")
+        )
+        assertEquals(
+            "gemini-4-argon",
+            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("models/gemini-4-argon")
+        )
+        assertEquals(
+            "gemini-4-carbon",
+            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("gemini-4-carbon")
+        )
+
+        // Active 2026 models validate cleanly
+        for (opt in com.example.data.remote.DirectGeminiApiClient.SUPPORTED_MODELS) {
+            val res = com.example.data.remote.DirectGeminiApiClient.validateModelSelection(opt.modelId)
+            assertTrue("Expected active model ${opt.modelId} to validate", res.isSuccess)
+            assertEquals(opt.modelId, res.getOrThrow())
+        }
+
+        // Retired / deprecated / invalid model IDs are explicitly rejected
+        val retired25 = com.example.data.remote.DirectGeminiApiClient.validateModelSelection("gemini-2.5-flash")
+        assertTrue("Retired gemini-2.5-flash must be rejected", retired25.isFailure)
+        val retired20 = com.example.data.remote.DirectGeminiApiClient.validateModelSelection("gemini-2.0-flash")
+        assertTrue("Retired gemini-2.0-flash must be rejected", retired20.isFailure)
+        val bogusModel = com.example.data.remote.DirectGeminiApiClient.validateModelSelection("gemini-99-fake")
+        assertTrue("Unsupported model ID must be rejected", bogusModel.isFailure)
 
         val invalidKey = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(
             httpCode = 400,
             responseBody = """{"error":{"message":"API_KEY_INVALID: API key not valid."}}"""
         )
         assertEquals(com.example.data.remote.GeminiErrorKind.INVALID_API_KEY, invalidKey.kind)
+        assertEquals(
+            com.example.data.remote.GeminiConnectionState.AUTH_FAILED,
+            com.example.data.remote.DirectGeminiApiClient.mapErrorToConnectionState(invalidKey.kind)
+        )
 
         val unauthorized = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(403, "PERMISSION_DENIED: invalid api key")
         assertEquals(com.example.data.remote.GeminiErrorKind.INVALID_API_KEY, unauthorized.kind)
 
         val missingModel = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(404, "Model not found")
         assertEquals(com.example.data.remote.GeminiErrorKind.MODEL_NOT_FOUND, missingModel.kind)
+        assertEquals(
+            com.example.data.remote.GeminiConnectionState.MODEL_UNAVAILABLE,
+            com.example.data.remote.DirectGeminiApiClient.mapErrorToConnectionState(missingModel.kind)
+        )
 
         val rateLimited = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(429, "Too many requests, please retry")
         assertEquals(com.example.data.remote.GeminiErrorKind.RATE_LIMITED, rateLimited.kind)
+        assertEquals(
+            com.example.data.remote.GeminiConnectionState.QUOTA_OR_RATE_LIMITED,
+            com.example.data.remote.DirectGeminiApiClient.mapErrorToConnectionState(rateLimited.kind)
+        )
 
         val quotaBilling = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(429, "You exceeded your current quota for billing project")
         assertEquals(com.example.data.remote.GeminiErrorKind.QUOTA_OR_BILLING, quotaBilling.kind)
@@ -452,6 +489,17 @@ class ExampleUnitTest {
             "I trusted you, Captain!"
         )
         assertTrue("Intentional pure English dialogue must pass: ${validEnglish.issueSummary}", validEnglish.isValid)
+
+        // Common English words that look like Hindi ('main', 'do', 'log', 'mat', 'bas') must NOT false-positive
+        val englishMainDo = com.example.engine.MixedScriptLanguageEngine.validateMixedScript(
+            "This is the main plan we need to do before we log out."
+        )
+        assertTrue("English words 'main'/'do'/'log' must not false-positive: ${englishMainDo.issueSummary}", englishMainDo.isValid)
+
+        val mixedWithMainDo = com.example.engine.MixedScriptLanguageEngine.validateMixedScript(
+            "यह हमारा main mission है, do not give up!"
+        )
+        assertTrue("Mixed-script with English 'main' and 'do' must pass: ${mixedWithMainDo.issueSummary}", mixedWithMainDo.isValid)
 
         val invalidRoman = com.example.engine.MixedScriptLanguageEngine.validateMixedScript(
             "Mujhe tumhare saath jaana hai, lekin abhi time nahi hai."
@@ -619,5 +667,186 @@ class ExampleUnitTest {
         val f5 = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.first { it.engineId == "F5-Hindi-24KHz" }
         assertEquals(false, f5.isSupportedOnAndroid)
     }
+
+    @Test
+    fun verifyDictionaryImportDeduplicationNormalizationAndIdPreservation() {
+        val existing = listOf(
+            DictionaryEntryEntity(
+                id = 42L,
+                dictionaryLevel = "GLOBAL",
+                japaneseSourceTerm = "先輩",
+                preferredMixedScript = "सीनियर",
+                preferredRomanHinglish = "सीनियर",
+                preferredHindiWording = "सीनियर",
+                preferredEnglishWording = "Senior",
+                pronunciationGuidance = "Senior",
+                contextNotes = "Original"
+            ),
+            DictionaryEntryEntity(
+                id = 77L,
+                dictionaryLevel = "PROJECT",
+                projectId = 5L,
+                japaneseSourceTerm = "領域展開",
+                preferredMixedScript = "Domain Expansion",
+                preferredRomanHinglish = "Domain Expansion",
+                preferredHindiWording = "",
+                preferredEnglishWording = "Domain Expansion",
+                pronunciationGuidance = "Domain Expansion",
+                contextNotes = "Unchanged"
+            )
+        )
+
+        val incoming = listOf(
+            // 1. Exact duplicate of existing id=77 with trailing punctuation/whitespace -> SKIPPED
+            DictionaryEntryEntity(
+                dictionaryLevel = "PROJECT",
+                projectId = 5L,
+                japaneseSourceTerm = "  領域展開！ ",
+                preferredMixedScript = "Domain Expansion",
+                preferredRomanHinglish = "Domain Expansion",
+                preferredHindiWording = "",
+                preferredEnglishWording = "Domain Expansion",
+                pronunciationGuidance = "Domain Expansion",
+                contextNotes = "Unchanged"
+            ),
+            // 2. Same normalized key as id=42 with updated pronunciation -> UPDATED preserving id=42
+            DictionaryEntryEntity(
+                dictionaryLevel = "GLOBAL",
+                japaneseSourceTerm = "先輩。",
+                preferredMixedScript = "सेनपाई",
+                preferredRomanHinglish = "सेनपाई",
+                preferredHindiWording = "सेनपाई",
+                preferredEnglishWording = "Senpai",
+                pronunciationGuidance = "Sen-pai",
+                contextNotes = "Updated"
+            ),
+            // 3. Brand new term -> IMPORTED (first occurrence)
+            DictionaryEntryEntity(
+                dictionaryLevel = "GLOBAL",
+                japaneseSourceTerm = "呪術",
+                preferredMixedScript = "Jujutsu",
+                preferredRomanHinglish = "Jujutsu",
+                preferredHindiWording = "",
+                preferredEnglishWording = "Jujutsu",
+                pronunciationGuidance = "Joo-joot-soo",
+                contextNotes = "First copy"
+            ),
+            // 4. Duplicate of #3 inside the SAME import batch -> deduplicated (no duplicate insert!)
+            DictionaryEntryEntity(
+                dictionaryLevel = "GLOBAL",
+                japaneseSourceTerm = "  呪術  ",
+                preferredMixedScript = "Jujutsu",
+                preferredRomanHinglish = "Jujutsu",
+                preferredHindiWording = "",
+                preferredEnglishWording = "Jujutsu",
+                pronunciationGuidance = "Joo-joot-soo",
+                contextNotes = "First copy"
+            ),
+            // 5. Invalid entry missing projectId for PROJECT scope -> FAILED
+            DictionaryEntryEntity(
+                dictionaryLevel = "PROJECT",
+                projectId = null,
+                japaneseSourceTerm = "魔法",
+                preferredMixedScript = "Magic",
+                preferredRomanHinglish = "Magic",
+                preferredHindiWording = "",
+                preferredEnglishWording = "Magic",
+                pronunciationGuidance = "",
+                contextNotes = ""
+            )
+        )
+
+        val plan = com.example.engine.MixedScriptLanguageEngine.planDictionaryImport(
+            incomingEntries = incoming,
+            existingEntries = existing
+        )
+        assertEquals("Only 1 unique new entry should be inserted", 1, plan.toInsert.size)
+        assertEquals("Existing id=42 should be updated in place", 1, plan.toUpdate.size)
+        assertEquals("Updated record MUST preserve existing DB id=42", 42L, plan.toUpdate.first().id)
+        assertEquals("Expected 2 skipped (1 existing unchanged + 1 in-batch duplicate)", 2, plan.skippedCount)
+        assertEquals("Expected 1 failed (missing projectId)", 1, plan.failedCount)
+    }
+
+    @Test
+    fun verifyStreamingWavInspectionValidationAndStrictFinalVerificationChecks() {
+        val tempDir = java.nio.file.Files.createTempDirectory("stream_wav_test").toFile()
+        try {
+            val sr = 24000
+            val tone = ShortArray(sr) { i ->
+                (sin(2.0 * PI * 330.0 * (i.toDouble() / sr)) * 12000).toInt().toShort()
+            }
+            val sourceWav = java.io.File(tempDir, "master_24k.wav")
+            AudioDspEngine.writeWavFile(sourceWav, PcmAudioBuffer(tone, sr, 1))
+
+            val strict = AudioDspEngine.validateAudioFileStrict(sourceWav).getOrThrow()
+            assertEquals(sr, strict.sampleRateHz)
+            assertEquals(1, strict.channels)
+            assertTrue("Expected audible non-silent WAV (rms=${strict.rmsDbfs} dBFS)", strict.rmsDbfs > -55.0f)
+
+            // Same-rate WAV export must perform direct lossless copy (wasResampled = false)
+            val copyWav = java.io.File(tempDir, "export_24k.wav")
+            val copyMeta = AudioDspEngine.exportWavWithMetadata(sourceWav, copyWav, 24000).getOrThrow()
+            assertEquals(false, copyMeta.wasResampled)
+            assertEquals(24000, copyMeta.sampleRateHz)
+
+            // Different-rate WAV export must honestly report wasResampled = true
+            val resampledWav = java.io.File(tempDir, "export_48k.wav")
+            val resampledMeta = AudioDspEngine.exportWavWithMetadata(sourceWav, resampledWav, 48000).getOrThrow()
+            assertEquals(true, resampledMeta.wasResampled)
+            assertEquals(48000, resampledMeta.sampleRateHz)
+
+            // FinalVerificationAgent must FAIL when dialogues list is empty even if background master WAV is audible!
+            val emptyDialoguesReport = com.example.engine.FinalVerificationAgent.verifyExportedOutput(
+                outputFile = copyWav,
+                exportFormat = "WAV_AUDIO_ONLY",
+                expectedDurationMs = 1000L,
+                dialogues = emptyList(),
+                subtitleFiles = emptyList(),
+                requireDubbedDialogues = true
+            )
+            assertEquals(
+                "Background-only export with zero dubbed dialogues must FAIL verification",
+                false,
+                emptyDialoguesReport.passed
+            )
+
+            // FinalVerificationAgent must FAIL when a dialogue points to a corrupt WAV even though File.exists() is true
+            val corruptDlgWav = java.io.File(tempDir, "corrupt_dlg.wav")
+            corruptDlgWav.writeBytes(ByteArray(512) { 0x55 })
+            val corruptDlg = com.example.data.local.DialogueSegmentEntity(
+                id = 1L,
+                episodeId = 1L,
+                globalOrderNumber = 1,
+                dialogueId = "A-001",
+                speakerLabel = "A",
+                originalStartMs = 0L,
+                originalEndMs = 1000L,
+                originalDurationMs = 1000L,
+                transcriptSegmentId = 1L,
+                japaneseText = "行くぞ！",
+                romanHinglishText = "चलो चलते हैं!",
+                ttsNormalizedText = "चलो चलते हैं!",
+                generatedAudioPath = corruptDlgWav.absolutePath,
+                actualGeneratedDurationMs = 1000L,
+                timelineStartMs = 0L
+            )
+            val corruptDlgReport = com.example.engine.FinalVerificationAgent.verifyExportedOutput(
+                outputFile = copyWav,
+                exportFormat = "WAV_AUDIO_ONLY",
+                expectedDurationMs = 1000L,
+                dialogues = listOf(corruptDlg),
+                subtitleFiles = emptyList(),
+                requireDubbedDialogues = true
+            )
+            assertEquals(
+                "Corrupt dialogue WAV must FAIL strict decode check (never pass on File.exists())",
+                false,
+                corruptDlgReport.passed
+            )
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }
+
 

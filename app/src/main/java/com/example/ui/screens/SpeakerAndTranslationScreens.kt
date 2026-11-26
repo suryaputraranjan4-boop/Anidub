@@ -67,6 +67,7 @@ import com.example.ui.components.StudioEmptyState
 import com.example.ui.components.StudioSectionHeader
 import com.example.ui.components.WarningBanner
 import com.example.ui.components.speakerAccentColor
+import com.example.ui.components.statusColorFor
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.StudioAmber
 import com.example.ui.theme.StudioBorder
@@ -317,6 +318,7 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
     val banner by viewModel.pipelineBanner.collectAsState()
     val config by viewModel.studioConfig.collectAsState()
     val geminiKeyState by viewModel.geminiKeyState.collectAsState()
+    val geminiConnectionState by viewModel.geminiConnectionState.collectAsState()
 
     var subMode by remember { mutableStateOf("TRANSLATIONS") } // TRANSLATIONS or DICTIONARIES
     var dialogueSearchQuery by remember { mutableStateOf("") }
@@ -794,8 +796,8 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                         }
                         Spacer(modifier = Modifier.width(8.dp))
                         StatusPill(
-                            text = if (geminiKeyState.isConfigured) "API READY" else "KEY NEEDED",
-                            color = if (geminiKeyState.isConfigured) StudioEmerald else StudioAmber
+                            text = geminiConnectionState.pillLabel,
+                            color = statusColorFor(geminiConnectionState.name)
                         )
                     }
                     if (!geminiKeyState.isConfigured) {

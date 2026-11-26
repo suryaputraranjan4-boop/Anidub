@@ -173,10 +173,12 @@ fun StatusPill(
 }
 
 fun statusColorFor(status: String): Color = when (status.uppercase()) {
-    "COMPLETED", "PASSED", "INSTALLED", "VERIFIED", "READY", "SYNCED", "SUCCESS", "BUILT_IN" -> StudioEmerald
-    "RUNNING", "DOWNLOADING", "DOWNLOADED", "VERIFYING", "LOADING", "PROCESSING", "TRANSLATED", "GENERATED", "RETRIED" -> StudioCyan
-    "WARNING", "PENDING", "WAITING", "PAUSED_CHECKPOINT", "UNSUPPORTED_ON_ANDROID" -> StudioAmber
-    "FAILED", "ERROR", "CORRUPTED", "BLOCKED" -> StudioCrimson
+    "COMPLETED", "PASSED", "INSTALLED", "VERIFIED", "VERIFIED_CONNECTED", "READY", "SYNCED", "SUCCESS", "BUILT_IN" -> StudioEmerald
+    "RUNNING", "TESTING", "DOWNLOADING", "DOWNLOADED", "VERIFYING", "LOADING", "PROCESSING", "TRANSLATED", "GENERATED", "RETRIED" -> StudioCyan
+    "WARNING", "PARTIAL", "CANCELLED", "SKIPPED", "UNSUPPORTED", "PENDING", "WAITING", "PAUSED_CHECKPOINT",
+    "UNSUPPORTED_ON_ANDROID", "NOT_CONFIGURED", "KEY_SAVED_UNVERIFIED", "API_KEY_SAVED_UNVERIFIED" -> StudioAmber
+    "FAILED", "ERROR", "CORRUPTED", "BLOCKED", "AUTH_FAILED", "QUOTA_OR_RATE_LIMITED",
+    "NETWORK_UNAVAILABLE", "MODEL_UNAVAILABLE", "VERIFICATION_FAILED" -> StudioCrimson
     else -> StudioTextMuted
 }
 
@@ -313,11 +315,14 @@ fun ActiveContextBar(
 ) {
     if (episode == null) return
     val completedCount = (1..14).count { (episode.completedStagesMask and (1 shl it)) != 0 }
-    val hasError = episode.pipelineStatus == "ERROR" || !episode.lastErrorMessage.isNullOrBlank()
+    val hasError = episode.pipelineStatus in setOf("ERROR", "FAILED") || !episode.lastErrorMessage.isNullOrBlank()
+    val isPartialOrCancelled = episode.pipelineStatus in setOf("PARTIAL", "CANCELLED")
     val statusColor = when {
-        hasError -> StudioCrimson
+        hasError && !isPartialOrCancelled -> StudioCrimson
+        isPartialOrCancelled -> StudioAmber
         episode.pipelineStatus == "RUNNING" -> StudioCyan
-        completedCount >= 13 -> StudioEmerald
+        completedCount >= 14 -> StudioEmerald
+        completedCount >= 13 && !hasError -> StudioEmerald
         else -> StudioAmber
     }
 
@@ -327,7 +332,14 @@ fun ActiveContextBar(
             .clickable(onClick = onSwitchProject),
         color = StudioSurface,
         shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, if (hasError) StudioCrimson.copy(alpha = 0.45f) else StudioBorderSubtle)
+        border = BorderStroke(
+            1.dp,
+            when {
+                hasError && !isPartialOrCancelled -> StudioCrimson.copy(alpha = 0.45f)
+                isPartialOrCancelled -> StudioAmber.copy(alpha = 0.45f)
+                else -> StudioBorderSubtle
+            }
+        )
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),

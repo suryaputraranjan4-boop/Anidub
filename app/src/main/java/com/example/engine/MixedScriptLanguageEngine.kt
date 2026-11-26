@@ -1,8 +1,22 @@
 package com.example.engine
 
 import com.example.data.local.DictionaryEntryEntity
+import java.text.Normalizer
 import java.util.Locale
 import java.util.regex.Pattern
+
+data class DictionaryImportPlan(
+    val toInsert: List<DictionaryEntryEntity>,
+    val toUpdate: List<DictionaryEntryEntity>,
+    val importedCount: Int,
+    val updatedCount: Int,
+    val skippedCount: Int,
+    val failedCount: Int,
+    val warnings: List<String> = emptyList()
+) {
+    val totalProcessed: Int
+        get() = importedCount + updatedCount + skippedCount + failedCount
+}
 
 data class MixedScriptValidationResult(
     val isValid: Boolean,
@@ -41,40 +55,42 @@ object MixedScriptLanguageEngine {
     fun containsDevanagari(text: String): Boolean = DEVANAGARI_REGEX.containsMatchIn(text)
 
     /**
-     * High-precision lexicon of unmistakable Romanized Hindi words (excluding words that are also
-     * common valid English words like "main", "to", "in", "on", "me", "is", "are", "he", "we", "or",
-     * "so", "no", "go", "do", "us", "as", "at", "by", "up", "if", "it", "hi", "hum", "bar", "bus", "car").
-     * Used strictly to detect Romanized Hindi leaks without false-flagging genuine English sentences.
+     * High-precision lexicon of unmistakable Romanized Hindi words.
+     * STRICT EXCLUSION RULE: Every word that is also a valid English word or common abbreviation
+     * (e.g., "main", "do", "to", "in", "on", "me", "is", "are", "he", "we", "or", "so", "no", "go",
+     * "us", "as", "at", "by", "up", "if", "it", "hi", "hum", "bar", "bus", "car", "par", "ab", "lo",
+     * "log", "mat", "din", "hun", "bas", "kon", "rok", "chal") is STRICTLY EXCLUDED here so valid
+     * English or mixed-script sentences NEVER trigger false positives.
      */
     private val UNAMBIGUOUS_ROMAN_HINDI_WORDS = setOf(
         "mujhe", "mujko", "mujhko", "tumhe", "tumhein", "tumhen", "tumhara", "tumhari", "tumhare",
         "tumne", "tumko", "tumse", "tujhe", "tujhko", "tujhse", "tum", "aap", "aapka", "aapki", "aapke",
         "aapko", "aapne", "hamara", "hamari", "hamare", "humko", "humne", "humse", "humein", "hume",
-        "mera", "meri", "mere", "maine", "mera", "tera", "teri", "tere", "uska", "uski", "uske", "usne",
+        "mera", "meri", "mere", "maine", "tera", "teri", "tere", "uska", "uski", "uske", "usne",
         "usko", "unka", "unki", "unke", "unhone", "unko", "apna", "apni", "apne", "khud",
-        "nahi", "nahin", "nhi", "nahee", "hai", "hain", "tha", "thi", "thee", "hoon", "hun", "hu",
+        "nahi", "nahin", "nhi", "nahee", "hai", "hain", "tha", "thi", "thee", "hoon",
         "kya", "kyaa", "kyun", "kyon", "kyunki", "kyonki", "kaise", "kaisa", "kaisi", "kahan", "kaha",
-        "kahaan", "kaun", "kon", "kab", "kitna", "kitni", "kitne", "kidhar",
-        "abhi", "ab", "phir", "fir", "bahut", "bohot", "boht", "bilkul", "sirf", "bas", "zyada", "jyada",
+        "kahaan", "kaun", "kab", "kitna", "kitni", "kitne", "kidhar",
+        "abhi", "phir", "fir", "bahut", "bohot", "boht", "bilkul", "sirf", "zyada", "jyada",
         "thoda", "thodi", "thode", "saath", "sath", "paas", "baad", "pehle", "pahle", "andar", "bahar",
         "upar", "neeche", "niche", "yahan", "yaha", "wahan", "waha", "idhar", "udhar",
         "jaana", "jana", "jao", "jaao", "jaa", "gaya", "gayi", "gaye", "aana", "aao", "aaya", "aayi", "aaye",
-        "karna", "karni", "karne", "karo", "karta", "karti", "karte", "kiya", "kiye", "ki", "raha", "rahi", "rahe",
+        "karna", "karni", "karne", "karo", "karta", "karti", "karte", "kiya", "kiye", "raha", "rahi", "rahe",
         "hona", "hota", "hoti", "hote", "hoga", "hogi", "honge", "hua", "hui", "hue",
         "dekhna", "dekho", "dekha", "dekhi", "sunna", "suno", "suna", "bolna", "bolo", "bola", "boli",
         "samajhna", "samjho", "samjha", "samajh", "pata", "batao", "batana", "bataya", "rukna", "ruko", "ruka",
-        "bhaago", "bhago", "chalo", "chal", "chala", "chali", "chale", "milna", "milo", "mila", "mili",
-        "lena", "lo", "liya", "dena", "do", "diya", "dunga", "dungi", "denge", "rakhna", "rakho", "rakha",
+        "bhaago", "bhago", "chalo", "chala", "chali", "chale", "milna", "milo", "mila", "mili",
+        "lena", "liya", "dena", "diya", "dunga", "dungi", "denge", "rakhna", "rakho", "rakha",
         "lagna", "laga", "lagi", "lage", "lagta", "lagti", "sakta", "sakti", "sakte", "chahiye", "chahie",
-        "chahta", "chahti", "chahte", "chahte", "zaroor", "jaroor", "zaroori", "jaroori", "shayad",
+        "chahta", "chahti", "chahte", "zaroor", "jaroor", "zaroori", "jaroori", "shayad",
         "lekin", "magar", "parantu", "isliye", "isiliye", "agar", "jab", "tab", "tak", "bhi", "aur",
-        "yeh", "ye", "woh", "wo", "yahi", "wahi", "sab", "sabhi", "kuch", "kuchh", "koi", "kisi",
+        "yeh", "woh", "yahi", "wahi", "sabhi", "kuch", "kuchh", "koi", "kisi",
         "aisa", "aisi", "aise", "waisa", "waisi", "waise", "jaisa", "jaisi", "jaise",
         "accha", "achha", "achcha", "theek", "thik", "bura", "buri", "galat", "sahi", "sach", "jhooth", "jhoot",
-        "bhai", "yaar", "dost", "haan", "haa", "mat", "shakti", "taaqat", "taqat", "bekaar", "bekar",
+        "bhai", "yaar", "dost", "haan", "haa", "shakti", "taaqat", "taqat", "bekaar", "bekar",
         "jeet", "haar", "haarunga", "harunga", "tayar", "taiyaar", "tayyar", "khatam", "khatm", "madad",
-        "bachao", "rok", "roko", "maarna", "maaro", "mara", "ladna", "lado", "zinda", "marna", "duniya",
-        "samay", "waqt", "raat", "din", "subah", "shaam", "log", "logon", "kaam", "baat", "baatein",
+        "bachao", "roko", "maarna", "maaro", "mara", "ladna", "lado", "zinda", "marna", "duniya",
+        "samay", "waqt", "raat", "subah", "shaam", "logon", "kaam", "baat", "baatein",
         "naam", "jagah", "raasta", "rasta", "ghar", "dil", "dimag", "aankh", "aankhein", "haath"
     )
 
@@ -84,7 +100,8 @@ object MixedScriptLanguageEngine {
      * (prevents false positives on English words like "main character", "to be", "do it").
      */
     private val CONTEXTUAL_ROMAN_HINDI_PARTICLES = setOf(
-        "main", "mein", "se", "ko", "ka", "ke", "pe", "par", "ne", "ho", "na", "toh", "hi", "ek", "do"
+        "main", "mein", "se", "ko", "ka", "ke", "ki", "pe", "par", "ne", "ho", "na", "toh", "hi", "ek", "do",
+        "ab", "lo", "ye", "wo", "sab", "mat", "bas", "din", "log", "hun", "hu"
     )
 
     /**
@@ -402,11 +419,157 @@ INCORRECT EXAMPLES (STRICTLY FORBIDDEN):
     }
 
     /**
-     * Normalizes a dictionary term key for duplicate prevention.
+     * Normalizes a dictionary term key with Unicode NFC, whitespace collapsing,
+     * edge punctuation stripping, and lowercase folding for deterministic duplicate prevention.
      */
+    fun normalizeForComparison(text: String): String {
+        val nfc = Normalizer.normalize(text, Normalizer.Form.NFC)
+        return nfc
+            .trim()
+            .replace(Regex("\\s+"), " ")
+            .trim { it in setOf('.', ',', '!', '?', ':', ';', '"', '\'', '「', '」', '『', '』', '।', '。', '、', '！', '？', '：', '；', '（', '）') }
+            .trim()
+            .lowercase(Locale.US)
+    }
+
     fun normalizedTermKey(japaneseSourceTerm: String, preferredDisplay: String): String {
-        val jp = japaneseSourceTerm.trim().lowercase(Locale.US)
-        return if (jp.isNotEmpty()) jp else preferredDisplay.trim().lowercase(Locale.US)
+        val jp = normalizeForComparison(japaneseSourceTerm)
+        return if (jp.isNotEmpty()) jp else normalizeForComparison(preferredDisplay)
+    }
+
+    fun normalizedCompositeKey(entry: DictionaryEntryEntity): String {
+        val level = entry.dictionaryLevel.trim().uppercase(Locale.US).let {
+            if (it in setOf("PROJECT", "ANIME", "GLOBAL")) it else "GLOBAL"
+        }
+        val scopeBinding = when (level) {
+            "PROJECT" -> "P:${entry.projectId ?: -1L}"
+            "ANIME" -> "A:${normalizeForComparison(entry.animeSeriesName.orEmpty())}"
+            else -> "G"
+        }
+        val termKey = normalizedTermKey(entry.japaneseSourceTerm, preferredDisplayTerm(entry))
+        return "$level|$scopeBinding|$termKey"
+    }
+
+    /**
+     * Deterministic, pure-Kotlin dictionary import planner:
+     * - Normalizes case, whitespace, punctuation, and Unicode NFC.
+     * - Deduplicates repeated entries WITHIN the same import batch AND against existing DB entries
+     *   by updating the in-memory lookup map after every processed entry (fixing stale comparison list bugs).
+     * - Preserves existing DB entry IDs on update, skips identical no-op entries cleanly,
+     *   counts malformed/unscoped entries under `failedCount`, and NEVER deletes existing entries.
+     */
+    fun planDictionaryImport(
+        incomingEntries: List<DictionaryEntryEntity>,
+        existingEntries: List<DictionaryEntryEntity>,
+        malformedObjectCount: Int = 0
+    ): DictionaryImportPlan {
+        val existingByKey = LinkedHashMap<String, DictionaryEntryEntity>()
+        for (ex in existingEntries) {
+            existingByKey[normalizedCompositeKey(ex)] = ex
+        }
+
+        val insertsByKey = LinkedHashMap<String, DictionaryEntryEntity>()
+        val updatesByKey = LinkedHashMap<String, DictionaryEntryEntity>()
+        val warnings = mutableListOf<String>()
+
+        var importedCount = 0
+        var updatedCount = 0
+        var skippedCount = 0
+        var failedCount = malformedObjectCount.coerceAtLeast(0)
+
+        for ((idx, raw) in incomingEntries.withIndex()) {
+            val level = raw.dictionaryLevel.trim().uppercase(Locale.US).let {
+                if (it in setOf("PROJECT", "ANIME", "GLOBAL")) it else "GLOBAL"
+            }
+            val cleanJp = Normalizer.normalize(raw.japaneseSourceTerm, Normalizer.Form.NFC).trim()
+            val cleanMixed = Normalizer.normalize(raw.preferredMixedScript, Normalizer.Form.NFC).trim()
+            val cleanHindi = Normalizer.normalize(raw.preferredHindiWording, Normalizer.Form.NFC).trim()
+            val cleanEnglish = Normalizer.normalize(raw.preferredEnglishWording, Normalizer.Form.NFC).trim()
+            val cleanRoman = Normalizer.normalize(raw.preferredRomanHinglish, Normalizer.Form.NFC).trim()
+            val effectiveDisplay = cleanMixed.ifBlank { cleanHindi.ifBlank { cleanEnglish.ifBlank { cleanRoman } } }
+
+            if (cleanJp.isBlank() && effectiveDisplay.isBlank()) {
+                failedCount++
+                warnings.add("Entry #${idx + 1}: Empty source and preferred wording.")
+                continue
+            }
+            if (level == "PROJECT" && (raw.projectId == null || raw.projectId <= 0L)) {
+                failedCount++
+                warnings.add("Entry #${idx + 1} ('${cleanJp.ifBlank { effectiveDisplay }}'): PROJECT scope requires an active project.")
+                continue
+            }
+            if (level == "ANIME" && raw.animeSeriesName.isNullOrBlank()) {
+                failedCount++
+                warnings.add("Entry #${idx + 1} ('${cleanJp.ifBlank { effectiveDisplay }}'): ANIME scope requires an animeSeriesName.")
+                continue
+            }
+
+            val sanitized = raw.copy(
+                id = 0L,
+                dictionaryLevel = level,
+                projectId = if (level == "PROJECT") raw.projectId else null,
+                animeSeriesName = if (level == "ANIME") Normalizer.normalize(raw.animeSeriesName.orEmpty(), Normalizer.Form.NFC).trim() else null,
+                japaneseSourceTerm = cleanJp,
+                preferredMixedScript = effectiveDisplay,
+                preferredRomanHinglish = cleanRoman.ifBlank { effectiveDisplay },
+                preferredHindiWording = cleanHindi,
+                preferredEnglishWording = cleanEnglish,
+                pronunciationGuidance = Normalizer.normalize(raw.pronunciationGuidance, Normalizer.Form.NFC).trim(),
+                contextNotes = Normalizer.normalize(raw.contextNotes, Normalizer.Form.NFC).trim(),
+                replacementScope = raw.replacementScope.trim().ifBlank { level }
+            )
+
+            val compositeKey = normalizedCompositeKey(sanitized)
+            val existingMatch = existingByKey[compositeKey]
+
+            if (existingMatch != null) {
+                val isIdentical = isSemanticallyEquivalent(existingMatch, sanitized)
+                if (isIdentical) {
+                    skippedCount++
+                } else {
+                    val updatedEntity = sanitized.copy(id = existingMatch.id)
+                    if (existingMatch.id > 0L) {
+                        // Updating an already-persisted DB row (preserve its original ID!)
+                        if (!updatesByKey.containsKey(compositeKey)) {
+                            updatedCount++
+                        } else {
+                            // Repeated entry within the same JSON batch updating the same existing row
+                            skippedCount++
+                        }
+                        updatesByKey[compositeKey] = updatedEntity
+                    } else {
+                        // Repeated entry within the same JSON batch colliding with an earlier new entry
+                        insertsByKey[compositeKey] = updatedEntity
+                        skippedCount++
+                    }
+                    // Immediately update in-memory comparison map so later items compare against latest state!
+                    existingByKey[compositeKey] = updatedEntity
+                }
+            } else {
+                insertsByKey[compositeKey] = sanitized
+                existingByKey[compositeKey] = sanitized
+                importedCount++
+            }
+        }
+
+        return DictionaryImportPlan(
+            toInsert = insertsByKey.values.toList(),
+            toUpdate = updatesByKey.values.toList(),
+            importedCount = importedCount,
+            updatedCount = updatedCount,
+            skippedCount = skippedCount,
+            failedCount = failedCount,
+            warnings = warnings
+        )
+    }
+
+    private fun isSemanticallyEquivalent(a: DictionaryEntryEntity, b: DictionaryEntryEntity): Boolean {
+        return normalizeForComparison(a.japaneseSourceTerm) == normalizeForComparison(b.japaneseSourceTerm) &&
+            normalizeForComparison(preferredDisplayTerm(a)) == normalizeForComparison(preferredDisplayTerm(b)) &&
+            normalizeForComparison(a.preferredHindiWording) == normalizeForComparison(b.preferredHindiWording) &&
+            normalizeForComparison(a.preferredEnglishWording) == normalizeForComparison(b.preferredEnglishWording) &&
+            normalizeForComparison(a.pronunciationGuidance) == normalizeForComparison(b.pronunciationGuidance) &&
+            a.preserveOriginalEnglish == b.preserveOriginalEnglish
     }
 
     /**
