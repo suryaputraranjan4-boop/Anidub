@@ -1,9 +1,11 @@
 package com.example.engine
 
+import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import com.example.data.local.DialogueSegmentEntity
 import java.io.File
+import java.nio.ByteBuffer
 import kotlin.math.abs
 
 data class VerificationCheckItem(
@@ -82,18 +84,22 @@ object FinalVerificationAgent {
                 p.isNullOrBlank() || !File(p).exists() || File(p).length() <= 44L
             }
             val missingHinglish = dialogues.filter { it.romanHinglishText.isBlank() }
+            val scriptViolations = dialogues.filter { dlg ->
+                dlg.romanHinglishText.isNotBlank() && !MixedScriptLanguageEngine.validateMixedScript(dlg.romanHinglishText).isValid
+            }
             val outOfBounds = if (expectedDurationMs > 0L) {
                 dialogues.filter { it.timelineStartMs < 0L || it.timelineStartMs > expectedDurationMs + 500L }
             } else emptyList()
-            val allDialoguesOk = missingDialogues.isEmpty() && missingHinglish.isEmpty() && outOfBounds.isEmpty()
+            val allDialoguesOk = missingDialogues.isEmpty() && missingHinglish.isEmpty() && scriptViolations.isEmpty() && outOfBounds.isEmpty()
             checks.add(
                 VerificationCheckItem(
-                    checkName = "Dialogue Audio, Text & Sync Completeness",
+                    checkName = "Dialogue Audio, Mixed-Script & Sync Completeness",
                     passed = allDialoguesOk,
                     detail = when {
-                        allDialoguesOk -> "All ${dialogues.size} dialogue clips verified on disk with Roman Hinglish text and valid timeline positions."
+                        allDialoguesOk -> "All ${dialogues.size} dialogue clips verified on disk with Mixed-Script Hindi-English text and valid timeline positions."
                         missingDialogues.isNotEmpty() -> "${missingDialogues.size} of ${dialogues.size} dialogue clips missing audio (${missingDialogues.take(4).joinToString { it.dialogueId }})."
-                        missingHinglish.isNotEmpty() -> "${missingHinglish.size} dialogue(s) missing Roman Hinglish text (${missingHinglish.take(4).joinToString { it.dialogueId }})."
+                        missingHinglish.isNotEmpty() -> "${missingHinglish.size} dialogue(s) missing translated text (${missingHinglish.take(4).joinToString { it.dialogueId }})."
+                        scriptViolations.isNotEmpty() -> "${scriptViolations.size} dialogue(s) violate Mixed-Script Devanagari+English rule (${scriptViolations.take(4).joinToString { it.dialogueId }})."
                         else -> "${outOfBounds.size} dialogue(s) fall outside episode duration bounds (${expectedDurationMs}ms)."
                     }
                 )
@@ -196,17 +202,25 @@ object FinalVerificationAgent {
             extractor.setDataSource(mp4File.absolutePath)
             var hasVideo = false
             var hasAudio = false
+            var videoTrackIndex = -1
+            var audioTrackIndex = -1
+            var videoFormat: MediaFormat? = null
+            var audioFormat: MediaFormat? = null
             var videoDurationMs = 0L
             var audioDurationMs = 0L
             for (i in 0 until extractor.trackCount) {
                 val fmt = extractor.getTrackFormat(i)
                 val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
                 val dur = if (fmt.containsKey(MediaFormat.KEY_DURATION)) fmt.getLong(MediaFormat.KEY_DURATION) / 1000L else 0L
-                if (mime.startsWith("video/")) {
+                if (mime.startsWith("video/") && !hasVideo) {
                     hasVideo = true
+                    videoTrackIndex = i
+                    videoFormat = fmt
                     videoDurationMs = dur
-                } else if (mime.startsWith("audio/")) {
+                } else if (mime.startsWith("audio/") && !hasAudio) {
                     hasAudio = true
+                    audioTrackIndex = i
+                    audioFormat = fmt
                     audioDurationMs = dur
                 }
             }
@@ -226,6 +240,27 @@ object FinalVerificationAgent {
                     detail = "Container duration ${measuredDur}ms vs expected ${expectedDurationMs}ms (delta ${delta}ms)."
                 )
             )
+            // Actual frame-decoding validation for both video & audio streams (not metadata-only)
+            if (videoTrackIndex >= 0 && videoFormat != null) {
+                val videoDecoded = verifyTrackDecodable(mp4File, videoTrackIndex, videoFormat)
+                items.add(
+                    VerificationCheckItem(
+                        checkName = "MP4 Video Stream Decode",
+                        passed = videoDecoded.first,
+                        detail = videoDecoded.second
+                    )
+                )
+            }
+            if (audioTrackIndex >= 0 && audioFormat != null) {
+                val audioDecoded = verifyTrackDecodable(mp4File, audioTrackIndex, audioFormat)
+                items.add(
+                    VerificationCheckItem(
+                        checkName = "MP4 Audio Stream Decode",
+                        passed = audioDecoded.first,
+                        detail = audioDecoded.second
+                    )
+                )
+            }
         } catch (e: Exception) {
             items.add(
                 VerificationCheckItem(
@@ -241,5 +276,71 @@ object FinalVerificationAgent {
             }
         }
         return items
+    }
+
+    /**
+     * Reads encoded packets and decodes at least one real output frame via Android MediaCodec
+     * to verify stream decodability without loading the entire file into memory.
+     */
+    private fun verifyTrackDecodable(mp4File: File, trackIndex: Int, format: MediaFormat): Pair<Boolean, String> {
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: return false to "Track missing MIME type."
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        return try {
+            extractor.setDataSource(mp4File.absolutePath)
+            extractor.selectTrack(trackIndex)
+            val packetProbe = ByteBuffer.allocate(256 * 1024)
+            val firstSampleBytes = extractor.readSampleData(packetProbe, 0)
+            if (firstSampleBytes <= 0) {
+                return false to "Track ($mime) contains 0 readable encoded packets."
+            }
+            extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+
+            codec = MediaCodec.createDecoderByType(mime)
+            codec.configure(format, null, null, 0)
+            codec.start()
+
+            val info = MediaCodec.BufferInfo()
+            var decodedFrames = 0
+            var inputDone = false
+            var attempts = 0
+            while (decodedFrames == 0 && attempts < 45) {
+                attempts++
+                if (!inputDone) {
+                    val inIdx = codec.dequeueInputBuffer(15_000L)
+                    if (inIdx >= 0) {
+                        val inBuf = codec.getInputBuffer(inIdx)
+                        if (inBuf != null) {
+                            inBuf.clear()
+                            val read = extractor.readSampleData(inBuf, 0)
+                            if (read < 0) {
+                                codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inputDone = true
+                            } else {
+                                codec.queueInputBuffer(inIdx, 0, read, extractor.sampleTime, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+                }
+                val outIdx = codec.dequeueOutputBuffer(info, 15_000L)
+                if (outIdx >= 0) {
+                    if (info.size > 0) decodedFrames++
+                    codec.releaseOutputBuffer(outIdx, false)
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                }
+            }
+            if (decodedFrames > 0) {
+                true to "Decoded $decodedFrames frame(s) from $mime stream cleanly."
+            } else {
+                false to "MediaCodec produced 0 decoded frames for $mime stream."
+            }
+        } catch (e: Exception) {
+            false to "Stream decode failed for $mime: ${e.localizedMessage ?: e.javaClass.simpleName}"
+        } finally {
+            try { codec?.stop() } catch (_: Exception) {}
+            try { codec?.release() } catch (_: Exception) {}
+            try { extractor.release() } catch (_: Exception) {}
+        }
     }
 }

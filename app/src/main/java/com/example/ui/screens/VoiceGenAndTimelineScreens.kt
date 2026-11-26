@@ -142,17 +142,30 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Voice Synthesis Engine", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+                    val remoteF5Ready = workerHealth?.isModelReady("f5_hindi") == true
+                    val workerReachable = workerHealth?.reachable == true
                     StatusPill(
-                        text = if (workerHealth?.reachable == true) "REMOTE GPU READY" else "ANDROID SPEECH TTS",
-                        color = if (workerHealth?.reachable == true) StudioEmerald else StudioCyan
+                        text = when {
+                            remoteF5Ready -> "REMOTE F5-HINDI READY"
+                            workerReachable -> "WORKER F5 NOT READY"
+                            else -> "ANDROID SPEECH TTS"
+                        },
+                        color = when {
+                            remoteF5Ready -> StudioEmerald
+                            workerReachable -> StudioAmber
+                            else -> StudioCyan
+                        }
                     )
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = if (workerHealth?.reachable == true) {
-                        "Remote worker reachable at ${config.remoteWorkerBaseUrl}. Selected engine: ${selectedEngine.displayName}."
-                    } else {
-                        "No remote PyTorch GPU worker connected. Genuine spoken Hindi/Hinglish audio is synthesized on-device via Android Speech TTS (generic system voice, no voice cloning) + WSOLA synchronization."
+                    text = when {
+                        workerHealth?.isModelReady("f5_hindi") == true ->
+                            "Remote GPU worker verified & F5-Hindi-24KHz loaded at ${config.remoteWorkerBaseUrl}. Selected engine: ${selectedEngine.displayName}."
+                        workerHealth?.reachable == true ->
+                            "Remote worker reachable, but F5-Hindi-24KHz is not loaded/ready for inference. Falling back to genuine on-device Android Speech TTS (generic voice, no cloning)."
+                        else ->
+                            "No remote PyTorch GPU worker connected. Genuine spoken Hindi-English audio is synthesized on-device via Android Speech TTS (generic system voice, no voice cloning) + WSOLA synchronization."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = StudioTextSecondary
@@ -210,7 +223,7 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
                 StudioEmptyState(
                     icon = Icons.Default.RecordVoiceOver,
                     title = "No Dialogues Queued for Voice Generation",
-                    description = "Segment and translate dialogues into Roman Hinglish first to populate the character-wise voice batch queue.",
+                    description = "Segment and translate dialogues into Mixed-Script Hindi-English first to populate the character-wise voice batch queue.",
                     primaryActionLabel = "Go to Translation",
                     onPrimaryAction = { viewModel.selectProductionSection(ProductionSection.TRANSLATION) },
                     testTagPrefix = "voice_gen_empty"
@@ -278,7 +291,7 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
 
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = dlg.romanHinglishText.ifBlank { "Missing Roman Hinglish translation" },
+                            text = dlg.romanHinglishText.ifBlank { "Missing Mixed-Script Hindi-English translation" },
                             style = MaterialTheme.typography.bodyMedium,
                             color = if (dlg.romanHinglishText.isNotBlank()) StudioTextPrimary else StudioAmber
                         )

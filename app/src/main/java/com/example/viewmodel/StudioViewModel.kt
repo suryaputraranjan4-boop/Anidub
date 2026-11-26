@@ -31,6 +31,7 @@ import com.example.engine.AudioDspEngine
 import com.example.engine.AudioPlaybackState
 import com.example.engine.HinglishTtsNormalizer
 import com.example.engine.MediaExtractionResult
+import com.example.engine.MixedScriptLanguageEngine
 import com.example.engine.ModelDownloadManager
 import com.example.engine.StudioAudioPlayer
 import kotlinx.coroutines.Dispatchers
@@ -825,6 +826,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
 
+            val timingChanged = safeStart != dialogue.originalStartMs || safeEnd != dialogue.originalEndMs
             dao.updateDialogue(
                 dialogue.copy(
                     japaneseText = newJapaneseText.trim(),
@@ -832,6 +834,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     originalEndMs = safeEnd,
                     originalDurationMs = safeEnd - safeStart,
                     timelineStartMs = safeStart,
+                    timingStatus = if (timingChanged) "MANUAL" else dialogue.timingStatus,
                     originalAudioSlicePath = slicePath
                 )
             )
@@ -918,6 +921,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         romanHinglishText = "",
                         ttsNormalizedText = "",
                         alignmentSource = "Manual Timeline Entry",
+                        timingStatus = "MANUAL",
+                        scriptValidationStatus = "UNVALIDATED",
                         originalAudioSlicePath = slicePath,
                         timelineStartMs = safeStart
                     )
@@ -930,24 +935,70 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateDialogueTranslationOnly(
         dialogue: DialogueSegmentEntity,
-        newRomanHinglish: String,
+        newMixedScriptText: String,
         newEmotion: String,
         newSpeakingStyle: String
     ) {
         viewModelScope.launch(Dispatchers.IO) {
-            val dicts = dao.getAllDictionaryEntriesOnce()
-            val cleanText = newRomanHinglish.trim()
-            val normalized = HinglishTtsNormalizer.normalizeForTtsPronunciation(cleanText, dicts)
+            val ep = dao.getEpisodeById(dialogue.episodeId)
+            val project = ep?.let { dao.getProjectById(it.projectId) }
+            val resolvedDicts = MixedScriptLanguageEngine.resolveScopedDictionaries(
+                allEntries = dao.getAllDictionaryEntriesOnce(),
+                projectId = ep?.projectId,
+                animeSeriesName = project?.animeSeriesName
+            )
+            val cleanText = newMixedScriptText.trim()
+            val validation = MixedScriptLanguageEngine.validateMixedScript(cleanText)
+            val ttsPronunciation = MixedScriptLanguageEngine.buildTtsPronunciationText(cleanText, resolvedDicts)
             dao.updateDialogue(
                 dialogue.copy(
                     romanHinglishText = cleanText,
-                    ttsNormalizedText = normalized,
+                    ttsNormalizedText = ttsPronunciation,
+                    scriptValidationStatus = validation.status,
                     emotion = newEmotion,
                     speakingStyle = newSpeakingStyle.trim().ifBlank { dialogue.speakingStyle },
                     generationStatus = if (cleanText.isNotBlank() && dialogue.generatedAudioPath == null) "TRANSLATED" else dialogue.generationStatus,
-                    translationVersion = dialogue.translationVersion + 1
+                    translationVersion = dialogue.translationVersion + 1,
+                    errorNote = if (validation.isValid) null else validation.issueSummary
                 )
             )
+        }
+    }
+
+    fun fixDialogueScriptWithGemini(
+        dialogueId: Long,
+        currentText: String,
+        onResult: (Result<String>) -> Unit
+    ) {
+        val modelName = studioConfig.value.geminiModelName
+        viewModelScope.launch {
+            _pipelineBanner.value = PipelineBannerState(
+                isRunning = true,
+                activeStageNumber = 8,
+                activeStageTitle = "Fixing Mixed-Script with Gemini",
+                activeDetail = "Converting Romanized Hindi to Devanagari while preserving English words…"
+            )
+            val res = coordinator.fixSingleDialogueScriptWithGemini(
+                dialogueId = dialogueId,
+                rawText = currentText,
+                geminiModelName = modelName
+            )
+            _pipelineBanner.value = res.fold(
+                onSuccess = {
+                    PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = "Script converted to Mixed-Script Hindi-English (Devanagari + English)."
+                    )
+                },
+                onFailure = { err ->
+                    PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = err.localizedMessage ?: "Script fix failed.",
+                        isError = true
+                    )
+                }
+            )
+            onResult(res)
         }
     }
 
@@ -1072,7 +1123,55 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun addOrUpdateDictionaryEntry(entry: DictionaryEntryEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            dao.insertDictionaryEntry(entry)
+            val normalizedLevel = entry.dictionaryLevel.uppercase().let {
+                if (it in setOf("PROJECT", "ANIME", "GLOBAL")) it else "GLOBAL"
+            }
+            val cleanPreferred = MixedScriptLanguageEngine.preferredDisplayTerm(entry)
+            val cleanSource = entry.japaneseSourceTerm.trim()
+            if (cleanSource.isBlank() && cleanPreferred.isBlank()) return@launch
+
+            val targetProjectId = if (normalizedLevel == "PROJECT") entry.projectId else null
+            val targetAnimeName = if (normalizedLevel == "ANIME") entry.animeSeriesName?.trim()?.takeIf { it.isNotBlank() } else null
+            val key = MixedScriptLanguageEngine.normalizedTermKey(cleanSource, cleanPreferred)
+
+            val allExisting = dao.getAllDictionaryEntriesOnce()
+            val duplicate = allExisting.find { existing ->
+                existing.id != entry.id &&
+                    existing.dictionaryLevel.equals(normalizedLevel, ignoreCase = true) &&
+                    existing.projectId == targetProjectId &&
+                    (existing.animeSeriesName?.trim() ?: "").equals(targetAnimeName ?: "", ignoreCase = true) &&
+                    MixedScriptLanguageEngine.normalizedTermKey(
+                        existing.japaneseSourceTerm,
+                        MixedScriptLanguageEngine.preferredDisplayTerm(existing)
+                    ) == key
+            }
+
+            val finalId = if (entry.id > 0L) entry.id else (duplicate?.id ?: 0L)
+            val sanitized = entry.copy(
+                id = finalId,
+                dictionaryLevel = normalizedLevel,
+                projectId = targetProjectId,
+                animeSeriesName = targetAnimeName,
+                japaneseSourceTerm = cleanSource,
+                preferredMixedScript = entry.preferredMixedScript.trim().ifBlank { cleanPreferred },
+                preferredRomanHinglish = entry.preferredMixedScript.trim().ifBlank { cleanPreferred },
+                preferredHindiWording = entry.preferredHindiWording.trim(),
+                preferredEnglishWording = entry.preferredEnglishWording.trim(),
+                pronunciationGuidance = entry.pronunciationGuidance.trim(),
+                contextNotes = entry.contextNotes.trim(),
+                updatedAt = System.currentTimeMillis()
+            )
+            dao.insertDictionaryEntry(sanitized)
+            _pipelineBanner.value = PipelineBannerState(
+                isRunning = false,
+                statusBannerMessage = if (finalId > 0L && entry.id == 0L) {
+                    "Updated existing $normalizedLevel dictionary entry for '${cleanSource.ifBlank { cleanPreferred }}'."
+                } else if (entry.id > 0L) {
+                    "Saved changes to $normalizedLevel dictionary entry '${cleanSource.ifBlank { cleanPreferred }}'."
+                } else {
+                    "Added $normalizedLevel dictionary term '${cleanSource.ifBlank { cleanPreferred }}' → '$cleanPreferred'."
+                }
+            )
         }
     }
 
@@ -1292,7 +1391,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 isRunning = true,
                 activeStageNumber = 14,
                 activeStageTitle = "Generating Subtitles (Agent 21)",
-                activeDetail = "Writing & validating Japanese SRT, Hinglish SRT, Bilingual SRT, and Styled ASS…"
+                activeDetail = "Writing & validating Japanese SRT, Mixed-Script Hindi-English SRT, Bilingual SRT, and Styled ASS…"
             )
             try {
                 val ep = dao.getEpisodeById(epId)

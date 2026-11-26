@@ -116,6 +116,12 @@ interface AnimeDubDao {
     @Query("DELETE FROM dialogue_segments WHERE episodeId = :episodeId")
     suspend fun clearDialoguesForEpisode(episodeId: Long)
 
+    @Transaction
+    suspend fun replaceDialoguesAtomic(episodeId: Long, dialogues: List<DialogueSegmentEntity>) {
+        clearDialoguesForEpisode(episodeId)
+        insertDialogues(dialogues)
+    }
+
     // Speaker Profiles (Agent 3 & Agent 5)
     @Query("SELECT * FROM speaker_profiles WHERE episodeId = :episodeId ORDER BY speakerLabel ASC")
     fun observeSpeakersForEpisode(episodeId: Long): Flow<List<SpeakerProfileEntity>>
@@ -147,6 +153,9 @@ interface AnimeDubDao {
 
     @Query("SELECT * FROM dictionary_entries ORDER BY dictionaryLevel ASC, japaneseSourceTerm ASC")
     suspend fun getAllDictionaryEntriesOnce(): List<DictionaryEntryEntity>
+
+    @Query("SELECT * FROM dictionary_entries WHERE id = :id LIMIT 1")
+    suspend fun getDictionaryEntryById(id: Long): DictionaryEntryEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertDictionaryEntry(entry: DictionaryEntryEntity): Long

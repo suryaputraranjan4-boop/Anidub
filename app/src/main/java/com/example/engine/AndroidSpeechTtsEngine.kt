@@ -35,7 +35,8 @@ class AndroidSpeechTtsEngine(private val context: Context) {
         emotion: String,
         targetDurationMs: Long,
         outputDir: File,
-        targetSampleRateHz: Int = 24000
+        targetSampleRateHz: Int = 24000,
+        displayMixedScriptText: String = textToSpeak
     ): Result<SynthesizedDialogueResult> = withContext(Dispatchers.IO) {
         if (textToSpeak.isBlank()) {
             return@withContext Result.failure(IllegalArgumentException("Cannot synthesize empty dialogue text for $dialogueId."))
@@ -81,17 +82,27 @@ class AndroidSpeechTtsEngine(private val context: Context) {
                 Locale.US,
                 Locale.getDefault()
             )
-            var chosenLocaleLabel = "default"
+            var chosenLocaleLabel = ""
             for (loc in candidateLocales) {
                 val avail = tts.isLanguageAvailable(loc)
                 if (avail == TextToSpeech.LANG_AVAILABLE ||
                     avail == TextToSpeech.LANG_COUNTRY_AVAILABLE ||
                     avail == TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE
                 ) {
-                    tts.language = loc
-                    chosenLocaleLabel = loc.toLanguageTag()
-                    break
+                    val setRes = tts.setLanguage(loc)
+                    if (setRes != TextToSpeech.LANG_MISSING_DATA && setRes != TextToSpeech.LANG_NOT_SUPPORTED) {
+                        chosenLocaleLabel = loc.toLanguageTag()
+                        break
+                    }
                 }
+            }
+            if (chosenLocaleLabel.isBlank()) {
+                return@withContext Result.failure(
+                    IllegalStateException(
+                        "No supported Hindi (hi-IN) or English TTS voice pack is installed on this device. " +
+                            "Install Google Speech Services voice data or connect a Remote GPU Worker with F5-Hindi-24KHz."
+                    )
+                )
             }
 
             // Map speaker voice profile F0 & emotion to honest pitch and speech rate parameters
@@ -183,21 +194,23 @@ class AndroidSpeechTtsEngine(private val context: Context) {
             }
 
             val resampled = AudioDspEngine.resampleMono(rawBuffer, targetSampleRateHz)
+            val rawRatio = if (targetDurationMs > 0L) resampled.durationMs.toFloat() / targetDurationMs.toFloat() else 1.0f
+            val exceededSafeWsolaBounds = rawRatio < 0.75f || rawRatio > 1.35f
             val (stretchedBuffer, stretchRatio) = AudioDspEngine.timeStretchPcm(resampled, targetDurationMs)
             AudioDspEngine.writeWavFile(finalOutFile, stretchedBuffer)
 
             val peakDbfs = AudioDspEngine.computePeakDbfs(stretchedBuffer)
             val deviationMs = abs(stretchedBuffer.durationMs - targetDurationMs)
             val syncStatus = when {
+                exceededSafeWsolaBounds || deviationMs > 350L -> "NEEDS_ADAPTATION"
                 deviationMs <= 120L && abs(stretchRatio - 1.0f) <= 0.03f -> "ALIGNED"
-                deviationMs <= 350L -> "TIME_STRETCHED"
-                else -> "NEEDS_ADAPTATION"
+                else -> "TIME_STRETCHED"
             }
 
             Result.success(
                 SynthesizedDialogueResult(
                     outputFile = finalOutFile,
-                    visibleRomanHinglish = textToSpeak,
+                    visibleRomanHinglish = displayMixedScriptText,
                     internalNormalizedPhonetic = textToSpeak,
                     actualDurationMs = stretchedBuffer.durationMs,
                     timeStretchRatio = stretchRatio,

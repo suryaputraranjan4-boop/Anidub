@@ -26,14 +26,15 @@ data class SubtitleValidationResult(
 /**
  * Agent 21 — Subtitle Generation & Strict Validation Engine.
  *
- * Generates genuine, standards-compliant subtitle files synchronized to the final
+ * Generates genuine, UTF-8 standards-compliant subtitle files synchronized to the final
  * chronological dialogue timestamps:
  *  - Japanese source SRT (`*_ja.srt`)
- *  - Roman Hinglish dubbed SRT (`*_hi_hinglish.srt`)
- *  - Bilingual Japanese + Hinglish SRT (`*_bilingual.srt`)
+ *  - Mixed-Script Hindi-English (Devanagari + English) dubbed SRT (`*_hi_mixed.srt`)
+ *  - Bilingual Japanese + Mixed-Script Hindi-English SRT (`*_bilingual.srt`)
  *  - Styled Advanced SubStation Alpha ASS (`*_styled.ass`) with per-speaker color styling
  *
- * Strict Honesty Rules:
+ * Strict Honesty & Permanent Script Rules:
+ * - Always exports canonical mixed-script display text (`romanHinglishText`), NEVER `ttsNormalizedText`.
  * - Never injects fake placeholder strings like "(Pending Hinglish)" or "(No Japanese transcript)".
  * - `validateSubtitleFile` strictly rejects empty cues, placeholder strings, invalid timestamps,
  *   out-of-order cues, cues exceeding episode duration bounds, and cue count mismatches.
@@ -65,12 +66,12 @@ object SubtitleGenerator {
         val safeBase = baseFileName.replace(Regex("[^a-zA-Z0-9_\\-]"), "_").ifBlank { "episode_subtitles" }
 
         val jpFile = File(outputDir, "${safeBase}_ja.srt")
-        val hiFile = File(outputDir, "${safeBase}_hi_hinglish.srt")
+        val hiFile = File(outputDir, "${safeBase}_hi_mixed.srt")
         val biFile = File(outputDir, "${safeBase}_bilingual.srt")
         val assFile = File(outputDir, "${safeBase}_styled.ass")
 
-        jpFile.writeText(buildSrtContent(sorted) { d -> d.japaneseText.trim() })
-        hiFile.writeText(buildSrtContent(sorted) { d -> d.romanHinglishText.trim() })
+        jpFile.writeText(buildSrtContent(sorted) { d -> d.japaneseText.trim() }, Charsets.UTF_8)
+        hiFile.writeText(buildSrtContent(sorted) { d -> d.romanHinglishText.trim() }, Charsets.UTF_8)
         biFile.writeText(buildSrtContent(sorted) { d ->
             val hi = d.romanHinglishText.trim()
             val jp = d.japaneseText.trim()
@@ -79,14 +80,14 @@ object SubtitleGenerator {
                 hi.isNotEmpty() -> hi
                 else -> ""
             }
-        })
-        assFile.writeText(buildAssContent(episodeTitle, sorted, speakersByLabel))
+        }, Charsets.UTF_8)
+        assFile.writeText(buildAssContent(episodeTitle, sorted, speakersByLabel), Charsets.UTF_8)
 
         val validations = listOf(
-            validateSubtitleFile(jpFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs),
-            validateSubtitleFile(hiFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs),
-            validateSubtitleFile(biFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs),
-            validateSubtitleFile(assFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs)
+            validateSubtitleFile(jpFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs, enforceMixedScript = false),
+            validateSubtitleFile(hiFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs, enforceMixedScript = true),
+            validateSubtitleFile(biFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs, enforceMixedScript = false),
+            validateSubtitleFile(assFile, expectedCueCount = sorted.size, episodeDurationMs = episodeDurationMs, enforceMixedScript = true)
         )
         val issues = validations.filterNot { it.isValid }.map { "${it.file.name}: ${it.errorSummary}" }
 
@@ -172,16 +173,17 @@ object SubtitleGenerator {
     fun validateSubtitleFile(
         file: File,
         expectedCueCount: Int = -1,
-        episodeDurationMs: Long = 0L
+        episodeDurationMs: Long = 0L,
+        enforceMixedScript: Boolean = false
     ): SubtitleValidationResult {
         val ext = file.extension.uppercase(Locale.US)
         if (!file.exists() || file.length() == 0L) {
             return SubtitleValidationResult(file, ext, 0, false, "File missing or empty.")
         }
-        val content = file.readText()
+        val content = file.readText(Charsets.UTF_8)
         return when (ext) {
-            "SRT" -> validateSrtText(file, content, expectedCueCount, episodeDurationMs)
-            "ASS" -> validateAssText(file, content, expectedCueCount, episodeDurationMs)
+            "SRT" -> validateSrtText(file, content, expectedCueCount, episodeDurationMs, enforceMixedScript)
+            "ASS" -> validateAssText(file, content, expectedCueCount, episodeDurationMs, enforceMixedScript)
             else -> SubtitleValidationResult(file, ext, 0, false, "Unsupported subtitle extension: .$ext")
         }
     }
@@ -198,7 +200,8 @@ object SubtitleGenerator {
         file: File,
         content: String,
         expectedCueCount: Int,
-        episodeDurationMs: Long
+        episodeDurationMs: Long,
+        enforceMixedScript: Boolean = false
     ): SubtitleValidationResult {
         val timeLineRegex = Regex("""^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})$""")
         val normalized = content.replace("\r\n", "\n").trim()
@@ -253,6 +256,18 @@ object SubtitleGenerator {
                     "Cue #${idx + 1} has empty or placeholder subtitle text."
                 )
             }
+            if (enforceMixedScript) {
+                val scriptCheck = MixedScriptLanguageEngine.validateMixedScript(payload)
+                if (!scriptCheck.isValid) {
+                    return SubtitleValidationResult(
+                        file,
+                        "SRT",
+                        blocks.size,
+                        false,
+                        "Cue #${idx + 1} violates Mixed-Script Hindi-English rule: ${scriptCheck.issueSummary}"
+                    )
+                }
+            }
             cueCount++
         }
 
@@ -273,7 +288,8 @@ object SubtitleGenerator {
         file: File,
         content: String,
         expectedCueCount: Int,
-        episodeDurationMs: Long
+        episodeDurationMs: Long,
+        enforceMixedScript: Boolean = false
     ): SubtitleValidationResult {
         val hasScriptInfo = content.contains("[Script Info]")
         val hasStyles = content.contains("[V4+ Styles]")
@@ -323,6 +339,18 @@ object SubtitleGenerator {
                     false,
                     "ASS Dialogue #${idx + 1} has empty or placeholder text."
                 )
+            }
+            if (enforceMixedScript) {
+                val scriptCheck = MixedScriptLanguageEngine.validateMixedScript(text)
+                if (!scriptCheck.isValid) {
+                    return SubtitleValidationResult(
+                        file,
+                        "ASS",
+                        dialogueLines.size,
+                        false,
+                        "ASS Dialogue #${idx + 1} violates Mixed-Script Hindi-English rule: ${scriptCheck.issueSummary}"
+                    )
+                }
             }
         }
 

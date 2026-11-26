@@ -203,7 +203,7 @@ private val FOURTEEN_STAGES = listOf(
     PipelineStageSpec(5, "Dialogue Segmentation & Overlaps", "Agent 2 • Timestamps", ProductionSection.TRANSCRIPT),
     PipelineStageSpec(6, "Audio-Only Speaker Analysis", "Agent 3 • Voice Profiling", ProductionSection.SPEAKERS),
     PipelineStageSpec(7, "Global Sequential ID Numbering", "Coordinator", ProductionSection.TRANSCRIPT),
-    PipelineStageSpec(8, "Roman Hinglish Translation", "Agent 4 • Gemini 3.8 Flash", ProductionSection.TRANSLATION),
+    PipelineStageSpec(8, "Mixed-Script Hindi-English Translation", "Agent 4 • Gemini 3.8 Flash", ProductionSection.TRANSLATION),
     PipelineStageSpec(9, "Voice Reference Preparation", "Agent 5 • Reference Setup", ProductionSection.SPEAKERS),
     PipelineStageSpec(10, "Character-Wise Batch Voice Gen", "Agent 5 • Batch TTS", ProductionSection.VOICE_GEN),
     PipelineStageSpec(11, "Chronological Timeline Restore", "Agent 7 • Timeline", null),

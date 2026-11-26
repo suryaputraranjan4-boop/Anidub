@@ -159,7 +159,7 @@ fun HomeDashboardScreen(viewModel: StudioViewModel) {
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = if (projects.isEmpty()) {
-                                "Audio-first Japanese to Roman Hinglish dubbing workstation."
+                                "Audio-first Japanese to Mixed-Script Hindi-English dubbing workstation."
                             } else {
                                 "${projects.size} project(s) • ${episodes.size} episode(s) in local workspace"
                             },
@@ -219,7 +219,7 @@ fun HomeDashboardScreen(viewModel: StudioViewModel) {
                 StudioEmptyState(
                     icon = Icons.Default.Movie,
                     title = "No Dubbing Projects Yet",
-                    description = "Create a project and import a real Japanese anime video or audio file to begin stem separation, audio-only speaker profiling, Roman Hinglish translation, and multitrack mixing.",
+                    description = "Create a project and import a real Japanese anime video or audio file to begin stem separation, audio-only speaker profiling, Mixed-Script Hindi-English translation, and multitrack mixing.",
                     primaryActionLabel = "Create Your First Project",
                     onPrimaryAction = { viewModel.openGuidedNewProject() },
                     secondaryActionLabel = "Explore Model Library",
@@ -631,7 +631,7 @@ fun ProjectLibraryScreen(viewModel: StudioViewModel) {
                 StudioEmptyState(
                     icon = Icons.Default.FolderOpen,
                     title = "Your Project Library Is Empty",
-                    description = "Start a new anime dubbing project to organize episodes, speaker voice profiles, series dictionaries, and synchronized Hindi-Hinglish masters.",
+                    description = "Start a new anime dubbing project to organize episodes, speaker voice profiles, series dictionaries, and synchronized Mixed-Script Hindi-English masters.",
                     primaryActionLabel = "Create Your First Project",
                     onPrimaryAction = { viewModel.openGuidedNewProject() },
                     testTagPrefix = "projects_empty"
@@ -899,7 +899,7 @@ fun GuidedProjectImportScreen(viewModel: StudioViewModel) {
                                 value = state.projectTitle,
                                 onValueChange = { v -> viewModel.updateGuidedImport { it.copy(projectTitle = v) } },
                                 label = { Text("Project Title") },
-                                placeholder = { Text("e.g., Season 1 Hindi-Hinglish Dub") },
+                                placeholder = { Text("e.g., Season 1 Hindi-English Dub") },
                                 modifier = Modifier.fillMaxWidth().testTag("import_project_title_input"),
                                 singleLine = true
                             )

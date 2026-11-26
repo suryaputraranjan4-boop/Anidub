@@ -20,14 +20,52 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
+data class RemoteModelReadiness(
+    val modelKey: String,
+    val displayName: String,
+    val downloaded: Boolean,
+    val loaded: Boolean,
+    val readyForInference: Boolean,
+    val detailMessage: String = ""
+)
+
 data class WorkerHealthStatus(
     val reachable: Boolean,
+    val apiAvailable: Boolean = reachable,
     val workerUrl: String,
     val deviceType: String,
     val cudaAvailable: Boolean,
     val freeDiskSpaceGb: Double,
     val installedModels: List<String>,
+    val modelReadiness: Map<String, RemoteModelReadiness> = emptyMap(),
     val statusMessage: String
+) {
+    /**
+     * Returns true ONLY if the server is reachable, the API is available, AND the requested
+     * model is explicitly reported as loaded & ready for inference (never assumes HTTP 200 = ready).
+     */
+    fun isModelReady(modelKey: String): Boolean {
+        if (!reachable || !apiAvailable) return false
+        val direct = modelReadiness[modelKey]
+        if (direct != null) return direct.readyForInference
+        val normalized = modelKey.lowercase(Locale.US)
+        val fuzzy = modelReadiness.entries.firstOrNull { (k, _) ->
+            k.lowercase(Locale.US).contains(normalized) || normalized.contains(k.lowercase(Locale.US))
+        }?.value
+        if (fuzzy != null) return fuzzy.readyForInference
+        // Legacy workers returning only `installed_models` array without granular readiness map
+        if (modelReadiness.isEmpty() && installedModels.isNotEmpty()) {
+            return installedModels.any { it.lowercase(Locale.US).contains(normalized) }
+        }
+        return false
+    }
+}
+
+data class RemoteAsrWord(
+    val word: String,
+    val startMs: Long,
+    val endMs: Long,
+    val probability: Float = -1f
 )
 
 data class RemoteAsrSegment(
@@ -35,14 +73,16 @@ data class RemoteAsrSegment(
     val endMs: Long,
     val japaneseText: String,
     val romajiReading: String,
-    val confidenceScore: Float // -1f when worker did not report confidence
+    val confidenceScore: Float, // -1f when worker did not report confidence
+    val words: List<RemoteAsrWord> = emptyList()
 )
 
 data class RemoteDiarizationSegment(
     val startMs: Long,
     val endMs: Long,
     val speakerLabel: String,
-    val confidenceScore: Float // -1f when worker did not report confidence
+    val confidenceScore: Float, // -1f when worker did not report confidence
+    val embedding: FloatArray? = null
 )
 
 data class RemoteSeparationResult(
@@ -128,6 +168,7 @@ class RemoteWorkerClient {
                 }
                 val bodyStr = response.body?.string().orEmpty()
                 val json = JSONObject(bodyStr)
+                val apiAvailable = json.optBoolean("api_available", true)
                 val modelsArr = json.optJSONArray("installed_models")
                 val models = mutableListOf<String>()
                 if (modelsArr != null) {
@@ -136,14 +177,47 @@ class RemoteWorkerClient {
                         if (entry.isNotEmpty()) models.add(entry)
                     }
                 }
+                val readinessMap = linkedMapOf<String, RemoteModelReadiness>()
+                val modelsObj = json.optJSONObject("models")
+                if (modelsObj != null) {
+                    val keys = modelsObj.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val item = modelsObj.optJSONObject(key) ?: continue
+                        val downloaded = item.optBoolean("downloaded", false)
+                        val loaded = item.optBoolean("loaded", false)
+                        val ready = item.optBoolean("ready", loaded && downloaded)
+                        val display = item.optString("name", key).ifBlank { key }
+                        val detail = item.optString("detail", item.optString("error", "")).trim()
+                        readinessMap[key] = RemoteModelReadiness(
+                            modelKey = key,
+                            displayName = display,
+                            downloaded = downloaded,
+                            loaded = loaded,
+                            readyForInference = ready,
+                            detailMessage = detail
+                        )
+                        if (ready && !models.contains(display)) {
+                            models.add(display)
+                        }
+                    }
+                }
+                val readyCount = readinessMap.values.count { it.readyForInference }
+                val summaryMsg = if (readinessMap.isNotEmpty()) {
+                    "Connected to worker ($cleanUrl) • $readyCount/${readinessMap.size} model(s) ready for inference."
+                } else {
+                    "Connected to worker ($cleanUrl) • ${models.size} model(s) reported."
+                }
                 WorkerHealthStatus(
                     reachable = true,
+                    apiAvailable = apiAvailable,
                     workerUrl = cleanUrl,
                     deviceType = json.optString("device", "Unknown Remote Device").ifBlank { "Unknown Remote Device" },
                     cudaAvailable = json.optBoolean("cuda_available", false),
                     freeDiskSpaceGb = json.optDouble("free_disk_gb", 0.0),
                     installedModels = models,
-                    statusMessage = "Connected to remote inference worker ($cleanUrl)."
+                    modelReadiness = readinessMap,
+                    statusMessage = summaryMsg
                 )
             }
         } catch (e: CancellationException) {
@@ -151,11 +225,13 @@ class RemoteWorkerClient {
         } catch (e: Exception) {
             WorkerHealthStatus(
                 reachable = false,
+                apiAvailable = false,
                 workerUrl = cleanUrl,
                 deviceType = "Offline / Unreachable",
                 cudaAvailable = false,
                 freeDiskSpaceGb = 0.0,
                 installedModels = emptyList(),
+                modelReadiness = emptyMap(),
                 statusMessage = "Worker unreachable (${e.localizedMessage ?: "Connection refused"})."
             )
         }
@@ -269,6 +345,20 @@ class RemoteWorkerClient {
                     val endMs = item.optLong("end_ms", (item.optDouble("end", 0.0) * 1000.0).toLong())
                     val text = item.optString("text").trim()
                     val confidence = parseOptionalConfidence(item, "confidence")
+                    val wordsList = mutableListOf<RemoteAsrWord>()
+                    val wordsArr = item.optJSONArray("words")
+                    if (wordsArr != null) {
+                        for (wIdx in 0 until wordsArr.length()) {
+                            val wObj = wordsArr.optJSONObject(wIdx) ?: continue
+                            val wText = wObj.optString("word", wObj.optString("text", "")).trim()
+                            val wStart = wObj.optLong("start_ms", (wObj.optDouble("start", 0.0) * 1000.0).toLong())
+                            val wEnd = wObj.optLong("end_ms", (wObj.optDouble("end", 0.0) * 1000.0).toLong())
+                            val wProb = parseOptionalConfidence(wObj, "probability")
+                            if (wText.isNotEmpty() && wEnd > wStart) {
+                                wordsList.add(RemoteAsrWord(wText, wStart, wEnd, wProb))
+                            }
+                        }
+                    }
                     if (text.isNotBlank() && endMs > startMs) {
                         segments.add(
                             RemoteAsrSegment(
@@ -276,7 +366,8 @@ class RemoteWorkerClient {
                                 endMs = endMs,
                                 japaneseText = text,
                                 romajiReading = item.optString("romaji", "").trim(),
-                                confidenceScore = confidence
+                                confidenceScore = confidence,
+                                words = wordsList
                             )
                         )
                     }
@@ -331,13 +422,18 @@ class RemoteWorkerClient {
                     val endMs = item.optLong("end_ms", (item.optDouble("end", 0.0) * 1000.0).toLong())
                     val speaker = item.optString("speaker", item.optString("speaker_label", "")).trim()
                     val confidence = parseOptionalConfidence(item, "confidence")
+                    val embArr = item.optJSONArray("embedding")
+                    val emb = if (embArr != null && embArr.length() >= 8) {
+                        FloatArray(embArr.length()) { eIdx -> embArr.optDouble(eIdx, 0.0).toFloat() }
+                    } else null
                     if (speaker.isNotBlank() && endMs > startMs) {
                         segments.add(
                             RemoteDiarizationSegment(
                                 startMs = startMs,
                                 endMs = endMs,
                                 speakerLabel = speaker,
-                                confidenceScore = confidence
+                                confidenceScore = confidence,
+                                embedding = emb
                             )
                         )
                     }

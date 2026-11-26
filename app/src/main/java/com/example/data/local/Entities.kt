@@ -9,7 +9,7 @@ data class ProjectEntity(
     val title: String,
     val animeSeriesName: String,
     val sourceLanguage: String = "ja-JP (Japanese)",
-    val targetLanguage: String = "hi-Latn (Roman Hinglish)",
+    val targetLanguage: String = "hi-Deva+en (Mixed-Script Hindi-English)",
     val masterSampleRateHz: Int = 24000,
     val preferredTtsEngine: String = "F5-Hindi-24KHz",
     val preferredSeparationModel: String = "HTDemucs",
@@ -90,8 +90,8 @@ data class DialogueSegmentEntity(
     val originalDurationMs: Long,
     val transcriptSegmentId: Long,
     val japaneseText: String, // Preserved Japanese source dialogue
-    val romanHinglishText: String, // Natural Roman Hinglish translation (Never Devanagari)
-    val ttsNormalizedText: String, // Internal pronunciation-optimized phonetic string for TTS
+    val romanHinglishText: String, // Canonical display & subtitle text (Permanent Mixed-Script: Devanagari Hindi + English)
+    val ttsNormalizedText: String, // Separate internal pronunciation text for TTS engine (never overwrites display/subtitle text)
     val emotion: String = "NEUTRAL", // ANGRY, SAD, HAPPY, EXCITED, FEARFUL, CALM, WHISPERING, SHOUTING, NEUTRAL
     val speakingStyle: String = "Natural",
     val alignmentSource: String = "Unaligned",
@@ -118,7 +118,10 @@ data class DialogueSegmentEntity(
     val translationConfidence: Float = -1f, // -1f = unmeasured
     val sceneContextNote: String = "",
     val syncStatus: String = "PENDING", // PENDING, ALIGNED, TIME_STRETCHED, NEEDS_ADAPTATION
-    val verificationStatus: String = "UNVERIFIED"
+    val verificationStatus: String = "UNVERIFIED",
+    val sourceDialogueRef: String = "", // Links split sentences back to their originating segment ID
+    val timingStatus: String = "PENDING", // VERIFIED_ASR_ALIGNED, ACOUSTIC_ESTIMATED, MANUAL, PENDING
+    val scriptValidationStatus: String = "UNVALIDATED" // VALID_MIXED_SCRIPT, CORRECTED_MIXED_SCRIPT, LEGACY_ROMAN_WARNING, INVALID_ROMAN_HINDI, UNVALIDATED
 )
 
 @Entity(tableName = "speaker_profiles")
@@ -160,10 +163,11 @@ data class DictionaryEntryEntity(
     val animeSeriesName: String? = null,
     val japaneseSourceTerm: String,
     val preferredRomanHinglish: String,
-    val preferredHindiWording: String,
-    val preferredEnglishWording: String,
+    val preferredHindiWording: String, // Devanagari Hindi wording
+    val preferredEnglishWording: String, // English wording
+    val preferredMixedScript: String = "", // Canonical Devanagari + English mixed-script wording
     val preserveOriginalEnglish: Boolean = true,
-    val pronunciationGuidance: String,
+    val pronunciationGuidance: String, // Optional Roman/phonetic pronunciation guidance for TTS
     val contextNotes: String,
     val replacementScope: String = "GLOBAL", // GLOBAL, ANIME, PROJECT, EPISODE, DIALOGUE
     val updatedAt: Long = System.currentTimeMillis()

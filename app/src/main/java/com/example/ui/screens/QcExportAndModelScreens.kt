@@ -106,7 +106,7 @@ fun QcAndExportView(viewModel: StudioViewModel) {
     var exportFormat by remember { mutableStateOf("WAV_AUDIO_ONLY") }
     var sampleRate by remember(ep.id) { mutableStateOf(ep.audioSampleRateHz) }
     var audioBitrate by remember { mutableStateOf(192) }
-    var fileName by remember(ep.id) { mutableStateOf("AnimeDub_Ep${ep.episodeNumber}_Hinglish") }
+    var fileName by remember(ep.id) { mutableStateOf("AnimeDub_Ep${ep.episodeNumber}_HindiMixed") }
 
     val passedCount = checks.count { it.status == "PASSED" }
     val warnCount = checks.count { it.status == "WARNING" }
@@ -1153,15 +1153,55 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                         }
                     }
                     if (workerHealth != null) {
+                        val health = workerHealth!!
                         Spacer(modifier = Modifier.height(8.dp))
                         WarningBanner(
-                            message = if (workerHealth!!.reachable) {
-                                "Worker reachable (${workerHealth!!.deviceType}) — ${workerHealth!!.statusMessage}"
+                            message = if (health.reachable) {
+                                "Worker reachable (${health.deviceType}, CUDA=${if (health.cudaAvailable) "Yes" else "No"}, API=${if (health.apiAvailable) "OK" else "Unavailable"}) — ${health.statusMessage}"
                             } else {
-                                "Worker unreachable: ${workerHealth!!.statusMessage}"
+                                "Worker unreachable: ${health.statusMessage}"
                             },
-                            isError = !workerHealth!!.reachable
+                            isError = !health.reachable || !health.apiAvailable
                         )
+                        if (health.reachable && health.modelReadiness.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                "Per-Model Worker Readiness",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = StudioTextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            health.modelReadiness.values.forEach { m ->
+                                val readinessLabel = when {
+                                    m.readyForInference -> "Inference Ready"
+                                    m.loaded -> "Loaded (Not Ready)"
+                                    m.downloaded -> "Downloaded Only"
+                                    else -> "Not Downloaded"
+                                }
+                                val readinessColor = when {
+                                    m.readyForInference -> StudioEmerald
+                                    m.downloaded || m.loaded -> StudioAmber
+                                    else -> StudioCrimson
+                                }
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(m.displayName, style = MaterialTheme.typography.bodySmall, color = StudioTextPrimary)
+                                        Text(
+                                            text = "Downloaded: ${if (m.downloaded) "Yes" else "No"} • Loaded: ${if (m.loaded) "Yes" else "No"}${if (m.detailMessage.isNotBlank()) " • ${m.detailMessage}" else ""}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = StudioTextMuted
+                                        )
+                                    }
+                                    StatusPill(text = readinessLabel, color = readinessColor)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1171,7 +1211,7 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                     Text("Firebase AI Logic (Gemini Model)", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        "Used for Japanese ASR fallback (Stage 5) and Roman Hinglish translation (Stage 8) via Firebase App Check.",
+                        "Used for Japanese ASR fallback (Stage 4) and Mixed-Script Hindi-English (Devanagari + English) translation (Stage 8) via Firebase App Check.",
                         style = MaterialTheme.typography.bodySmall,
                         color = StudioTextSecondary
                     )

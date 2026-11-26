@@ -1355,4 +1355,101 @@ object AudioDspEngine {
         val db = 20.0 * log10(rms)
         return ((db * 10.0).roundToInt() / 10.0).toFloat()
     }
+
+    /**
+     * Splits a single audio segment `[segmentStartMs, segmentEndMs]` into `sentenceWeights.size`
+     * contiguous sub-segments by locating real short-time RMS energy minima (speech pause valleys)
+     * near proportional target points.
+     *
+     * Guarantees:
+     * - Every returned `(startMs, endMs)` satisfies `startMs < endMs`.
+     * - Sub-segments are strictly monotonic, contiguous (no gaps or overlaps), and clamped inside
+     *   `[segmentStartMs, segmentEndMs]`.
+     * - Callers MUST label these boundaries as `ACOUSTIC_ESTIMATED` (never `VERIFIED_ASR_ALIGNED`).
+     */
+    fun splitSegmentByAcousticPauses(
+        segmentPcm: PcmAudioBuffer?,
+        segmentStartMs: Long,
+        segmentEndMs: Long,
+        sentenceWeights: List<Int>
+    ): List<Pair<Long, Long>> {
+        val count = sentenceWeights.size
+        if (count <= 0) return emptyList()
+        val safeStart = segmentStartMs.coerceAtLeast(0L)
+        val safeEnd = segmentEndMs.coerceAtLeast(safeStart + count * 120L)
+        if (count == 1) return listOf(safeStart to safeEnd)
+
+        val totalDurMs = safeEnd - safeStart
+        val safeWeights = sentenceWeights.map { it.coerceAtLeast(1) }
+        val totalWeight = safeWeights.sum().toDouble()
+
+        val mono = segmentPcm?.takeIf { it.samples.isNotEmpty() && it.sampleRateHz > 0 }?.let { toMono(it) }
+        val frameMs = 20L
+        val frameEnergies: DoubleArray? = if (mono != null) {
+            val samplesPerFrame = max(1, (mono.sampleRateHz * frameMs / 1000L).toInt())
+            val numFrames = max(1, mono.samples.size / samplesPerFrame)
+            DoubleArray(numFrames) { f ->
+                val sIdx = f * samplesPerFrame
+                val eIdx = min(mono.samples.size, sIdx + samplesPerFrame)
+                var sumSq = 0.0
+                for (i in sIdx until eIdx) {
+                    val v = mono.samples[i].toDouble() / 32768.0
+                    sumSq += v * v
+                }
+                sqrt(sumSq / max(1, eIdx - sIdx))
+            }
+        } else null
+
+        val minSegMs = min(220L, totalDurMs / (count + 1)).coerceAtLeast(60L)
+        val cutPoints = mutableListOf<Long>()
+        var cumulativeWeight = 0.0
+        var prevCutMs = safeStart
+
+        for (idx in 0 until count - 1) {
+            cumulativeWeight += safeWeights[idx]
+            val targetRelMs = ((cumulativeWeight / totalWeight) * totalDurMs).toLong()
+            val remainingSegments = count - 1 - idx
+            val minAllowedAbs = prevCutMs + minSegMs
+            val maxAllowedAbs = (safeEnd - remainingSegments * minSegMs).coerceAtLeast(minAllowedAbs)
+            val targetAbs = (safeStart + targetRelMs).coerceIn(minAllowedAbs, maxAllowedAbs)
+
+            val chosenAbs = if (frameEnergies != null && frameEnergies.size >= 4) {
+                val searchRadiusMs = min(450L, totalDurMs / (count * 2)).coerceAtLeast(80L)
+                val winStartMs = (targetAbs - searchRadiusMs).coerceAtLeast(minAllowedAbs)
+                val winEndMs = (targetAbs + searchRadiusMs).coerceAtMost(maxAllowedAbs)
+                val startFrame = (((winStartMs - safeStart) / frameMs).toInt()).coerceIn(0, frameEnergies.lastIndex)
+                val endFrame = (((winEndMs - safeStart) / frameMs).toInt()).coerceIn(startFrame, frameEnergies.lastIndex)
+
+                var bestFrame = ((targetAbs - safeStart) / frameMs).toInt().coerceIn(startFrame, endFrame)
+                var bestScore = Double.MAX_VALUE
+                val targetFrame = ((targetAbs - safeStart) / frameMs).toDouble()
+                val spanFrames = max(1, endFrame - startFrame).toDouble()
+
+                for (f in startFrame..endFrame) {
+                    // Combine local RMS energy minimum with gentle distance penalty so we pick true speech pauses
+                    val distNorm = abs(f - targetFrame) / spanFrames
+                    val score = frameEnergies[f] + (distNorm * 0.015)
+                    if (score < bestScore) {
+                        bestScore = score
+                        bestFrame = f
+                    }
+                }
+                (safeStart + bestFrame * frameMs).coerceIn(minAllowedAbs, maxAllowedAbs)
+            } else {
+                targetAbs
+            }
+
+            cutPoints.add(chosenAbs)
+            prevCutMs = chosenAbs
+        }
+
+        val ranges = mutableListOf<Pair<Long, Long>>()
+        var cursor = safeStart
+        for (cut in cutPoints) {
+            ranges.add(cursor to cut)
+            cursor = cut
+        }
+        ranges.add(cursor to safeEnd)
+        return ranges
+    }
 }

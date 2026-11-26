@@ -1,0 +1,411 @@
+package com.example.engine
+
+import com.example.data.local.DictionaryEntryEntity
+import java.util.Locale
+import java.util.regex.Pattern
+
+data class MixedScriptValidationResult(
+    val isValid: Boolean,
+    val status: String, // VALID_MIXED_SCRIPT, LEGACY_ROMAN_WARNING, INVALID_ROMAN_HINDI, EMPTY
+    val hasDevanagari: Boolean,
+    val hasLatin: Boolean,
+    val detectedRomanHindiTokens: List<String>,
+    val message: String
+) {
+    val issueSummary: String
+        get() = if (isValid) "" else message
+}
+
+/**
+ * Centralized Permanent Hindi-English Mixed-Script Language Engine.
+ *
+ * Permanent rules enforced everywhere (Gemini prompts, post-validation, manual edits,
+ * dictionary matching, TTS pronunciation separation, QC, and SRT/ASS subtitles):
+ * 1. Hindi words MUST be written in Devanagari (e.g., मुझे, तुम्हारे, साथ, जाना, है, अभी, नहीं).
+ * 2. English words MUST be written in English/Roman script (e.g., but, time, ready, situation, dangerous).
+ * 3. Never convert entire Hindi sentences into Roman Hinglish.
+ * 4. Never unnecessarily translate natural English words, brands, technical terms, or character names into Hindi.
+ * 5. Display/Subtitle text and Internal TTS pronunciation text MUST remain strictly separate.
+ */
+object MixedScriptLanguageEngine {
+
+    const val STATUS_VALID = "VALID_MIXED_SCRIPT"
+    const val STATUS_CORRECTED = "CORRECTED_MIXED_SCRIPT"
+    const val STATUS_LEGACY_ROMAN = "LEGACY_ROMAN_WARNING"
+    const val STATUS_INVALID_ROMAN = "INVALID_ROMAN_HINDI"
+    const val STATUS_EMPTY = "EMPTY"
+
+    private val DEVANAGARI_REGEX = Regex("[\\u0900-\\u097F]")
+    private val LATIN_WORD_REGEX = Regex("[A-Za-z]+(?:'[A-Za-z]+)?")
+
+    fun containsDevanagari(text: String): Boolean = DEVANAGARI_REGEX.containsMatchIn(text)
+
+    /**
+     * High-precision lexicon of unmistakable Romanized Hindi words (excluding words that are also
+     * common valid English words like "main", "to", "in", "on", "me", "is", "are", "he", "we", "or",
+     * "so", "no", "go", "do", "us", "as", "at", "by", "up", "if", "it", "hi", "hum", "bar", "bus", "car").
+     * Used strictly to detect Romanized Hindi leaks without false-flagging genuine English sentences.
+     */
+    private val UNAMBIGUOUS_ROMAN_HINDI_WORDS = setOf(
+        "mujhe", "mujko", "mujhko", "tumhe", "tumhein", "tumhen", "tumhara", "tumhari", "tumhare",
+        "tumne", "tumko", "tumse", "tujhe", "tujhko", "tujhse", "tum", "aap", "aapka", "aapki", "aapke",
+        "aapko", "aapne", "hamara", "hamari", "hamare", "humko", "humne", "humse", "humein", "hume",
+        "mera", "meri", "mere", "maine", "mera", "tera", "teri", "tere", "uska", "uski", "uske", "usne",
+        "usko", "unka", "unki", "unke", "unhone", "unko", "apna", "apni", "apne", "khud",
+        "nahi", "nahin", "nhi", "nahee", "hai", "hain", "tha", "thi", "thee", "hoon", "hun", "hu",
+        "kya", "kyaa", "kyun", "kyon", "kyunki", "kyonki", "kaise", "kaisa", "kaisi", "kahan", "kaha",
+        "kahaan", "kaun", "kon", "kab", "kitna", "kitni", "kitne", "kidhar",
+        "abhi", "ab", "phir", "fir", "bahut", "bohot", "boht", "bilkul", "sirf", "bas", "zyada", "jyada",
+        "thoda", "thodi", "thode", "saath", "sath", "paas", "baad", "pehle", "pahle", "andar", "bahar",
+        "upar", "neeche", "niche", "yahan", "yaha", "wahan", "waha", "idhar", "udhar",
+        "jaana", "jana", "jao", "jaao", "jaa", "gaya", "gayi", "gaye", "aana", "aao", "aaya", "aayi", "aaye",
+        "karna", "karni", "karne", "karo", "karta", "karti", "karte", "kiya", "kiye", "ki", "raha", "rahi", "rahe",
+        "hona", "hota", "hoti", "hote", "hoga", "hogi", "honge", "hua", "hui", "hue",
+        "dekhna", "dekho", "dekha", "dekhi", "sunna", "suno", "suna", "bolna", "bolo", "bola", "boli",
+        "samajhna", "samjho", "samjha", "samajh", "pata", "batao", "batana", "bataya", "rukna", "ruko", "ruka",
+        "bhaago", "bhago", "chalo", "chal", "chala", "chali", "chale", "milna", "milo", "mila", "mili",
+        "lena", "lo", "liya", "dena", "do", "diya", "dunga", "dungi", "denge", "rakhna", "rakho", "rakha",
+        "lagna", "laga", "lagi", "lage", "lagta", "lagti", "sakta", "sakti", "sakte", "chahiye", "chahie",
+        "chahta", "chahti", "chahte", "chahte", "zaroor", "jaroor", "zaroori", "jaroori", "shayad",
+        "lekin", "magar", "parantu", "isliye", "isiliye", "agar", "jab", "tab", "tak", "bhi", "aur",
+        "yeh", "ye", "woh", "wo", "yahi", "wahi", "sab", "sabhi", "kuch", "kuchh", "koi", "kisi",
+        "aisa", "aisi", "aise", "waisa", "waisi", "waise", "jaisa", "jaisi", "jaise",
+        "accha", "achha", "achcha", "theek", "thik", "bura", "buri", "galat", "sahi", "sach", "jhooth", "jhoot",
+        "bhai", "yaar", "dost", "haan", "haa", "mat", "shakti", "taaqat", "taqat", "bekaar", "bekar",
+        "jeet", "haar", "haarunga", "harunga", "tayar", "taiyaar", "tayyar", "khatam", "khatm", "madad",
+        "bachao", "rok", "roko", "maarna", "maaro", "mara", "ladna", "lado", "zinda", "marna", "duniya",
+        "samay", "waqt", "raat", "din", "subah", "shaam", "log", "logon", "kaam", "baat", "baatein",
+        "naam", "jagah", "raasta", "rasta", "ghar", "dil", "dimag", "aankh", "aankhein", "haath"
+    )
+
+    /**
+     * Secondary Romanized Hindi short particles that are ONLY counted as Romanized Hindi when
+     * co-occurring with at least one unambiguous Romanized Hindi word in the same sentence
+     * (prevents false positives on English words like "main character", "to be", "do it").
+     */
+    private val CONTEXTUAL_ROMAN_HINDI_PARTICLES = setOf(
+        "main", "mein", "se", "ko", "ka", "ke", "pe", "par", "ne", "ho", "na", "toh", "hi", "ek", "do"
+    )
+
+    /**
+     * Permanent canonical prompt rules injected into every Gemini translation, sentence-splitting,
+     * and script-correction request.
+     */
+    val PERMANENT_MIXED_SCRIPT_SYSTEM_RULES: String = """
+PERMANENT HINDI-ENGLISH MIXED-SCRIPT WRITING SYSTEM (MANDATORY):
+1. Hindi words MUST ALWAYS be written in Devanagari script (e.g., मुझे, तुम्हारे, साथ, जाना, है, अभी, नहीं, क्या, तुम, ये, बहुत).
+2. English words MUST ALWAYS be written in English/Roman characters (e.g., but, time, ready, situation, dangerous, I trusted you, mission, system, boss, power, sorry, please).
+3. Mix Hindi (Devanagari) and English (Roman) naturally within the same sentence exactly how urban Indian anime audiences speak.
+4. NEVER write Hindi words in Roman Hinglish (FORBIDDEN: "Mujhe tumhare saath jaana hai, but abhi time nahi hai.").
+5. NEVER unnecessarily translate natural English words, brands, technical terms, or anime terminology into heavy textbook Hindi.
+6. Preserve character names, numbers, punctuation, emotion, sarcasm, humor, and speaking style.
+
+CORRECT EXAMPLES:
+- मुझे तुम्हारे साथ जाना है, but अभी time नहीं है।
+- तुमने ऐसा क्यों किया? I trusted you.
+- क्या तुम ready हो या नहीं?
+- मुझे नहीं पता कि he कहाँ गया।
+- ये situation बहुत dangerous है।
+
+INCORRECT EXAMPLES (STRICTLY FORBIDDEN):
+- Mujhe tumhare saath jaana hai, but abhi time nahi hai. (Romanized Hindi — FORBIDDEN)
+- MUJHE TUMHARE SAATH JANA HAI. (All-caps Romanized Hindi — FORBIDDEN)
+""".trimIndent()
+
+    /**
+     * Validates whether a dialogue or subtitle string conforms to the permanent Mixed-Script
+     * Hindi-English rule without blindly flagging legitimate English words or proper nouns.
+     */
+    fun validateMixedScript(text: String): MixedScriptValidationResult {
+        val clean = text.trim()
+        if (clean.isEmpty()) {
+            return MixedScriptValidationResult(
+                isValid = false,
+                status = STATUS_EMPTY,
+                hasDevanagari = false,
+                hasLatin = false,
+                detectedRomanHindiTokens = emptyList(),
+                message = "Dialogue text is empty."
+            )
+        }
+
+        val hasDevanagari = DEVANAGARI_REGEX.containsMatchIn(clean)
+        val latinWords = LATIN_WORD_REGEX.findAll(clean).map { it.value }.toList()
+        val hasLatin = latinWords.isNotEmpty()
+
+        val unambiguousLeaks = latinWords
+            .filter { word ->
+                // Skip pure acronyms (e.g., HQ, AI, VIP, S-Rank)
+                if (word.length >= 2 && word.all { it.isUpperCase() } && word.lowercase(Locale.US) !in UNAMBIGUOUS_ROMAN_HINDI_WORDS) {
+                    false
+                } else {
+                    word.lowercase(Locale.US) in UNAMBIGUOUS_ROMAN_HINDI_WORDS
+                }
+            }
+            .distinctBy { it.lowercase(Locale.US) }
+
+        val contextualLeaks = if (unambiguousLeaks.isNotEmpty()) {
+            latinWords
+                .filter { it.lowercase(Locale.US) in CONTEXTUAL_ROMAN_HINDI_PARTICLES }
+                .distinctBy { it.lowercase(Locale.US) }
+        } else {
+            emptyList()
+        }
+
+        val allLeaks = (unambiguousLeaks + contextualLeaks).distinctBy { it.lowercase(Locale.US) }
+
+        return when {
+            // Purely Romanized Hindi sentence (no Devanagari + Roman Hindi words detected)
+            !hasDevanagari && unambiguousLeaks.isNotEmpty() -> {
+                MixedScriptValidationResult(
+                    isValid = false,
+                    status = STATUS_LEGACY_ROMAN,
+                    hasDevanagari = false,
+                    hasLatin = true,
+                    detectedRomanHindiTokens = allLeaks,
+                    message = "Romanized Hindi detected (${allLeaks.take(5).joinToString(", ")}). Hindi words must be written in Devanagari."
+                )
+            }
+            // Mixed sentence that still leaked Romanized Hindi words alongside Devanagari
+            hasDevanagari && unambiguousLeaks.isNotEmpty() -> {
+                MixedScriptValidationResult(
+                    isValid = false,
+                    status = STATUS_INVALID_ROMAN,
+                    hasDevanagari = true,
+                    hasLatin = true,
+                    detectedRomanHindiTokens = allLeaks,
+                    message = "Romanized Hindi words leaked into mixed-script line (${allLeaks.take(5).joinToString(", ")})."
+                )
+            }
+            // Valid Devanagari + English mixed-script OR intentional pure English line (e.g., "I trusted you.")
+            else -> {
+                MixedScriptValidationResult(
+                    isValid = true,
+                    status = STATUS_VALID,
+                    hasDevanagari = hasDevanagari,
+                    hasLatin = hasLatin,
+                    detectedRomanHindiTokens = emptyList(),
+                    message = if (hasDevanagari && hasLatin) {
+                        "Valid Devanagari + English mixed-script."
+                    } else if (hasDevanagari) {
+                        "Valid Devanagari Hindi."
+                    } else {
+                        "Valid English expression preserved."
+                    }
+                )
+            }
+        }
+    }
+
+    /**
+     * Returns the canonical display preference of a dictionary entry:
+     * preferredMixedScript > preferredHindiWording (if Devanagari) > preferredEnglishWording (if preserveOriginalEnglish) > preferredRomanHinglish.
+     */
+    fun preferredDisplayTerm(entry: DictionaryEntryEntity): String {
+        return when {
+            entry.preferredMixedScript.isNotBlank() -> entry.preferredMixedScript.trim()
+            entry.preserveOriginalEnglish && entry.preferredEnglishWording.isNotBlank() -> entry.preferredEnglishWording.trim()
+            entry.preferredHindiWording.isNotBlank() -> entry.preferredHindiWording.trim()
+            entry.preferredEnglishWording.isNotBlank() -> entry.preferredEnglishWording.trim()
+            else -> entry.preferredRomanHinglish.trim()
+        }
+    }
+
+    private fun scopePrecedence(level: String): Int = when (level.uppercase(Locale.US)) {
+        "PROJECT" -> 3
+        "ANIME" -> 2
+        else -> 1 // GLOBAL
+    }
+
+    /**
+     * Strictly isolates dictionary entries to the active project & anime series and resolves
+     * conflicts deterministically with precedence: Project > Anime > Global.
+     * Unrelated projects or unrelated anime series NEVER leak into the resolved list.
+     */
+    fun resolveScopedDictionaries(
+        allEntries: List<DictionaryEntryEntity>,
+        projectId: Long?,
+        animeSeriesName: String?
+    ): List<DictionaryEntryEntity> {
+        val cleanSeries = animeSeriesName?.trim().orEmpty()
+        val eligible = allEntries.filter { entry ->
+            when (entry.dictionaryLevel.uppercase(Locale.US)) {
+                "PROJECT" -> projectId != null && projectId > 0L && entry.projectId == projectId
+                "ANIME" -> cleanSeries.isNotEmpty() && entry.animeSeriesName.equals(cleanSeries, ignoreCase = true)
+                else -> true // GLOBAL
+            }
+        }
+
+        // Deduplicate by normalized Japanese source term (or display key if source is blank),
+        // keeping highest precedence (Project > Anime > Global), then most recently updated.
+        val resolvedByKey = LinkedHashMap<String, DictionaryEntryEntity>()
+        val sortedByPriority = eligible.sortedWith(
+            compareByDescending<DictionaryEntryEntity> { scopePrecedence(it.dictionaryLevel) }
+                .thenByDescending { it.updatedAt }
+                .thenByDescending { it.id }
+        )
+        for (entry in sortedByPriority) {
+            val key = entry.japaneseSourceTerm.trim().lowercase(Locale.US)
+                .ifBlank { preferredDisplayTerm(entry).lowercase(Locale.US) }
+            if (key.isNotEmpty() && !resolvedByKey.containsKey(key)) {
+                resolvedByKey[key] = entry
+            }
+        }
+        return resolvedByKey.values.toList()
+    }
+
+    /**
+     * Boundary-aware phrase matcher supporting both Latin/English and Devanagari/Unicode scripts
+     * without corrupting substrings inside longer words.
+     */
+    private fun buildUnicodeBoundaryRegex(term: String, ignoreCase: Boolean): Regex {
+        val escaped = Regex.escape(term.trim())
+        // Ensure the match is not immediately preceded or followed by a letter, digit, or Devanagari combining mark
+        val pattern = "(?<![\\p{L}\\p{N}\\p{M}])$escaped(?![\\p{L}\\p{N}\\p{M}])"
+        val flags = if (ignoreCase) Pattern.CASE_INSENSITIVE or Pattern.UNICODE_CASE else 0
+        return Pattern.compile(pattern, flags).toRegex()
+    }
+
+    /**
+     * Applies resolved dictionary terminology deterministically to mixed-script display text.
+     *
+     * Rules enforced:
+     * - Uses longest matching phrases first to avoid partial-phrase corruption.
+     * - Enforces Unicode word boundaries so unrelated words containing the substring are never corrupted.
+     * - Never blindly appends dictionary terms in brackets.
+     * - Only replaces when an alternate wording (old wording / non-preferred Hindi/English/Roman variant)
+     *   actually matches a boundary-delimited phrase in the text (or when the Japanese source contains the term).
+     */
+    fun applyDictionariesToDisplayText(
+        displayText: String,
+        japaneseSource: String,
+        resolvedEntries: List<DictionaryEntryEntity>
+    ): String {
+        if (displayText.isBlank() || resolvedEntries.isEmpty()) return displayText
+
+        // Build replacement pairs (candidateVariant -> canonicalTarget), ordered longest phrase first
+        data class ReplacementRule(
+            val variant: String,
+            val target: String,
+            val requiresJapaneseSourceMatch: Boolean,
+            val japaneseSourceTerm: String
+        )
+
+        val rules = mutableListOf<ReplacementRule>()
+        for (entry in resolvedEntries) {
+            val target = preferredDisplayTerm(entry)
+            if (target.isBlank()) continue
+
+            val variants = linkedSetOf<String>()
+            if (entry.preferredHindiWording.isNotBlank() && !entry.preferredHindiWording.trim().equals(target, ignoreCase = false)) {
+                variants.add(entry.preferredHindiWording.trim())
+            }
+            if (entry.preferredEnglishWording.isNotBlank() && !entry.preferredEnglishWording.trim().equals(target, ignoreCase = false)) {
+                variants.add(entry.preferredEnglishWording.trim())
+            }
+            if (entry.preferredRomanHinglish.isNotBlank() && !entry.preferredRomanHinglish.trim().equals(target, ignoreCase = false)) {
+                variants.add(entry.preferredRomanHinglish.trim())
+            }
+            // Also normalize casing when preserveOriginalEnglish is enabled and target has specific casing (e.g. "Domain Expansion")
+            if (entry.preserveOriginalEnglish && target.any { it.isUpperCase() } && target.all { it.code < 128 }) {
+                variants.add(target)
+            }
+
+            for (v in variants) {
+                if (v.length >= 2) {
+                    rules.add(
+                        ReplacementRule(
+                            variant = v,
+                            target = target,
+                            requiresJapaneseSourceMatch = entry.japaneseSourceTerm.isNotBlank() && japaneseSource.isNotBlank(),
+                            japaneseSourceTerm = entry.japaneseSourceTerm.trim()
+                        )
+                    )
+                }
+            }
+        }
+
+        // Longest matching phrases first
+        val orderedRules = rules.sortedByDescending { it.variant.length }
+        var result = displayText
+        for (rule in orderedRules) {
+            if (rule.requiresJapaneseSourceMatch && !japaneseSource.contains(rule.japaneseSourceTerm)) {
+                // Only apply Japanese-scoped alternate replacements when the Japanese source contains the term
+                // OR when it's an exact case-normalization rule for a preserved English term.
+                if (!rule.variant.equals(rule.target, ignoreCase = true)) {
+                    continue
+                }
+            }
+            val regex = buildUnicodeBoundaryRegex(rule.variant, ignoreCase = true)
+            if (regex.containsMatchIn(result)) {
+                result = regex.replace(result, Regex.escapeReplacement(rule.target))
+            }
+        }
+        return result
+    }
+
+    /**
+     * Builds the separate internal TTS pronunciation string from the canonical Mixed-Script display text.
+     *
+     * Guarantees:
+     * - NEVER mutates or overwrites the canonical mixed-script display or subtitle text.
+     * - Applies `Project > Anime > Global` dictionary `pronunciationGuidance` overrides using
+     *   longest-phrase boundary-aware matching across mixed-script, Hindi, English, and Roman keys.
+     * - Strips bracketed internal annotation markers (e.g., `[EN:...]`) so clean natural speech text
+     *   reaches Android Speech TTS (`hi-IN`) and Remote `F5-Hindi-24KHz`.
+     */
+    fun buildTtsPronunciationText(
+        mixedScriptDisplayText: String,
+        resolvedEntries: List<DictionaryEntryEntity>
+    ): String {
+        if (mixedScriptDisplayText.isBlank()) return ""
+
+        data class PronRule(val matchPhrase: String, val spokenGuide: String)
+
+        val rules = mutableListOf<PronRule>()
+        for (entry in resolvedEntries) {
+            val guide = entry.pronunciationGuidance.trim()
+                .replace(Regex("""\[EN:([^\]]+)\]"""), "$1")
+                .trim()
+            if (guide.isBlank()) continue
+
+            val matchKeys = linkedSetOf<String>()
+            if (entry.preferredMixedScript.isNotBlank()) matchKeys.add(entry.preferredMixedScript.trim())
+            if (entry.preferredHindiWording.isNotBlank()) matchKeys.add(entry.preferredHindiWording.trim())
+            if (entry.preferredEnglishWording.isNotBlank()) matchKeys.add(entry.preferredEnglishWording.trim())
+            if (entry.preferredRomanHinglish.isNotBlank()) matchKeys.add(entry.preferredRomanHinglish.trim())
+
+            for (key in matchKeys) {
+                if (key.isNotBlank() && !key.equals(guide, ignoreCase = false)) {
+                    rules.add(PronRule(key, guide))
+                }
+            }
+        }
+
+        // Longest phrases first to preserve multi-word terms like "Domain Expansion" before single words
+        val orderedRules = rules
+            .distinctBy { it.matchPhrase.lowercase(Locale.US) }
+            .sortedByDescending { it.matchPhrase.length }
+
+        var spoken = mixedScriptDisplayText.trim()
+            .replace(Regex("""\[EN:([^\]]+)\]"""), "$1")
+
+        for (rule in orderedRules) {
+            val regex = buildUnicodeBoundaryRegex(rule.matchPhrase, ignoreCase = true)
+            if (regex.containsMatchIn(spoken)) {
+                spoken = regex.replace(spoken, Regex.escapeReplacement(rule.spokenGuide))
+            }
+        }
+
+        // Clean Devanagari danda/whitespace for consistent pauses in TTS engines
+        return spoken.replace(Regex("\\s+"), " ").trim()
+    }
+
+    /**
+     * Normalizes a dictionary term key for duplicate prevention.
+     */
+    fun normalizedTermKey(japaneseSourceTerm: String, preferredDisplay: String): String {
+        val jp = japaneseSourceTerm.trim().lowercase(Locale.US)
+        return if (jp.isNotEmpty()) jp else preferredDisplay.trim().lowercase(Locale.US)
+    }
+}

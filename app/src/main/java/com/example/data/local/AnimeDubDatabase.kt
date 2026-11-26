@@ -23,7 +23,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AgentJobRecordEntity::class,
         ExportRecordEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class AnimeDubDatabase : RoomDatabase() {
@@ -93,10 +93,20 @@ abstract class AnimeDubDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                addColumnIfMissing(db, "dialogue_segments", "sourceDialogueRef", "TEXT NOT NULL DEFAULT ''")
+                addColumnIfMissing(db, "dialogue_segments", "timingStatus", "TEXT NOT NULL DEFAULT 'PENDING'")
+                addColumnIfMissing(db, "dialogue_segments", "scriptValidationStatus", "TEXT NOT NULL DEFAULT 'UNVALIDATED'")
+                addColumnIfMissing(db, "dictionary_entries", "preferredMixedScript", "TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         val ALL_MIGRATIONS: Array<Migration> = arrayOf(
             MIGRATION_1_2,
             MIGRATION_2_3,
-            MIGRATION_3_4
+            MIGRATION_3_4,
+            MIGRATION_4_5
         )
 
         fun getInstance(context: Context): AnimeDubDatabase {

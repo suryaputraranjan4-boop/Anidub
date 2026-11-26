@@ -52,23 +52,25 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun verifyRomanHinglishPronunciationNormalizerPreservesVisibleTextAndEnglishTerms() {
+    fun verifyMixedScriptPronunciationNormalizerKeepsDisplayTextSeparateAndAppliesPronunciationOverride() {
         val dict = listOf(
             DictionaryEntryEntity(
                 dictionaryLevel = "GLOBAL",
                 japaneseSourceTerm = "ダンジョン",
+                preferredMixedScript = "Dungeon",
                 preferredRomanHinglish = "Dungeon",
-                preferredHindiWording = "Tehkhana",
+                preferredHindiWording = "",
                 preferredEnglishWording = "Dungeon",
                 preserveOriginalEnglish = true,
-                pronunciationGuidance = "[EN:Dungeon]",
+                pronunciationGuidance = "dun-jun",
                 contextNotes = "Keep in English"
             )
         )
-        val visible = "Mujhe kam mat samajhna. Ye meri book hai."
+        val visible = "मुझे इस Dungeon के अंदर जाना है, but अभी time नहीं है।"
         val normalized = HinglishTtsNormalizer.normalizeForTtsPronunciation(visible, dict)
-        assertTrue(normalized.contains("mu-jhay"))
-        assertTrue(normalized.contains("[EN:book].") || normalized.contains("[EN:book]"))
+        assertTrue("TTS text must never contain bracket tags", !normalized.contains("[EN:"))
+        assertTrue("TTS text must apply dictionary pronunciation guidance", normalized.contains("dun-jun"))
+        assertTrue("Display text itself must remain untouched Devanagari + English", visible.contains("Dungeon") && visible.contains("मुझे"))
     }
 
     @Test
@@ -164,8 +166,8 @@ class ExampleUnitTest {
                     originalDurationMs = 2200L,
                     transcriptSegmentId = 1L,
                     japaneseText = "絶対に負けない！",
-                    romanHinglishText = "Main bilkul nahi haarunga!",
-                    ttsNormalizedText = "main bil-kul na-hee haa-roon-gaa!",
+                    romanHinglishText = "मैं बिल्कुल नहीं हारूँगा!",
+                    ttsNormalizedText = "मैं बिल्कुल नहीं हारूँगा!",
                     timelineStartMs = 1000L,
                     actualGeneratedDurationMs = 2150L
                 ),
@@ -180,8 +182,8 @@ class ExampleUnitTest {
                     originalDurationMs = 2000L,
                     transcriptSegmentId = 2L,
                     japaneseText = "面白いな。",
-                    romanHinglishText = "Interesting hai.",
-                    ttsNormalizedText = "Interesting hai.",
+                    romanHinglishText = "यह काफी interesting है।",
+                    ttsNormalizedText = "यह काफी interesting है।",
                     timelineStartMs = 3600L,
                     actualGeneratedDurationMs = 1900L
                 )
@@ -195,14 +197,20 @@ class ExampleUnitTest {
             )
             assertTrue("Expected all 4 subtitle files to pass validation: ${bundle.validationIssues}", bundle.validationPassed)
             assertEquals(2, bundle.cueCount)
-            assertTrue(bundle.japaneseSrtFile.readText().contains("絶対に負けない！"))
-            assertTrue(bundle.hindiHinglishSrtFile.readText().contains("Main bilkul nahi haarunga!"))
-            assertTrue(bundle.bilingualSrtFile.readText().contains("Interesting hai."))
-            assertTrue(bundle.styledAssFile.readText().contains("Style: Speaker_A"))
+            assertTrue(bundle.japaneseSrtFile.readText(Charsets.UTF_8).contains("絶対に負けない！"))
+            assertTrue(bundle.hindiHinglishSrtFile.readText(Charsets.UTF_8).contains("मैं बिल्कुल नहीं हारूँगा!"))
+            assertTrue(bundle.bilingualSrtFile.readText(Charsets.UTF_8).contains("यह काफी interesting है।"))
+            assertTrue(bundle.styledAssFile.readText(Charsets.UTF_8).contains("Style: Speaker_A"))
+
+            // Romanized Hindi in mixed-script SRT must fail strict mixed-script validation
+            val badRomanSrt = java.io.File(tempDir, "roman_leak.srt")
+            badRomanSrt.writeText("1\n00:00:01,000 --> 00:00:03,000\nMujhe tumhare saath jaana hai, lekin time nahi hai.\n", Charsets.UTF_8)
+            val badRomanRes = com.example.engine.SubtitleGenerator.validateSubtitleFile(badRomanSrt, enforceMixedScript = true)
+            assertEquals("Romanized Hindi SRT must fail mixed-script validation", false, badRomanRes.isValid)
 
             // Corrupt SRT file must fail validation honestly
             val badSrt = java.io.File(tempDir, "broken.srt")
-            badSrt.writeText("1\n00:00:05,000 --> 00:00:02,000\nInvalid reversed timestamps\n")
+            badSrt.writeText("1\n00:00:05,000 --> 00:00:02,000\nInvalid reversed timestamps\n", Charsets.UTF_8)
             val badRes = com.example.engine.SubtitleGenerator.validateSubtitleFile(badSrt)
             assertEquals("Reversed timestamp SRT must fail validation", false, badRes.isValid)
         } finally {
@@ -236,8 +244,8 @@ class ExampleUnitTest {
                 originalDurationMs = 1000L,
                 transcriptSegmentId = 1L,
                 japaneseText = "行くぞ！",
-                romanHinglishText = "Chalo chalte hain!",
-                ttsNormalizedText = "Chalo chalte hain!",
+                romanHinglishText = "चलो चलते हैं!",
+                ttsNormalizedText = "चलो चलते हैं!",
                 generatedAudioPath = dlgWav.absolutePath,
                 actualGeneratedDurationMs = 1000L,
                 timelineStartMs = 0L
@@ -280,16 +288,22 @@ class ExampleUnitTest {
         val dict = listOf(
             DictionaryEntryEntity(
                 dictionaryLevel = "PROJECT",
+                projectId = 1L,
                 japaneseSourceTerm = "領域展開",
+                preferredMixedScript = "Domain Expansion",
                 preferredRomanHinglish = "Domain Expansion",
-                preferredHindiWording = "Domain Expansion",
+                preferredHindiWording = "",
                 preferredEnglishWording = "Domain Expansion",
                 preserveOriginalEnglish = true,
                 pronunciationGuidance = "Domain Expansion",
                 contextNotes = "Preserve iconic attack name"
             )
         )
-        val speakable = HinglishTtsNormalizer.prepareSpeakableText("Ye meri book hai, Domain Expansion!", dict)
+        val speakable = HinglishTtsNormalizer.prepareSpeakableText(
+            "यह मेरी book है, Domain Expansion!",
+            dict,
+            projectId = 1L
+        )
         assertTrue("Speakable text must not contain [EN: tags", !speakable.contains("[EN:"))
         assertTrue(speakable.contains("book"))
         assertTrue(speakable.contains("Domain Expansion"))
@@ -428,6 +442,167 @@ class ExampleUnitTest {
             "/files/vocals.wav"
         )
         assertTrue("Relative same-origin artifact path must be accepted", sameOriginOk.isSuccess)
+    }
+
+    @Test
+    fun verifyMixedScriptLanguageRulesAndThreeTierDictionaryPrecedence() {
+        // 1. Mixed-Script validation
+        val validMixed = com.example.engine.MixedScriptLanguageEngine.validateMixedScript(
+            "मुझे तुम्हारे साथ जाना है, but अभी time नहीं है।"
+        )
+        assertTrue("Natural Mixed-Script Devanagari + English must pass: ${validMixed.issueSummary}", validMixed.isValid)
+
+        val validEnglish = com.example.engine.MixedScriptLanguageEngine.validateMixedScript(
+            "I trusted you, Captain!"
+        )
+        assertTrue("Intentional pure English dialogue must pass: ${validEnglish.issueSummary}", validEnglish.isValid)
+
+        val invalidRoman = com.example.engine.MixedScriptLanguageEngine.validateMixedScript(
+            "Mujhe tumhare saath jaana hai, lekin abhi time nahi hai."
+        )
+        assertEquals("Romanized Hindi sentence must fail mixed-script validation", false, invalidRoman.isValid)
+
+        // 2. 3-tier dictionary isolation & Project > Anime > Global precedence
+        val allDicts = listOf(
+            DictionaryEntryEntity(
+                id = 1L,
+                dictionaryLevel = "GLOBAL",
+                japaneseSourceTerm = "先輩",
+                preferredMixedScript = "सीनियर",
+                preferredRomanHinglish = "सीनियर",
+                preferredHindiWording = "सीनियर",
+                preferredEnglishWording = "Senior",
+                pronunciationGuidance = "Senior",
+                contextNotes = ""
+            ),
+            DictionaryEntryEntity(
+                id = 2L,
+                dictionaryLevel = "ANIME",
+                animeSeriesName = "Jujutsu Kaisen",
+                japaneseSourceTerm = "先輩",
+                preferredMixedScript = "Senpai",
+                preferredRomanHinglish = "Senpai",
+                preferredHindiWording = "",
+                preferredEnglishWording = "Senpai",
+                pronunciationGuidance = "Sen-pie",
+                contextNotes = ""
+            ),
+            DictionaryEntryEntity(
+                id = 3L,
+                dictionaryLevel = "PROJECT",
+                projectId = 10L,
+                japaneseSourceTerm = "先輩",
+                preferredMixedScript = "सेनपाई",
+                preferredRomanHinglish = "सेनपाई",
+                preferredHindiWording = "सेनपाई",
+                preferredEnglishWording = "Senpai",
+                pronunciationGuidance = "Sen-pai",
+                contextNotes = ""
+            ),
+            DictionaryEntryEntity(
+                id = 4L,
+                dictionaryLevel = "PROJECT",
+                projectId = 99L, // Different project — must NEVER leak into project 10
+                japaneseSourceTerm = "領域展開",
+                preferredMixedScript = "WRONG_PROJECT_TERM",
+                preferredRomanHinglish = "WRONG_PROJECT_TERM",
+                preferredHindiWording = "",
+                preferredEnglishWording = "WRONG_PROJECT_TERM",
+                pronunciationGuidance = "",
+                contextNotes = ""
+            )
+        )
+
+        val resolvedForProj10 = com.example.engine.MixedScriptLanguageEngine.resolveScopedDictionaries(
+            allEntries = allDicts,
+            projectId = 10L,
+            animeSeriesName = "Jujutsu Kaisen"
+        )
+        assertEquals("Only Project 10 entry should win for 先輩 and Project 99 must not leak", 1, resolvedForProj10.size)
+        assertEquals("सेनपाई", com.example.engine.MixedScriptLanguageEngine.preferredDisplayTerm(resolvedForProj10.first()))
+
+        // 3. Longest-phrase boundary-aware replacement (zero partial-word corruption, zero bracket appending)
+        val boundaryDict = listOf(
+            DictionaryEntryEntity(
+                id = 10L,
+                dictionaryLevel = "GLOBAL",
+                japaneseSourceTerm = "アート",
+                preferredMixedScript = "Art",
+                preferredRomanHinglish = "Art",
+                preferredHindiWording = "art",
+                preferredEnglishWording = "Art",
+                pronunciationGuidance = "",
+                contextNotes = ""
+            )
+        )
+        val untouched = com.example.engine.MixedScriptLanguageEngine.applyDictionariesToDisplayText(
+            displayText = "यह मेरा start point है, art नहीं।",
+            japaneseSource = "",
+            resolvedEntries = boundaryDict
+        )
+        assertTrue("Must not corrupt 'start' into 'stArt'", untouched.contains("start"))
+        assertTrue("Must replace standalone 'art' with 'Art'", untouched.contains("Art"))
+        assertTrue("Must never append parenthetical brackets", !untouched.contains("(Art)"))
+    }
+
+    @Test
+    fun verifyAcousticPauseSplitterFindsRealSilenceValley() {
+        val sr = 24000
+        // 3 seconds total: 0..1.2s tone, 1.2..1.8s silence valley, 1.8..3.0s tone
+        val samples = ShortArray(sr * 3) { i ->
+            val tSec = i.toDouble() / sr
+            if (tSec in 1.2..1.8) 0
+            else (sin(2.0 * PI * 240.0 * tSec) * 14000).toInt().toShort()
+        }
+        val pcm = PcmAudioBuffer(samples, sr, 1)
+        val splits = AudioDspEngine.splitSegmentByAcousticPauses(
+            segmentPcm = pcm,
+            segmentStartMs = 10_000L,
+            segmentEndMs = 13_000L,
+            sentenceWeights = listOf(20, 20)
+        )
+        assertEquals(2, splits.size)
+        assertEquals(10_000L, splits[0].first)
+        assertEquals(13_000L, splits[1].second)
+        assertEquals("Sub-segments must be contiguous", splits[0].second, splits[1].first)
+        assertTrue(
+            "Boundary should fall inside the silence valley (11200..11800ms), got ${splits[0].second}",
+            splits[0].second in 11_150L..11_850L
+        )
+    }
+
+    @Test
+    fun verifyRemoteWorkerGranularReadinessDistinguishesDownloadedLoadedAndReady() {
+        val health = com.example.data.remote.WorkerHealthStatus(
+            reachable = true,
+            apiAvailable = true,
+            workerUrl = "https://worker.local",
+            deviceType = "CUDA GPU",
+            cudaAvailable = true,
+            freeDiskSpaceGb = 50.0,
+            installedModels = listOf("whisper"),
+            modelReadiness = mapOf(
+                "whisper" to com.example.data.remote.RemoteModelReadiness(
+                    modelKey = "whisper",
+                    displayName = "Whisper Large V3 Turbo",
+                    downloaded = true,
+                    loaded = true,
+                    readyForInference = true
+                ),
+                "f5_hindi" to com.example.data.remote.RemoteModelReadiness(
+                    modelKey = "f5_hindi",
+                    displayName = "F5-Hindi-24KHz",
+                    downloaded = true,
+                    loaded = false,
+                    readyForInference = false,
+                    detailMessage = "Weights cached on disk; model not loaded"
+                )
+            ),
+            statusMessage = "Worker online"
+        )
+        assertEquals(true, health.isModelReady("whisper"))
+        assertEquals("Downloaded-only model must NOT be treated as inference-ready", false, health.isModelReady("f5_hindi"))
+        assertEquals("Missing model key must return false", false, health.isModelReady("htdemucs"))
     }
 }
 

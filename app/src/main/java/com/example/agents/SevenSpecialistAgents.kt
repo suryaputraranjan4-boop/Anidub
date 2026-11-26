@@ -15,6 +15,7 @@ import com.example.data.local.TimelineTrackEntity
 import com.example.data.local.TranscriptSegmentEntity
 import com.example.data.local.VoiceGenerationRecordEntity
 import com.example.data.remote.RemoteWorkerClient
+import com.example.data.remote.WorkerHealthStatus
 import com.example.engine.AndroidSpeechTtsEngine
 import com.example.engine.AudioDspEngine
 import com.example.engine.FinalVerificationAgent
@@ -22,6 +23,7 @@ import com.example.engine.GeneratedSubtitleBundle
 import com.example.engine.HinglishTtsNormalizer
 import com.example.engine.MediaExtractionResult
 import com.example.engine.MixPlacementItem
+import com.example.engine.MixedScriptLanguageEngine
 import com.example.engine.SileroVadOnnxEngine
 import com.example.engine.SubtitleGenerator
 import com.example.engine.SynthesizedDialogueResult
@@ -91,23 +93,48 @@ class SevenSpecialistAgentsCoordinator(
             "translations" to Schema.array(
                 items = Schema.obj(
                     properties = mapOf(
-                        "dialogueId" to Schema.string(description = "Original global dialogue ID such as A-001"),
-                        "romanHinglish" to Schema.string(description = "Natural spoken Roman Hinglish translation, strictly Latin alphabet, never Devanagari"),
-                        "speakingStyle" to Schema.string(description = "Target delivery style matching character personality"),
-                        "emotion" to Schema.enumeration(
-                            values = listOf("ANGRY", "SAD", "HAPPY", "EXCITED", "FEARFUL", "CALM", "WHISPERING", "SHOUTING", "NEUTRAL"),
-                            description = "Detected emotional tone"
-                        ),
-                        "emotionConfidence" to Schema.double(description = "Honest emotion confidence between 0.0 and 1.0"),
-                        "translationConfidence" to Schema.double(description = "Honest translation quality confidence between 0.0 and 1.0"),
-                        "sceneContextNote" to Schema.string(description = "Brief note on speaker intent, honorifics, or relationship nuance"),
-                        "dictionaryTermsApplied" to Schema.array(
-                            items = Schema.string(),
-                            description = "Dictionary terms preserved or applied in this line"
+                        "dialogueId" to Schema.string(description = "Original source dialogue ID such as A-001"),
+                        "sentences" to Schema.array(
+                            items = Schema.obj(
+                                properties = mapOf(
+                                    "mixedScriptText" to Schema.string(
+                                        description = "Natural spoken Mixed-Script Hindi-English sentence: Hindi words strictly in Devanagari, English words strictly in English/Roman characters. Never Roman Hinglish for Hindi words."
+                                    ),
+                                    "speakingStyle" to Schema.string(description = "Target delivery style matching character personality"),
+                                    "emotion" to Schema.enumeration(
+                                        values = listOf("ANGRY", "SAD", "HAPPY", "EXCITED", "FEARFUL", "CALM", "WHISPERING", "SHOUTING", "NEUTRAL"),
+                                        description = "Detected emotional tone for this sentence"
+                                    ),
+                                    "emotionConfidence" to Schema.double(description = "Honest emotion confidence between 0.0 and 1.0"),
+                                    "translationConfidence" to Schema.double(description = "Honest translation quality confidence between 0.0 and 1.0"),
+                                    "sceneContextNote" to Schema.string(description = "Brief note on speaker intent, honorifics, or relationship nuance"),
+                                    "dictionaryTermsApplied" to Schema.array(
+                                        items = Schema.string(),
+                                        description = "Dictionary terms preserved or applied in this sentence"
+                                    )
+                                )
+                            ),
+                            description = "1 or more natural Mixed-Script Hindi-English sentences translated from this source dialogue segment"
                         )
                     )
                 ),
-                description = "Translated dialogue items in Roman Hinglish"
+                description = "Translated dialogue items in Mixed-Script Hindi-English (Devanagari + English)"
+            )
+        )
+    )
+
+    private val scriptCorrectionSchema = Schema.obj(
+        properties = mapOf(
+            "corrections" to Schema.array(
+                items = Schema.obj(
+                    properties = mapOf(
+                        "key" to Schema.string(description = "Exact item key from the correction request"),
+                        "correctedMixedScriptText" to Schema.string(
+                            description = "Corrected sentence with ALL Hindi words in Devanagari and ALL English words in English/Roman characters, preserving exact meaning and tone"
+                        )
+                    )
+                ),
+                description = "Script-corrected sentences"
             )
         )
     )
@@ -115,7 +142,7 @@ class SevenSpecialistAgentsCoordinator(
     private fun ensureFirebaseReady() {
         if (FirebaseApp.getApps(context).isEmpty()) {
             throw IllegalStateException(
-                "Firebase is not initialized on this device. Verify google-services.json and Firebase App Check configuration."
+                "Missing Firebase config: Firebase is not initialized on this device. Verify google-services.json and Firebase App Check configuration."
             )
         }
     }
@@ -123,6 +150,29 @@ class SevenSpecialistAgentsCoordinator(
     private fun sanitizeGeminiModelName(modelName: String): String {
         val clean = modelName.trim()
         return if (clean.matches(Regex("^[a-zA-Z0-9._\\-]{3,64}$"))) clean else "gemini-3.8-flash"
+    }
+
+    private fun classifyGeminiFailure(e: Throwable): String {
+        val raw = (e.localizedMessage ?: e.message ?: e::class.java.simpleName).trim()
+        val lower = raw.lowercase()
+        return when {
+            e is TimeoutCancellationException || lower.contains("timeout") || lower.contains("timed out") ->
+                "Network / Timeout: Gemini request timed out ($raw)."
+            lower.contains("firebase") && (lower.contains("not initialized") || lower.contains("google-services")) ->
+                "Missing Firebase config: $raw"
+            lower.contains("app check") || lower.contains("appcheck") || lower.contains("permission") ||
+                lower.contains("unauthenticated") || lower.contains("403") || lower.contains("401") ->
+                "App Check / Auth failure: $raw"
+            lower.contains("quota") || lower.contains("resource_exhausted") || lower.contains("429") ||
+                lower.contains("billing") || lower.contains("rate limit") ->
+                "Quota / Billing limit: $raw"
+            lower.contains("unknownhost") || lower.contains("connect") || lower.contains("network") ||
+                lower.contains("socket") || lower.contains("offline") ->
+                "Network / Timeout: $raw"
+            e is org.json.JSONException || lower.contains("json") ->
+                "Invalid model JSON response: $raw"
+            else -> "Gemini AI error: $raw"
+        }
     }
 
     private fun createAsrModel(geminiModelName: String): GenerativeModel {
@@ -145,6 +195,69 @@ class SevenSpecialistAgentsCoordinator(
                 responseSchema = translationBatchSchema
             }
         )
+    }
+
+    private fun createScriptCorrectionModel(geminiModelName: String): GenerativeModel {
+        ensureFirebaseReady()
+        return Firebase.ai.generativeModel(
+            modelName = sanitizeGeminiModelName(geminiModelName),
+            generationConfig = generationConfig {
+                responseMimeType = "application/json"
+                responseSchema = scriptCorrectionSchema
+            }
+        )
+    }
+
+    private suspend fun checkRemoteModelReady(
+        remoteWorkerUrl: String,
+        remoteWorkerAuthToken: String,
+        allowInsecureLocalHttp: Boolean,
+        modelKey: String
+    ): Pair<Boolean, String> {
+        if (remoteWorkerUrl.isBlank()) return false to "Remote worker not configured"
+        val health = workerClient.checkWorkerHealth(
+            baseUrl = remoteWorkerUrl,
+            authToken = remoteWorkerAuthToken,
+            allowInsecureLocalHttp = allowInsecureLocalHttp
+        )
+        if (!health.reachable || !health.apiAvailable) {
+            return false to health.statusMessage
+        }
+        if (health.isModelReady(modelKey)) {
+            return true to "Remote $modelKey ready"
+        }
+        val status = health.modelReadiness[modelKey]
+        val detail = if (status != null) {
+            "${status.displayName} unavailable on worker (downloaded=${status.downloaded}, loaded=${status.loaded}, ready=${status.readyForInference}${if (status.detailMessage.isNotBlank()) ": ${status.detailMessage}" else ""})"
+        } else {
+            "Remote worker reachable but model '$modelKey' is not ready for inference"
+        }
+        return false to detail
+    }
+
+    private fun parseEmbeddingJson(json: String): FloatArray {
+        val trimmed = json.trim()
+        if (trimmed.length < 3 || !trimmed.startsWith("[")) return FloatArray(0)
+        return try {
+            val arr = JSONArray(trimmed)
+            FloatArray(arr.length()) { idx -> arr.optDouble(idx, 0.0).toFloat() }
+        } catch (_: Exception) {
+            FloatArray(0)
+        }
+    }
+
+    private fun cleanupOrphanedDialogueWavFiles(genDir: File, activeDialogues: List<DialogueSegmentEntity>) {
+        if (!genDir.exists() || !genDir.isDirectory) return
+        val referencedPaths = activeDialogues.mapNotNull { it.generatedAudioPath }.map { File(it).name }.toSet()
+        val expectedIds = activeDialogues.map { "dlg_${it.dialogueId.lowercase().replace('-', '_')}.wav" }.toSet()
+        val keepNames = referencedPaths + expectedIds
+        genDir.listFiles()?.forEach { file ->
+            if (file.isFile && (file.name.startsWith("dlg_") || file.name.startsWith("remote_")) && file.name.endsWith(".wav")) {
+                if (file.name !in keepNames) {
+                    runCatching { file.delete() }
+                }
+            }
+        }
     }
 
     fun getEpisodeWorkspaceDir(episodeId: Long): File {
@@ -453,7 +566,13 @@ class SevenSpecialistAgentsCoordinator(
         }
 
         val stemsDir = File(epDir, "stems").apply { mkdirs() }
-        val remoteAttempt = if (remoteWorkerUrl.isNotBlank()) {
+        val (htdemucsReady, htdemucsNote) = checkRemoteModelReady(
+            remoteWorkerUrl = remoteWorkerUrl,
+            remoteWorkerAuthToken = remoteWorkerAuthToken,
+            allowInsecureLocalHttp = allowInsecureLocalHttp,
+            modelKey = "htdemucs"
+        )
+        val remoteAttempt = if (htdemucsReady) {
             workerClient.separateAudioRemote(
                 baseUrl = remoteWorkerUrl,
                 masterWav = masterFile,
@@ -462,7 +581,7 @@ class SevenSpecialistAgentsCoordinator(
                 allowInsecureLocalHttp = allowInsecureLocalHttp
             )
         } else {
-            Result.failure(IllegalStateException("Remote worker not configured"))
+            Result.failure(IllegalStateException(htdemucsNote))
         }
 
         val masterBuf = AudioDspEngine.readWavFileStrict(masterFile).getOrElse {
@@ -665,8 +784,14 @@ class SevenSpecialistAgentsCoordinator(
                 }
             }
         } else {
-            // Path 1: Remote Whisper Large V3 Turbo worker when configured
-            val remoteAsr = if (remoteWorkerUrl.isNotBlank()) {
+            // Path 1: Remote Whisper Large V3 Turbo worker when configured & model ready
+            val (whisperReady, whisperNote) = checkRemoteModelReady(
+                remoteWorkerUrl = remoteWorkerUrl,
+                remoteWorkerAuthToken = remoteWorkerAuthToken,
+                allowInsecureLocalHttp = allowInsecureLocalHttp,
+                modelKey = "whisper"
+            )
+            val remoteAsr = if (whisperReady) {
                 workerClient.transcribeJapaneseRemote(
                     baseUrl = remoteWorkerUrl,
                     vocalWav = vocalStemFile,
@@ -674,7 +799,7 @@ class SevenSpecialistAgentsCoordinator(
                     allowInsecureLocalHttp = allowInsecureLocalHttp
                 )
             } else {
-                Result.failure(IllegalStateException("Remote worker not configured"))
+                Result.failure(IllegalStateException(whisperNote))
             }
 
             if (remoteAsr.isSuccess) {
@@ -912,41 +1037,61 @@ class SevenSpecialistAgentsCoordinator(
         val existingDialogues = dao.getDialoguesChronologicalOnce(episode.id)
         val existingByOrder = existingDialogues.associateBy { it.globalOrderNumber }
 
-        val updatedDialogues = transcripts.sortedBy { it.preliminaryStartMs }.mapIndexed { index, tr ->
+        val sortedTranscripts = transcripts.sortedBy { it.preliminaryStartMs }
+        val maxEpMs = episode.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE
+
+        val updatedDialogues = sortedTranscripts.mapIndexed { index, tr ->
             val orderNum = index + 1
             val prev = existingByOrder[orderNum]
-            val duration = (tr.preliminaryEndMs - tr.preliminaryStartMs).coerceAtLeast(100L)
-            val overlapId = if (index > 0 && tr.preliminaryStartMs < transcripts[index - 1].preliminaryEndMs) {
+            val clampedStart = tr.preliminaryStartMs.coerceIn(0L, (maxEpMs - 100L).coerceAtLeast(0L))
+            val clampedEnd = tr.preliminaryEndMs.coerceIn(clampedStart + 100L, maxOf(clampedStart + 100L, maxEpMs))
+            val duration = (clampedEnd - clampedStart).coerceAtLeast(100L)
+            val overlapId = if (index > 0 && clampedStart < sortedTranscripts[index - 1].preliminaryEndMs) {
                 "Overlap #${index}"
             } else null
 
+            val honestTimingStatus = when {
+                tr.asrModelUsed.contains("Whisper", ignoreCase = true) -> "VERIFIED_ASR_ALIGNED"
+                tr.asrModelUsed.contains("Manual", ignoreCase = true) -> "MANUAL"
+                else -> "ACOUSTIC_ESTIMATED"
+            }
+            val alignmentLabel = when (honestTimingStatus) {
+                "VERIFIED_ASR_ALIGNED" -> "Whisper ASR Timestamp Alignment"
+                "MANUAL" -> "Manual Timeline Entry"
+                else -> "On-Device VAD Acoustic Boundary"
+            }
+
             prev?.copy(
-                originalStartMs = tr.preliminaryStartMs,
-                originalEndMs = tr.preliminaryEndMs,
+                originalStartMs = clampedStart,
+                originalEndMs = clampedEnd,
                 originalDurationMs = duration,
                 transcriptSegmentId = tr.id,
                 japaneseText = tr.japaneseText.ifBlank { prev.japaneseText },
                 originalAudioSlicePath = tr.originalAudioSlicePath,
-                overlapsWithDialogueId = overlapId
+                overlapsWithDialogueId = overlapId,
+                alignmentSource = alignmentLabel,
+                timingStatus = honestTimingStatus
             ) ?: DialogueSegmentEntity(
                 episodeId = episode.id,
                 globalOrderNumber = orderNum,
                 dialogueId = "UNASSIGNED-%03d".format(orderNum),
                 speakerLabel = "?",
-                originalStartMs = tr.preliminaryStartMs,
-                originalEndMs = tr.preliminaryEndMs,
+                originalStartMs = clampedStart,
+                originalEndMs = clampedEnd,
                 originalDurationMs = duration,
                 transcriptSegmentId = tr.id,
                 japaneseText = tr.japaneseText,
                 romanHinglishText = "",
                 ttsNormalizedText = "",
-                alignmentSource = "On-Device VAD Boundary Alignment",
+                alignmentSource = alignmentLabel,
+                timingStatus = honestTimingStatus,
+                scriptValidationStatus = "UNVALIDATED",
                 overlapsWithDialogueId = overlapId,
                 originalAudioSlicePath = tr.originalAudioSlicePath,
-                timelineStartMs = tr.preliminaryStartMs
+                timelineStartMs = clampedStart
             )
         }
-        dao.insertDialogues(updatedDialogues)
+        dao.replaceDialoguesAtomic(episode.id, updatedDialogues)
 
         val firstStart = updatedDialogues.first().originalStartMs
         val lastEnd = updatedDialogues.last().originalEndMs
@@ -1012,7 +1157,13 @@ class SevenSpecialistAgentsCoordinator(
             throw IllegalStateException(msg)
         }
 
+        // Strictly project-isolated speaker profiles for cross-episode & rerun continuity (never leaks across projects)
         val savedProjectSpeakers = dao.getSpeakersForProjectOnce(episode.projectId)
+            .distinctBy { it.speakerLabel }
+        val savedSpeakerEmbeddings = savedProjectSpeakers.mapNotNull { sp ->
+            val emb = parseEmbeddingJson(sp.speakerEmbeddingJson)
+            if (emb.isNotEmpty()) sp to emb else null
+        }
         val existingNamesByLabel = savedProjectSpeakers.associate { it.speakerLabel to it.characterName }
         val existingConsentByLabel = savedProjectSpeakers.associate { it.speakerLabel to it.rightsConsentConfirmed }
 
@@ -1020,7 +1171,18 @@ class SevenSpecialistAgentsCoordinator(
         val vocalStemFile = stems.find { it.stemType == "DIALOGUE_VOCAL" }?.let { File(it.filePath) }
             ?: File(episode.originalMasterAudioPath)
 
-        val remoteDiarization = if (remoteWorkerUrl.isNotBlank() && vocalStemFile.exists() && vocalStemFile.length() > 44L) {
+        val (pyannoteReady, pyannoteNote) = if (vocalStemFile.exists() && vocalStemFile.length() > 44L) {
+            checkRemoteModelReady(
+                remoteWorkerUrl = remoteWorkerUrl,
+                remoteWorkerAuthToken = remoteWorkerAuthToken,
+                allowInsecureLocalHttp = allowInsecureLocalHttp,
+                modelKey = "pyannote"
+            )
+        } else {
+            false to "Vocal stem missing"
+        }
+
+        val remoteDiarization = if (pyannoteReady) {
             workerClient.diarizeSpeakersRemote(
                 baseUrl = remoteWorkerUrl,
                 vocalWav = vocalStemFile,
@@ -1028,34 +1190,66 @@ class SevenSpecialistAgentsCoordinator(
                 allowInsecureLocalHttp = allowInsecureLocalHttp
             )
         } else {
-            Result.failure(IllegalStateException("Remote worker not configured"))
+            Result.failure(IllegalStateException(pyannoteNote))
         }
 
         data class DiscoveredCluster(
-            val label: String,
-            val characterName: String,
+            var label: String,
+            var characterName: String,
             val featuresList: MutableList<com.example.engine.AcousticVoiceFeatures>,
             val similarityScores: MutableList<Float>,
             var centroidEmbedding: FloatArray,
-            var representativeSlicePath: String
+            var representativeSlicePath: String,
+            var matchedSavedProfile: SpeakerProfileEntity? = null
         )
 
         val clusters = mutableListOf<DiscoveredCluster>()
-        val labelAlphabet = listOf("A", "B", "C", "D", "E", "F", "G", "H")
+        val labelAlphabet = listOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
         val updatedDialogues = mutableListOf<DialogueSegmentEntity>()
         val usedRemoteDiarization = remoteDiarization.isSuccess
+
+        fun matchSavedProjectProfile(
+            embedding: FloatArray,
+            f0MeanHz: Float,
+            alreadyClaimedLabels: Set<String>
+        ): SpeakerProfileEntity? {
+            if (embedding.isEmpty() || savedSpeakerEmbeddings.isEmpty()) return null
+            var bestProfile: SpeakerProfileEntity? = null
+            var bestScore = -1f
+            for ((saved, savedEmb) in savedSpeakerEmbeddings) {
+                if (saved.speakerLabel in alreadyClaimedLabels) continue
+                if (savedEmb.size != embedding.size) continue
+                val sim = AudioDspEngine.computeCosineSimilarity(embedding, savedEmb)
+                val combined = if (f0MeanHz > 0f && saved.f0MeanHz > 0f) {
+                    val f0DiffRatio = abs(f0MeanHz - saved.f0MeanHz) / saved.f0MeanHz.coerceAtLeast(80f)
+                    if (f0DiffRatio >= 0.18f) continue
+                    sim * 0.70f + (1f - f0DiffRatio.coerceIn(0f, 1f)) * 0.30f
+                } else {
+                    sim
+                }
+                if (combined > bestScore) {
+                    bestScore = combined
+                    bestProfile = saved
+                }
+            }
+            return if (bestScore >= 0.85f) bestProfile else null
+        }
+
+        fun nextAvailableLabel(usedLabels: Set<String>): String {
+            return labelAlphabet.firstOrNull { it !in usedLabels } ?: "S${usedLabels.size + 1}"
+        }
 
         if (usedRemoteDiarization) {
             val remoteSegs = remoteDiarization.getOrThrow()
             val remoteSpeakerToCanonical = mutableMapOf<String, String>()
             val clusterByLabel = mutableMapOf<String, DiscoveredCluster>()
+            val claimedLabels = mutableSetOf<String>()
 
             for (dlg in dialogues) {
                 val sliceFile = File(dlg.originalAudioSlicePath)
                 val pcm = AudioDspEngine.readWavFile(sliceFile)
                 val acoustic = AudioDspEngine.analyzeVoiceSegment(pcm)
 
-                // Match dialogue window against remote diarization segments by maximum temporal overlap
                 var bestRemoteSpeaker: String? = null
                 var bestOverlapMs = 0L
                 var bestRemoteConf = -1f
@@ -1070,7 +1264,10 @@ class SevenSpecialistAgentsCoordinator(
 
                 val canonicalLabel = if (bestRemoteSpeaker != null) {
                     remoteSpeakerToCanonical.getOrPut(bestRemoteSpeaker) {
-                        labelAlphabet.getOrElse(remoteSpeakerToCanonical.size) { "S${remoteSpeakerToCanonical.size + 1}" }
+                        val matchedSaved = matchSavedProjectProfile(acoustic.embedding, acoustic.f0MeanHz, claimedLabels)
+                        val lbl = matchedSaved?.speakerLabel ?: nextAvailableLabel(claimedLabels)
+                        claimedLabels.add(lbl)
+                        lbl
                     }
                 } else {
                     "UNIDENTIFIED"
@@ -1078,13 +1275,15 @@ class SevenSpecialistAgentsCoordinator(
 
                 if (canonicalLabel != "UNIDENTIFIED") {
                     val cluster = clusterByLabel.getOrPut(canonicalLabel) {
+                        val savedMatch = savedProjectSpeakers.find { it.speakerLabel == canonicalLabel }
                         val c = DiscoveredCluster(
                             label = canonicalLabel,
-                            characterName = existingNamesByLabel[canonicalLabel] ?: "Speaker $canonicalLabel",
+                            characterName = savedMatch?.characterName ?: existingNamesByLabel[canonicalLabel] ?: "Speaker $canonicalLabel",
                             featuresList = mutableListOf(),
                             similarityScores = mutableListOf(),
                             centroidEmbedding = acoustic.embedding,
-                            representativeSlicePath = dlg.originalAudioSlicePath
+                            representativeSlicePath = dlg.originalAudioSlicePath,
+                            matchedSavedProfile = savedMatch
                         )
                         clusters.add(c)
                         c
@@ -1109,7 +1308,8 @@ class SevenSpecialistAgentsCoordinator(
                 )
             }
         } else {
-            // Honest On-Device Non-Neural Acoustic F0 & Spectral Clustering Fallback
+            // Honest On-Device Non-Neural Acoustic F0 & Spectral Clustering with Project-Isolated Continuity
+            val claimedLabels = mutableSetOf<String>()
             for (dlg in dialogues) {
                 val sliceFile = File(dlg.originalAudioSlicePath)
                 val pcm = AudioDspEngine.readWavFile(sliceFile)
@@ -1141,15 +1341,20 @@ class SevenSpecialistAgentsCoordinator(
                     target.similarityScores.add(bestScore)
                     target
                 } else {
-                    val newLabel = labelAlphabet.getOrElse(clusters.size) { "S${clusters.size + 1}" }
-                    val defaultCharName = existingNamesByLabel[newLabel] ?: "Speaker $newLabel"
+                    val savedMatch = matchSavedProjectProfile(acoustic.embedding, acoustic.f0MeanHz, claimedLabels)
+                    val newLabel = savedMatch?.speakerLabel ?: nextAvailableLabel(claimedLabels)
+                    claimedLabels.add(newLabel)
+                    val defaultCharName = savedMatch?.characterName
+                        ?: existingNamesByLabel[newLabel]
+                        ?: "Speaker $newLabel"
                     val created = DiscoveredCluster(
                         label = newLabel,
                         characterName = defaultCharName,
                         featuresList = mutableListOf(acoustic),
                         similarityScores = mutableListOf(), // Empty until a real pairwise comparison occurs
                         centroidEmbedding = acoustic.embedding,
-                        representativeSlicePath = dlg.originalAudioSlicePath
+                        representativeSlicePath = dlg.originalAudioSlicePath,
+                        matchedSavedProfile = savedMatch
                     )
                     clusters.add(created)
                     created
@@ -1194,8 +1399,12 @@ class SevenSpecialistAgentsCoordinator(
             }
             val firstFeat = cluster.featuresList.first()
             val embJson = cluster.centroidEmbedding.joinToString(prefix = "[", postfix = "]") { "%.4f".format(it) }
-            val confirmedConsent = existingConsentByLabel[cluster.label] ?: false
-            val charId = "CHAR-${episode.projectId}-${cluster.label}"
+            val confirmedConsent = cluster.matchedSavedProfile?.rightsConsentConfirmed
+                ?: existingConsentByLabel[cluster.label]
+                ?: false
+            val charId = cluster.matchedSavedProfile?.characterId?.takeIf { it.isNotBlank() }
+                ?: "CHAR-${episode.projectId}-${cluster.label}"
+            val continuityTag = if (cluster.matchedSavedProfile != null) " • Matched existing project voice profile" else ""
 
             SpeakerProfileEntity(
                 projectId = episode.projectId,
@@ -1218,14 +1427,14 @@ class SevenSpecialistAgentsCoordinator(
                 voiceReferenceId = "VREF-${episode.projectId}-${cluster.label}",
                 rightsConsentConfirmed = confirmedConsent,
                 useConsentedGenericVoiceFallback = !confirmedConsent,
-                preferredTtsEngine = "F5-Hindi-24KHz",
+                preferredTtsEngine = cluster.matchedSavedProfile?.preferredTtsEngine ?: "F5-Hindi-24KHz",
                 dialogueCount = count,
                 voiceConsistencyScore = avgSim,
                 characterId = charId,
                 visualIdentityNote = if (usedRemoteDiarization) {
-                    "Audio-Only Remote pyannote/WeSpeaker Diarization (No visual recognition)"
+                    "Audio-Only Remote pyannote/WeSpeaker Diarization (No visual/gender assumptions)$continuityTag"
                 } else {
-                    "Audio-Only On-Device Acoustic F0/Spectral Features (Non-Neural; No visual recognition)"
+                    "Audio-Only On-Device Acoustic F0/Spectral Features (Non-Neural; No visual/gender assumptions)$continuityTag"
                 },
                 profileConfidence = avgSim
             )
@@ -1353,11 +1562,13 @@ class SevenSpecialistAgentsCoordinator(
     }
 
     /**
-     * Stage 8 — Agent 4: Roman Hinglish Translation via Firebase AI Logic (configurable Gemini model).
-     * Strict Honesty Rules:
-     * - Never invents hardcoded fallback translations or default `0.75`/`0.85` confidence scores.
-     * - Rejects any returned line containing Devanagari characters (`[\u0900-\u097F]`).
-     * - Verifies 100% coverage of all translatable dialogues before marking Stage 8 completed.
+     * Stage 8 — Agent 4: Permanent Mixed-Script Hindi-English (Devanagari + English) Translation
+     * via Firebase AI Logic (configurable Gemini model) with:
+     * - Sentence-level splitting (1..N sentences per long source segment)
+     * - Acoustic pause-valley timestamp reconciliation (`ACOUSTIC_ESTIMATED` for split sub-sentences)
+     * - Strict 3-tier dictionary isolation & precedence (`Project > Anime > Global`)
+     * - Mixed-script compliance validation + 1 controlled Gemini script-correction pass if Romanized Hindi leaks
+     * - Atomic DB persistence (zero duplicates on rerun) & strict separation of display vs TTS pronunciation text
      */
     suspend fun runStage8Agent4GeminiTranslation(
         episode: EpisodeEntity,
@@ -1377,7 +1588,7 @@ class SevenSpecialistAgentsCoordinator(
                 episodeId = episode.id,
                 agentNumber = 4,
                 stageNumber = 8,
-                agentName = "Agent 4 — Translation & Dictionary",
+                agentName = "Agent 4 — Mixed-Script Translation & Dictionary",
                 operation = "Blocked: Japanese transcript empty",
                 modelUsed = "$cleanModelName (Firebase AI Logic)",
                 runtimeMode = "FIREBASE_AI_GEMINI",
@@ -1395,20 +1606,20 @@ class SevenSpecialistAgentsCoordinator(
         val speakers = dao.getSpeakersForEpisodeOnce(episode.id).associateBy { it.speakerLabel }
         val allDictionaries = dao.getAllDictionaryEntriesOnce()
         val project = dao.getProjectById(episode.projectId)
+        val resolvedDicts = MixedScriptLanguageEngine.resolveScopedDictionaries(
+            allEntries = allDictionaries,
+            projectId = episode.projectId,
+            animeSeriesName = project?.animeSeriesName
+        )
 
-        val applicableEntries = allDictionaries.filter { entry ->
-            when (entry.dictionaryLevel) {
-                "PROJECT" -> entry.projectId == episode.projectId
-                "ANIME" -> project != null && entry.animeSeriesName.equals(project.animeSeriesName, ignoreCase = true)
-                else -> true
-            }
-        }
-
-        val dictPromptBlock = if (applicableEntries.isEmpty()) {
+        val dictPromptBlock = if (resolvedDicts.isEmpty()) {
             "(No custom dictionary entries configured yet.)"
         } else {
-            applicableEntries.joinToString("\n") { d ->
-                "- Source: '${d.japaneseSourceTerm}' -> Roman Hinglish: '${d.preferredRomanHinglish}' (Keep English: ${d.preserveOriginalEnglish}, Notes: ${d.contextNotes})"
+            resolvedDicts.joinToString("\n") { d ->
+                val preferred = MixedScriptLanguageEngine.preferredDisplayTerm(d)
+                val pron = d.pronunciationGuidance.takeIf { it.isNotBlank() }?.let { " | Pronunciation: '$it'" } ?: ""
+                val notes = d.contextNotes.takeIf { it.isNotBlank() }?.let { " | Notes: $it" } ?: ""
+                "- [${d.dictionaryLevel}] Source: '${d.japaneseSourceTerm}' -> Preferred Mixed-Script: '$preferred'$pron$notes"
             }
         }
 
@@ -1419,34 +1630,38 @@ class SevenSpecialistAgentsCoordinator(
         }
 
         val fullPrompt = """
-You are Agent 4 — Context Understanding, Japanese-to-Hindi Translation, and Dialogue Adaptation Specialist.
-Translate EVERY SINGLE Japanese anime dialogue segment below into natural spoken Roman Hinglish (Hindi written strictly in Latin alphabet mixed naturally with English).
+You are Agent 4 — Context Understanding, Japanese-to-Hindi Translation, and Anime Dialogue Adaptation Specialist.
+Translate EVERY SINGLE Japanese anime dialogue segment below into natural spoken Mixed-Script Hindi-English.
 
-STRICT RULES:
-1. Visible output MUST use Roman Hinglish ONLY. NEVER output Devanagari script.
-2. You MUST return an entry for EVERY dialogue ID listed below — do not omit any line.
-3. Preserve character relationships, honorific intent (-san, -sama, -kun, senpai), emotional subtext, and anime personality.
-4. Adapt dialogue length naturally to fit each line's original DurationWindow in seconds without dropping key meaning.
-5. Provide honest confidence scores (0.0 to 1.0) for emotionConfidence and translationConfidence, plus a concise sceneContextNote.
-6. Enforce these saved Dictionary terms (Project > Anime > Global):
+${MixedScriptLanguageEngine.PERMANENT_MIXED_SCRIPT_SYSTEM_RULES}
+
+SEGMENTATION & DUBBING RULES:
+1. You MUST return an entry for EVERY source dialogueId listed below — do not omit any segment.
+2. If a Japanese segment contains a single utterance, return 1 sentence in `sentences`.
+3. If a longer Japanese segment naturally contains multiple distinct sentences or dramatic beats, split it into 2 or more concise sentences in chronological order inside `sentences` so dubbing delivery and subtitles read naturally.
+4. Preserve character relationships, honorific intent (-san, -sama, -kun, senpai), emotional subtext, and anime personality.
+5. Adapt dialogue length naturally to fit each segment's DurationWindow in seconds without dropping key meaning.
+6. Provide honest confidence scores (0.0 to 1.0) for emotionConfidence and translationConfidence, plus a concise sceneContextNote.
+7. Strictly enforce these active Dictionary terms (precedence: PROJECT > ANIME > GLOBAL):
 $dictPromptBlock
 
 DIALOGUES IN CHRONOLOGICAL ORDER:
 $dialogueLinesPrompt
 """.trimIndent()
 
-        data class ParsedTranslationLine(
-            val romanHinglish: String,
+        data class ParsedSentence(
+            val key: String,
+            val sourceDialogueId: String,
+            var mixedScriptText: String,
             val speakingStyle: String,
             val emotion: String,
             val emotionConfidence: Float,
             val translationConfidence: Float,
-            val sceneContextNote: String
+            val sceneContextNote: String,
+            var scriptStatus: String = MixedScriptLanguageEngine.STATUS_VALID
         )
 
-        val devanagariRegex = Regex("[\\u0900-\\u097F]")
-        val translatedMap = mutableMapOf<String, ParsedTranslationLine>()
-        val rejectedDevanagariIds = mutableListOf<String>()
+        val sentencesBySourceId = linkedMapOf<String, MutableList<ParsedSentence>>()
 
         try {
             val translationModel = createTranslationModel(cleanModelName)
@@ -1460,55 +1675,43 @@ $dialogueLinesPrompt
             for (i in 0 until arr.length()) {
                 val item = arr.getJSONObject(i)
                 val dId = item.getString("dialogueId").trim()
-                val hinglish = item.getString("romanHinglish").trim()
-                val style = item.optString("speakingStyle", "Natural").trim()
-                val emo = item.optString("emotion", "NEUTRAL").trim().uppercase()
-                val emoConf = RemoteWorkerClient.parseOptionalConfidence(item, "emotionConfidence")
-                val trConf = RemoteWorkerClient.parseOptionalConfidence(item, "translationConfidence")
-                val ctxNote = item.optString("sceneContextNote", "").trim()
-                if (hinglish.isBlank()) continue
-                if (devanagariRegex.containsMatchIn(hinglish)) {
-                    rejectedDevanagariIds.add(dId)
-                    continue
+                val sentArr = item.optJSONArray("sentences")
+                val list = mutableListOf<ParsedSentence>()
+                if (sentArr != null && sentArr.length() > 0) {
+                    for (j in 0 until sentArr.length()) {
+                        val sObj = sentArr.getJSONObject(j)
+                        val rawMixed = sObj.optString("mixedScriptText", "").trim()
+                        if (rawMixed.isBlank()) continue
+                        list.add(
+                            ParsedSentence(
+                                key = "$dId#$j",
+                                sourceDialogueId = dId,
+                                mixedScriptText = rawMixed,
+                                speakingStyle = sObj.optString("speakingStyle", "Natural").trim().ifBlank { "Natural" },
+                                emotion = sObj.optString("emotion", "NEUTRAL").trim().uppercase().ifBlank { "NEUTRAL" },
+                                emotionConfidence = RemoteWorkerClient.parseOptionalConfidence(sObj, "emotionConfidence"),
+                                translationConfidence = RemoteWorkerClient.parseOptionalConfidence(sObj, "translationConfidence"),
+                                sceneContextNote = sObj.optString("sceneContextNote", "").trim()
+                            )
+                        )
+                    }
                 }
-                translatedMap[dId] = ParsedTranslationLine(hinglish, style, emo, emoConf, trConf, ctxNote)
-            }
-            if (translatedMap.isEmpty()) {
-                val reason = if (rejectedDevanagariIds.isNotEmpty()) {
-                    "All returned translations contained disallowed Devanagari script (${rejectedDevanagariIds.joinToString()})."
-                } else {
-                    "Gemini structured response contained 0 valid Roman Hinglish dialogues."
+                if (list.isNotEmpty()) {
+                    sentencesBySourceId[dId] = list
                 }
-                throw IllegalStateException(reason)
             }
-        } catch (e: TimeoutCancellationException) {
-            val msg = "Gemini translation timed out after 60s. Check network connectivity and retry Stage 8."
-            recordAgentJob(
-                episodeId = episode.id,
-                agentNumber = 4,
-                stageNumber = 8,
-                agentName = "Agent 4 — Translation & Dictionary",
-                operation = "Gemini translation timed out",
-                modelUsed = "$cleanModelName (Firebase AI Logic)",
-                runtimeMode = "FIREBASE_AI_GEMINI",
-                inputSummary = "${translatable.size} Japanese dialogues",
-                outputSummary = "0 translated",
-                completed = 0,
-                total = translatable.size,
-                status = "FAILED",
-                errorDetails = msg,
-                startedAt = startedAt
-            )
-            throw IllegalStateException(msg, e)
+            if (sentencesBySourceId.isEmpty()) {
+                throw IllegalStateException("Invalid model JSON response: Gemini returned 0 translated sentences.")
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            val msg = "Gemini translation failed: ${e.localizedMessage ?: "Firebase AI Logic error"}. Retry Stage 8 or enter Roman Hinglish manually in Translation."
+            val msg = "${classifyGeminiFailure(e)} Retry Stage 8 or enter Mixed-Script Hindi-English manually in Translate."
             recordAgentJob(
                 episodeId = episode.id,
                 agentNumber = 4,
                 stageNumber = 8,
-                agentName = "Agent 4 — Translation & Dictionary",
+                agentName = "Agent 4 — Mixed-Script Translation & Dictionary",
                 operation = "Gemini translation failed",
                 modelUsed = "$cleanModelName (Firebase AI Logic)",
                 runtimeMode = "FIREBASE_AI_GEMINI",
@@ -1523,38 +1726,212 @@ $dialogueLinesPrompt
             throw IllegalStateException(msg, e)
         }
 
-        val missingIds = translatable.map { it.dialogueId }.filterNot { it in translatedMap }
-        val updatedDialogues = dialogues.map { dlg ->
-            val parsed = translatedMap[dlg.dialogueId]
-            if (parsed != null) {
-                val enforcedHinglish = applyDictionariesToLine(parsed.romanHinglish, applicableEntries)
-                val internalNormalized = HinglishTtsNormalizer.normalizeForTtsPronunciation(enforcedHinglish, applicableEntries)
-                dlg.copy(
-                    romanHinglishText = enforcedHinglish,
-                    ttsNormalizedText = internalNormalized,
-                    speakingStyle = parsed.speakingStyle,
-                    emotion = parsed.emotion,
-                    emotionConfidence = parsed.emotionConfidence,
-                    translationConfidence = parsed.translationConfidence,
-                    sceneContextNote = parsed.sceneContextNote,
-                    generationStatus = if (dlg.generatedAudioPath != null) dlg.generationStatus else "TRANSLATED",
-                    errorNote = null
-                )
-            } else if (dlg.dialogueId in rejectedDevanagariIds) {
-                dlg.copy(errorNote = "Model output rejected: contained Devanagari script instead of Roman Hinglish.")
-            } else if (dlg.japaneseText.isNotBlank()) {
-                dlg.copy(errorNote = "Translation omitted by model response; retry Stage 8 or translate manually.")
-            } else {
-                dlg
+        // Apply dictionary display rules & validate Mixed-Script compliance on every sentence
+        val sourceJapaneseById = translatable.associate { it.dialogueId to it.japaneseText }
+        val invalidForCorrection = mutableListOf<ParsedSentence>()
+        sentencesBySourceId.values.flatten().forEach { sent ->
+            val srcJp = sourceJapaneseById[sent.sourceDialogueId] ?: ""
+            sent.mixedScriptText = MixedScriptLanguageEngine.applyDictionariesToDisplayText(
+                displayText = sent.mixedScriptText,
+                japaneseSource = srcJp,
+                resolvedEntries = resolvedDicts
+            )
+            val validation = MixedScriptLanguageEngine.validateMixedScript(sent.mixedScriptText)
+            sent.scriptStatus = validation.status
+            if (!validation.isValid) {
+                invalidForCorrection.add(sent)
             }
         }
-        dao.insertDialogues(updatedDialogues)
 
-        val fullCoverage = missingIds.isEmpty() && rejectedDevanagariIds.isEmpty()
+        // One controlled Gemini script-correction pass if any Romanized Hindi leaked
+        if (invalidForCorrection.isNotEmpty()) {
+            try {
+                val correctionModel = createScriptCorrectionModel(cleanModelName)
+                val correctionPrompt = buildString {
+                    appendLine("Fix ONLY the script of each Hindi-English anime dialogue below without changing the meaning, emotion, or natural English words.")
+                    appendLine(MixedScriptLanguageEngine.PERMANENT_MIXED_SCRIPT_SYSTEM_RULES)
+                    appendLine()
+                    appendLine("Convert any Romanized Hindi words into proper Devanagari while keeping natural English words, brands, technical terms, and English names in English/Roman script.")
+                    appendLine("ITEMS TO FIX:")
+                    invalidForCorrection.forEach { s ->
+                        appendLine("KEY: ${s.key} | ORIGINAL_JAPANESE: ${sourceJapaneseById[s.sourceDialogueId] ?: ""} | TEXT: ${s.mixedScriptText}")
+                    }
+                }
+                val corrResp = withTimeout(45_000L) { correctionModel.generateContent(correctionPrompt) }
+                val corrJson = corrResp.text?.trim()
+                if (!corrJson.isNullOrBlank()) {
+                    val corrArr = JSONObject(corrJson).optJSONArray("corrections")
+                    val fixedByKey = mutableMapOf<String, String>()
+                    if (corrArr != null) {
+                        for (i in 0 until corrArr.length()) {
+                            val obj = corrArr.getJSONObject(i)
+                            val k = obj.optString("key", "").trim()
+                            val txt = obj.optString("correctedMixedScriptText", "").trim()
+                            if (k.isNotBlank() && txt.isNotBlank()) fixedByKey[k] = txt
+                        }
+                    }
+                    invalidForCorrection.forEach { sent ->
+                        val fixed = fixedByKey[sent.key]
+                        if (!fixed.isNullOrBlank()) {
+                            val srcJp = sourceJapaneseById[sent.sourceDialogueId] ?: ""
+                            val dictApplied = MixedScriptLanguageEngine.applyDictionariesToDisplayText(
+                                displayText = fixed,
+                                japaneseSource = srcJp,
+                                resolvedEntries = resolvedDicts
+                            )
+                            val recheck = MixedScriptLanguageEngine.validateMixedScript(dictApplied)
+                            sent.mixedScriptText = dictApplied
+                            sent.scriptStatus = if (recheck.isValid) {
+                                MixedScriptLanguageEngine.STATUS_CORRECTED
+                            } else {
+                                recheck.status
+                            }
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Controlled mixed-script correction pass failed: ${e.localizedMessage}")
+            }
+        }
+
+        // Build final chronological dialogue rows (supporting 1..N sentence splits with acoustic pause reconciliation)
+        val epDir = getEpisodeWorkspaceDir(episode.id)
+        val slicesDir = File(epDir, "jp_slices").apply { mkdirs() }
+        val maxEpMs = episode.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE
+        val assembledDialogues = mutableListOf<DialogueSegmentEntity>()
+        val invalidScriptIds = mutableListOf<String>()
+        var splitCount = 0
+
+        for (dlg in dialogues.sortedBy { it.originalStartMs }) {
+            val translatedSentences = sentencesBySourceId[dlg.dialogueId]
+            if (translatedSentences.isNullOrEmpty()) {
+                val errNote = if (dlg.japaneseText.isNotBlank()) {
+                    "Translation omitted by model response; retry Stage 8 or translate manually."
+                } else dlg.errorNote
+                assembledDialogues.add(dlg.copy(errorNote = errNote))
+                continue
+            }
+
+            if (translatedSentences.size == 1) {
+                val s = translatedSentences.first()
+                val ttsPron = MixedScriptLanguageEngine.buildTtsPronunciationText(s.mixedScriptText, resolvedDicts)
+                val scriptOk = s.scriptStatus == MixedScriptLanguageEngine.STATUS_VALID ||
+                    s.scriptStatus == MixedScriptLanguageEngine.STATUS_CORRECTED
+                if (!scriptOk) invalidScriptIds.add(dlg.dialogueId)
+                assembledDialogues.add(
+                    dlg.copy(
+                        romanHinglishText = s.mixedScriptText,
+                        ttsNormalizedText = ttsPron,
+                        speakingStyle = s.speakingStyle,
+                        emotion = s.emotion,
+                        emotionConfidence = s.emotionConfidence,
+                        translationConfidence = s.translationConfidence,
+                        sceneContextNote = s.sceneContextNote,
+                        scriptValidationStatus = s.scriptStatus,
+                        generationStatus = if (dlg.generatedAudioPath != null) dlg.generationStatus else "TRANSLATED",
+                        errorNote = if (scriptOk) null else "Mixed-script validation failed: Romanized Hindi detected. Tap Fix Script with Gemini."
+                    )
+                )
+            } else {
+                // Multi-sentence split: reconcile timestamps via acoustic pause-valley energy minima
+                splitCount++
+                val origSliceFile = File(dlg.originalAudioSlicePath)
+                val origSlicePcm = if (origSliceFile.exists() && origSliceFile.length() > 44L) {
+                    AudioDspEngine.readWavFile(origSliceFile)
+                } else null
+                val weights = translatedSentences.map { it.mixedScriptText.length.coerceAtLeast(1) }
+                val subRanges = AudioDspEngine.splitSegmentByAcousticPauses(
+                    segmentPcm = origSlicePcm,
+                    segmentStartMs = dlg.originalStartMs,
+                    segmentEndMs = dlg.originalEndMs,
+                    sentenceWeights = weights
+                )
+
+                translatedSentences.forEachIndexed { idx, s ->
+                    val (rawStart, rawEnd) = subRanges.getOrElse(idx) { dlg.originalStartMs to dlg.originalEndMs }
+                    val subStart = rawStart.coerceIn(0L, (maxEpMs - 100L).coerceAtLeast(0L))
+                    val subEnd = rawEnd.coerceIn(subStart + 100L, maxOf(subStart + 100L, maxEpMs))
+                    val subDur = (subEnd - subStart).coerceAtLeast(100L)
+
+                    val subSlicePath = if (origSlicePcm != null && origSlicePcm.samples.isNotEmpty()) {
+                        val relStart = (subStart - dlg.originalStartMs).coerceAtLeast(0L)
+                        val relEnd = (subEnd - dlg.originalStartMs).coerceAtLeast(relStart + 100L)
+                        val subBuf = AudioDspEngine.sliceBuffer(origSlicePcm, relStart, relEnd)
+                        val subFile = File(slicesDir, "jp_split_${dlg.dialogueId.lowercase().replace('-', '_')}_${idx + 1}.wav")
+                        AudioDspEngine.writeWavFile(subFile, subBuf)
+                        subFile.absolutePath
+                    } else {
+                        dlg.originalAudioSlicePath
+                    }
+
+                    val ttsPron = MixedScriptLanguageEngine.buildTtsPronunciationText(s.mixedScriptText, resolvedDicts)
+                    val scriptOk = s.scriptStatus == MixedScriptLanguageEngine.STATUS_VALID ||
+                        s.scriptStatus == MixedScriptLanguageEngine.STATUS_CORRECTED
+                    if (!scriptOk) invalidScriptIds.add("${dlg.dialogueId}.${idx + 1}")
+
+                    assembledDialogues.add(
+                        dlg.copy(
+                            id = 0L, // Fresh row for atomic replacement
+                            sourceDialogueRef = dlg.sourceDialogueRef.ifBlank { dlg.dialogueId },
+                            originalStartMs = subStart,
+                            originalEndMs = subEnd,
+                            originalDurationMs = subDur,
+                            timelineStartMs = subStart,
+                            originalAudioSlicePath = subSlicePath,
+                            romanHinglishText = s.mixedScriptText,
+                            ttsNormalizedText = ttsPron,
+                            speakingStyle = s.speakingStyle,
+                            emotion = s.emotion,
+                            emotionConfidence = s.emotionConfidence,
+                            translationConfidence = s.translationConfidence,
+                            sceneContextNote = s.sceneContextNote,
+                            timingStatus = "ACOUSTIC_ESTIMATED",
+                            alignmentSource = "Acoustic Pause-Valley Sub-Sentence Split (Estimated)",
+                            scriptValidationStatus = s.scriptStatus,
+                            generatedAudioPath = null,
+                            actualGeneratedDurationMs = 0L,
+                            durationDeviationMs = 0L,
+                            generationStatus = "TRANSLATED",
+                            syncStatus = "PENDING",
+                            errorNote = if (scriptOk) null else "Mixed-script validation failed: Romanized Hindi detected. Tap Fix Script with Gemini."
+                        )
+                    )
+                }
+            }
+        }
+
+        // Re-assign globally sequential unique IDs (A-001, B-002, A-003...) across all assembled dialogues
+        val sortedFinal = assembledDialogues.sortedBy { it.originalStartMs }
+        val distinctSpeakers = sortedFinal.map { it.speakerLabel }.distinct().sorted()
+        val batchBySpeaker = distinctSpeakers.withIndex().associate { (idx, lbl) -> lbl to (idx + 1) }
+        val countPerSpeaker = mutableMapOf<String, Int>()
+        val finalNumbered = sortedFinal.mapIndexed { idx, dlg ->
+            val globalNum = idx + 1
+            val label = dlg.speakerLabel.trim().uppercase().ifBlank { "UNIDENTIFIED" }
+            val newId = "$label-%03d".format(globalNum)
+            val spOrder = (countPerSpeaker[label] ?: 0) + 1
+            countPerSpeaker[label] = spOrder
+            dlg.copy(
+                id = 0L,
+                speakerLabel = label,
+                globalOrderNumber = globalNum,
+                dialogueId = newId,
+                characterBatchNumber = batchBySpeaker[label] ?: 0,
+                orderInCharacterBatch = spOrder
+            )
+        }
+
+        dao.replaceDialoguesAtomic(episode.id, finalNumbered)
+        cleanupOrphanedDialogueWavFiles(File(epDir, "generated_dialogues"), finalNumbered)
+
+        val missingIds = translatable.map { it.dialogueId }.filterNot { it in sentencesBySourceId }
+        val fullCoverage = missingIds.isEmpty() && invalidScriptIds.isEmpty()
         val coverageErr = if (!fullCoverage) {
             buildString {
-                if (rejectedDevanagariIds.isNotEmpty()) {
-                    append("Rejected Devanagari on: ${rejectedDevanagariIds.joinToString()}. ")
+                if (invalidScriptIds.isNotEmpty()) {
+                    append("Mixed-script validation failed on: ${invalidScriptIds.joinToString()}. ")
                 }
                 if (missingIds.isNotEmpty()) {
                     append("Missing translations for: ${missingIds.joinToString()}.")
@@ -1562,21 +1939,22 @@ $dialogueLinesPrompt
             }.trim()
         } else null
 
+        val splitNote = if (splitCount > 0) " ($splitCount segment(s) split into ${finalNumbered.size} sentences with acoustic-estimated sub-timings)" else ""
         recordAgentJob(
             episodeId = episode.id,
             agentNumber = 4,
             stageNumber = 8,
-            agentName = "Agent 4 — Translation & Dictionary",
-            operation = "Translated ${translatedMap.size}/${translatable.size} dialogue(s) via $cleanModelName",
+            agentName = "Agent 4 — Mixed-Script Translation & Dictionary",
+            operation = "Translated ${sentencesBySourceId.size}/${translatable.size} segment(s) → ${finalNumbered.size} line(s) via $cleanModelName",
             modelUsed = "$cleanModelName (Firebase AI Logic)",
             runtimeMode = "FIREBASE_AI_GEMINI",
-            inputSummary = "${translatable.size} Japanese lines + ${applicableEntries.size} dictionary terms",
+            inputSummary = "${translatable.size} Japanese segments + ${resolvedDicts.size} active dictionary terms",
             outputSummary = if (fullCoverage) {
-                "Saved all ${translatedMap.size} Roman Hinglish lines (100% coverage)"
+                "Saved ${finalNumbered.size} Mixed-Script Hindi-English line(s)$splitNote"
             } else {
-                "Partial coverage (${translatedMap.size}/${translatable.size}): $coverageErr"
+                "Incomplete (${sentencesBySourceId.size}/${translatable.size}): $coverageErr"
             },
-            completed = translatedMap.size,
+            completed = sentencesBySourceId.size,
             total = translatable.size,
             status = if (fullCoverage) "COMPLETED" else "FAILED",
             errorDetails = coverageErr,
@@ -1586,19 +1964,71 @@ $dialogueLinesPrompt
         val updated = episode.copy(
             currentStageNumber = 8,
             currentStageName = if (fullCoverage) {
-                "Stage 8 — Roman Hinglish Translated"
+                "Stage 8 — Mixed-Script Hindi-English Translated (${finalNumbered.size} lines)"
             } else {
-                "Stage 8 — Incomplete (${translatedMap.size}/${translatable.size})"
+                "Stage 8 — Script/Coverage Review Needed (${sentencesBySourceId.size}/${translatable.size})"
             },
             completedStagesMask = if (fullCoverage) {
                 invalidateDownstreamStages(episode.completedStagesMask, 8)
             } else {
                 clearStagesFrom(episode.completedStagesMask, 8)
             },
+            lastErrorMessage = if (fullCoverage) null else coverageErr,
             updatedAt = System.currentTimeMillis()
         )
         dao.updateEpisode(updated)
         return updated
+    }
+
+    /**
+     * One-tap controlled Gemini Mixed-Script repair for a single manually edited or legacy Roman-Hinglish dialogue line.
+     */
+    suspend fun fixSingleDialogueScriptWithGemini(
+        dialogueId: Long,
+        rawText: String,
+        geminiModelName: String = "gemini-3.8-flash"
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val trimmed = rawText.trim()
+        if (trimmed.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Enter dialogue text first."))
+        }
+        val dlg = dao.getDialogueById(dialogueId)
+        val ep = dlg?.let { dao.getEpisodeById(it.episodeId) }
+        val project = ep?.let { dao.getProjectById(it.projectId) }
+        val resolvedDicts = MixedScriptLanguageEngine.resolveScopedDictionaries(
+            allEntries = dao.getAllDictionaryEntriesOnce(),
+            projectId = ep?.projectId,
+            animeSeriesName = project?.animeSeriesName
+        )
+
+        try {
+            val model = createScriptCorrectionModel(geminiModelName)
+            val prompt = buildString {
+                appendLine("Convert any Romanized Hindi words in the dialogue below into natural Devanagari while preserving natural English words, brands, technical terms, and exact meaning.")
+                appendLine(MixedScriptLanguageEngine.PERMANENT_MIXED_SCRIPT_SYSTEM_RULES)
+                if (!dlg?.japaneseText.isNullOrBlank()) {
+                    appendLine("ORIGINAL JAPANESE: ${dlg?.japaneseText}")
+                }
+                appendLine("KEY: single | TEXT: $trimmed")
+            }
+            val resp = withTimeout(45_000L) { model.generateContent(prompt) }
+            val json = resp.text?.trim()
+                ?: return@withContext Result.failure(IllegalStateException("Gemini returned an empty response."))
+            val arr = JSONObject(json).optJSONArray("corrections")
+            val correctedRaw = arr?.optJSONObject(0)?.optString("correctedMixedScriptText", "")?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: return@withContext Result.failure(IllegalStateException("Invalid model JSON response: no corrected text returned."))
+            val withDict = MixedScriptLanguageEngine.applyDictionariesToDisplayText(
+                displayText = correctedRaw,
+                japaneseSource = dlg?.japaneseText ?: "",
+                resolvedEntries = resolvedDicts
+            )
+            Result.success(withDict)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(IllegalStateException(classifyGeminiFailure(e), e))
+        }
     }
 
     /**
@@ -1686,18 +2116,23 @@ $dialogueLinesPrompt
         val epDir = getEpisodeWorkspaceDir(episode.id)
         val genDir = File(epDir, "generated_dialogues").apply { mkdirs() }
         val speakersByLabel = dao.getSpeakersForEpisodeOnce(episode.id).associateBy { it.speakerLabel }
-        val dictionaries = dao.getAllDictionaryEntriesOnce()
+        val project = dao.getProjectById(episode.projectId)
+        val resolvedDictionaries = MixedScriptLanguageEngine.resolveScopedDictionaries(
+            allEntries = dao.getAllDictionaryEntriesOnce(),
+            projectId = episode.projectId,
+            animeSeriesName = project?.animeSeriesName
+        )
 
         val characterWiseDialogues = dao.getDialoguesCharacterWiseBatchesOnce(episode.id)
         val readyDialogues = characterWiseDialogues.filter { it.romanHinglishText.isNotBlank() }
         if (readyDialogues.isEmpty()) {
-            val msg = "No Roman Hinglish dialogue lines are ready for voice synthesis. Translate in Stage 8 or enter Hinglish text in the Translation tab."
+            val msg = "No Mixed-Script Hindi-English dialogue lines are ready for voice synthesis. Translate in Stage 8 or enter text in the Translate tab."
             recordAgentJob(
                 episodeId = episode.id,
                 agentNumber = 5,
                 stageNumber = 10,
                 agentName = "Agent 5 — Voice Generation",
-                operation = "Blocked: no Roman Hinglish text",
+                operation = "Blocked: no translated dialogue text",
                 modelUsed = "$selectedTtsEngine / Android Speech TTS",
                 runtimeMode = "ON_DEVICE_ANDROID",
                 inputSummary = "${characterWiseDialogues.size} dialogues (0 translated)",
@@ -1709,6 +2144,17 @@ $dialogueLinesPrompt
                 startedAt = startedAt
             )
             throw IllegalStateException(msg)
+        }
+
+        val (remoteF5Ready, _) = if (selectedTtsEngine == "F5-Hindi-24KHz" && remoteWorkerUrl.isNotBlank()) {
+            checkRemoteModelReady(
+                remoteWorkerUrl = remoteWorkerUrl,
+                remoteWorkerAuthToken = remoteWorkerAuthToken,
+                allowInsecureLocalHttp = allowInsecureLocalHttp,
+                modelKey = "f5_hindi"
+            )
+        } else {
+            false to "On-device TTS mode"
         }
 
         val distinctSpeakerLabels = readyDialogues.map { it.speakerLabel }.distinct().sorted()
@@ -1755,11 +2201,12 @@ $dialogueLinesPrompt
                 val synthOutcome = synthesizeSingleLineReal(
                     dialogueId = dlg.dialogueId,
                     speakerProfile = speakerProfile,
-                    visibleRomanHinglish = dlg.romanHinglishText,
-                    dictionaries = dictionaries,
+                    visibleMixedScript = dlg.romanHinglishText,
+                    resolvedDictionaries = resolvedDictionaries,
                     emotion = dlg.emotion,
                     targetDurationMs = dlg.originalDurationMs,
                     selectedEngineId = selectedTtsEngine,
+                    useRemoteF5 = remoteF5Ready,
                     remoteWorkerUrl = remoteWorkerUrl,
                     remoteWorkerAuthToken = remoteWorkerAuthToken,
                     allowInsecureLocalHttp = allowInsecureLocalHttp,
@@ -1841,7 +2288,7 @@ $dialogueLinesPrompt
                             modelVersion = "FAILED",
                             voiceReferenceId = speakerProfile.voiceReferenceId,
                             visibleRomanHinglish = dlg.romanHinglishText,
-                            internalPhoneticText = HinglishTtsNormalizer.normalizeForTtsPronunciation(dlg.romanHinglishText, dictionaries),
+                            internalPhoneticText = MixedScriptLanguageEngine.buildTtsPronunciationText(dlg.romanHinglishText, resolvedDictionaries),
                             emotionRequested = dlg.emotion,
                             emotionControlSupported = false,
                             targetDurationMs = dlg.originalDurationMs,
@@ -1858,6 +2305,8 @@ $dialogueLinesPrompt
                 batchExecutionSummary.add("Batch $batchNumber ($speakerLabel): [${batchIds.joinToString(", ")}]")
             }
         }
+
+        cleanupOrphanedDialogueWavFiles(genDir, dao.getDialoguesChronologicalOnce(episode.id))
 
         val jobStatus = if (generatedCount > 0 && failedCount == 0) "COMPLETED" else "FAILED"
         recordAgentJob(
@@ -1903,30 +2352,30 @@ $dialogueLinesPrompt
 
     /**
      * Real Speech Synthesis Dispatcher (Agent 15 + Agent 16 Pronunciation + Agent 17 WSOLA Sync):
-     * 1. Attempts Remote GPU Worker `SPRINGLab/F5-Hindi-24KHz` when configured.
+     * 1. Attempts Remote GPU Worker `SPRINGLab/F5-Hindi-24KHz` when configured & model ready.
      * 2. Falls back to real On-Device `AndroidSpeechTtsEngine` (generic Android system TTS).
-     * Never synthesizes fake sine-wave tones.
+     * Never mutates visible Mixed-Script display text; feeds separate dictionary-guided pronunciation text to TTS.
      */
     private suspend fun synthesizeSingleLineReal(
         dialogueId: String,
         speakerProfile: SpeakerProfileEntity,
-        visibleRomanHinglish: String,
-        dictionaries: List<DictionaryEntryEntity>,
+        visibleMixedScript: String,
+        resolvedDictionaries: List<DictionaryEntryEntity>,
         emotion: String,
         targetDurationMs: Long,
         selectedEngineId: String,
+        useRemoteF5: Boolean,
         remoteWorkerUrl: String,
         remoteWorkerAuthToken: String,
         allowInsecureLocalHttp: Boolean,
         outputDir: File,
         sampleRateHz: Int
     ): Result<SynthesizedDialogueResult> {
-        val internalPhonetic = HinglishTtsNormalizer.normalizeForTtsPronunciation(visibleRomanHinglish, dictionaries)
-        val speakableText = HinglishTtsNormalizer.prepareSpeakableText(visibleRomanHinglish, dictionaries)
+        val speakableText = MixedScriptLanguageEngine.buildTtsPronunciationText(visibleMixedScript, resolvedDictionaries)
         val outFile = File(outputDir, "dlg_${dialogueId.lowercase().replace('-', '_')}.wav")
 
-        // Path 1: Remote GPU Worker F5-Hindi-24KHz
-        if (selectedEngineId == "F5-Hindi-24KHz" && remoteWorkerUrl.isNotBlank()) {
+        // Path 1: Remote GPU Worker F5-Hindi-24KHz (only when model verified ready)
+        if (selectedEngineId == "F5-Hindi-24KHz" && useRemoteF5 && remoteWorkerUrl.isNotBlank()) {
             val refFile = speakerProfile.voiceReferencePath
                 .takeIf { it.isNotBlank() && speakerProfile.rightsConsentConfirmed }
                 ?.let { File(it) }
@@ -1954,6 +2403,7 @@ $dialogueLinesPrompt
                         AudioDspEngine.writeWavFile(outFile, stretched)
                         val devMs = abs(stretched.durationMs - targetDurationMs)
                         val syncStatus = when {
+                            stretchRatio !in 0.75f..1.35f -> "NEEDS_ADAPTATION"
                             devMs <= 120L && abs(stretchRatio - 1.0f) <= 0.03f -> "ALIGNED"
                             devMs <= 350L -> "TIME_STRETCHED"
                             else -> "NEEDS_ADAPTATION"
@@ -1961,8 +2411,8 @@ $dialogueLinesPrompt
                         return Result.success(
                             SynthesizedDialogueResult(
                                 outputFile = outFile,
-                                visibleRomanHinglish = visibleRomanHinglish,
-                                internalNormalizedPhonetic = internalPhonetic,
+                                visibleRomanHinglish = visibleMixedScript,
+                                internalNormalizedPhonetic = speakableText,
                                 actualDurationMs = stretched.durationMs,
                                 timeStretchRatio = stretchRatio,
                                 peakDbfs = AudioDspEngine.computePeakDbfs(stretched),
@@ -1980,6 +2430,7 @@ $dialogueLinesPrompt
         val androidRes = androidTtsEngine.synthesizeSpokenDialogueToWav(
             dialogueId = dialogueId,
             textToSpeak = speakableText,
+            displayMixedScriptText = visibleMixedScript,
             speakerProfile = speakerProfile,
             emotion = emotion,
             targetDurationMs = targetDurationMs,
@@ -1988,8 +2439,8 @@ $dialogueLinesPrompt
         )
         return androidRes.map { res ->
             res.copy(
-                visibleRomanHinglish = visibleRomanHinglish,
-                internalNormalizedPhonetic = internalPhonetic
+                visibleRomanHinglish = visibleMixedScript,
+                internalNormalizedPhonetic = speakableText
             )
         }
     }
@@ -2210,28 +2661,36 @@ $dialogueLinesPrompt
 
         val checks = mutableListOf<QualityCheckResultEntity>()
 
-        // 1. Translation completeness & Roman script check (no Devanagari)
-        val devanagariRegex = Regex("[\\u0900-\\u097F]")
+        // 1. Mixed-Script Hindi-English (Devanagari + English) Translation Completeness & Compliance
         val missingTrans = chronological.filter { it.romanHinglishText.isBlank() }
-        val devanagariLines = chronological.filter { devanagariRegex.containsMatchIn(it.romanHinglishText) }
+        val invalidScriptLines = chronological.filter { dlg ->
+            dlg.romanHinglishText.isNotBlank() &&
+                !MixedScriptLanguageEngine.validateMixedScript(dlg.romanHinglishText).isValid
+        }
+        val acousticEstimatedCount = chronological.count { it.timingStatus == "ACOUSTIC_ESTIMATED" }
         checks.add(
             QualityCheckResultEntity(
                 episodeId = episode.id,
                 checkNumber = 1,
-                checkName = "1. Roman Hinglish Translation Completeness",
+                checkName = "1. Mixed-Script Hindi-English Compliance",
                 category = "Translation (Agent 4)",
                 status = when {
                     !hasDialogues -> "BLOCKED"
-                    missingTrans.isNotEmpty() || devanagariLines.isNotEmpty() -> "FAILED"
+                    missingTrans.isNotEmpty() || invalidScriptLines.isNotEmpty() -> "FAILED"
                     else -> "PASSED"
                 },
                 summaryMessage = when {
                     !hasDialogues -> "Blocked: No dialogue segments exist yet."
-                    devanagariLines.isNotEmpty() -> "${devanagariLines.size} line(s) contain Devanagari characters; convert to Roman Hinglish."
-                    missingTrans.isNotEmpty() -> "${missingTrans.size} of ${chronological.size} dialogue(s) missing Roman Hinglish translation."
-                    else -> "All ${chronological.size} dialogues have valid Roman Hinglish text."
+                    invalidScriptLines.isNotEmpty() ->
+                        "${invalidScriptLines.size} line(s) contain Romanized Hindi instead of Devanagari + English. Tap Fix Script with Gemini in Translate."
+                    missingTrans.isNotEmpty() ->
+                        "${missingTrans.size} of ${chronological.size} dialogue(s) missing Mixed-Script Hindi-English translation."
+                    else -> {
+                        val timingNote = if (acousticEstimatedCount > 0) " ($acousticEstimatedCount acoustic-estimated timing window(s))" else ""
+                        "All ${chronological.size} dialogues comply with Mixed-Script Hindi-English (Devanagari + English)$timingNote."
+                    }
                 },
-                affectedDialogueIds = (missingTrans + devanagariLines).distinctBy { it.id }.joinToString { it.dialogueId },
+                affectedDialogueIds = (missingTrans + invalidScriptLines).distinctBy { it.id }.joinToString { it.dialogueId },
                 remediationTargetScreen = "TRANSLATION"
             )
         )
@@ -2779,13 +3238,19 @@ $dialogueLinesPrompt
             ?: return@withContext Result.failure(IllegalArgumentException("Dialogue not found."))
         val episode = dao.getEpisodeById(dlg.episodeId)
             ?: return@withContext Result.failure(IllegalArgumentException("Episode not found."))
+        val project = dao.getProjectById(episode.projectId)
         val speakers = dao.getSpeakersForEpisodeOnce(episode.id).associateBy { it.speakerLabel }
-        val dictionaries = dao.getAllDictionaryEntriesOnce()
+        val resolvedDictionaries = MixedScriptLanguageEngine.resolveScopedDictionaries(
+            allEntries = dao.getAllDictionaryEntriesOnce(),
+            projectId = episode.projectId,
+            animeSeriesName = project?.animeSeriesName
+        )
 
-        val updatedHinglish = newRomanHinglishText?.trim() ?: dlg.romanHinglishText
-        if (updatedHinglish.isBlank()) {
-            return@withContext Result.failure(IllegalStateException("Enter Roman Hinglish text before synthesizing voice audio."))
+        val updatedDisplayText = newRomanHinglishText?.trim() ?: dlg.romanHinglishText
+        if (updatedDisplayText.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Enter Mixed-Script Hindi-English text before synthesizing voice audio."))
         }
+        val scriptValidation = MixedScriptLanguageEngine.validateMixedScript(updatedDisplayText)
         val updatedEmotion = newEmotion?.trim()?.takeIf { it.isNotBlank() } ?: dlg.emotion
         val cleanSpeaker = dlg.speakerLabel.ifBlank { "UNIDENTIFIED" }
         val speakerProfile = speakers[cleanSpeaker] ?: SpeakerProfileEntity(
@@ -2814,15 +3279,26 @@ $dialogueLinesPrompt
 
         val epDir = getEpisodeWorkspaceDir(episode.id)
         val genDir = File(epDir, "generated_dialogues").apply { mkdirs() }
+        val (remoteF5Ready, _) = if (selectedTtsEngine == "F5-Hindi-24KHz" && remoteWorkerUrl.isNotBlank()) {
+            checkRemoteModelReady(
+                remoteWorkerUrl = remoteWorkerUrl,
+                remoteWorkerAuthToken = remoteWorkerAuthToken,
+                allowInsecureLocalHttp = allowInsecureLocalHttp,
+                modelKey = "f5_hindi"
+            )
+        } else {
+            false to "On-device TTS mode"
+        }
 
         val synthOutcome = synthesizeSingleLineReal(
             dialogueId = dlg.dialogueId,
             speakerProfile = speakerProfile,
-            visibleRomanHinglish = updatedHinglish,
-            dictionaries = dictionaries,
+            visibleMixedScript = updatedDisplayText,
+            resolvedDictionaries = resolvedDictionaries,
             emotion = updatedEmotion,
             targetDurationMs = dlg.originalDurationMs,
             selectedEngineId = selectedTtsEngine,
+            useRemoteF5 = remoteF5Ready,
             remoteWorkerUrl = remoteWorkerUrl,
             remoteWorkerAuthToken = remoteWorkerAuthToken,
             allowInsecureLocalHttp = allowInsecureLocalHttp,
@@ -2834,7 +3310,8 @@ $dialogueLinesPrompt
             val errMsg = synthOutcome.exceptionOrNull()?.localizedMessage ?: "Real speech synthesis failed."
             dao.updateDialogue(
                 dlg.copy(
-                    romanHinglishText = updatedHinglish,
+                    romanHinglishText = updatedDisplayText,
+                    scriptValidationStatus = scriptValidation.status,
                     emotion = updatedEmotion,
                     generationStatus = "FAILED",
                     errorNote = errMsg
@@ -2846,8 +3323,9 @@ $dialogueLinesPrompt
         val synthResult = synthOutcome.getOrThrow()
         val isRemoteF5 = synthResult.engineUsed.contains("F5-Hindi", ignoreCase = true)
         val updatedDlg = dlg.copy(
-            romanHinglishText = updatedHinglish,
+            romanHinglishText = updatedDisplayText,
             ttsNormalizedText = synthResult.internalNormalizedPhonetic,
+            scriptValidationStatus = scriptValidation.status,
             emotion = updatedEmotion,
             previousGeneratedAudioPath = dlg.generatedAudioPath,
             generatedAudioPath = synthResult.outputFile.absolutePath,
@@ -2874,7 +3352,7 @@ $dialogueLinesPrompt
                 ttsEngine = synthResult.engineUsed,
                 modelVersion = synthResult.modelVersion,
                 voiceReferenceId = speakerProfile.voiceReferenceId,
-                visibleRomanHinglish = updatedHinglish,
+                visibleRomanHinglish = updatedDisplayText,
                 internalPhoneticText = synthResult.internalNormalizedPhonetic,
                 emotionRequested = updatedEmotion,
                 emotionControlSupported = isRemoteF5,
@@ -2911,6 +3389,8 @@ $dialogueLinesPrompt
     ): Int = withContext(Dispatchers.IO) {
         val episode = dao.getEpisodeById(episodeId) ?: return@withContext 0
         val project = dao.getProjectById(episode.projectId)
+        val cleanNewTerm = newRomanHinglishTerm.trim()
+        if (cleanNewTerm.isBlank()) return@withContext 0
 
         if (scope in listOf("CURRENT_ANIME", "GLOBALLY", "EVERYWHERE", "CURRENT_EPISODE")) {
             val dictLevel = when (scope) {
@@ -2918,22 +3398,43 @@ $dialogueLinesPrompt
                 "CURRENT_EPISODE" -> "PROJECT"
                 else -> "GLOBAL"
             }
-            dao.insertDictionaryEntry(
-                DictionaryEntryEntity(
-                    dictionaryLevel = dictLevel,
-                    projectId = if (dictLevel == "PROJECT") episode.projectId else null,
-                    animeSeriesName = if (dictLevel == "ANIME") project?.animeSeriesName else null,
-                    japaneseSourceTerm = japaneseTerm.ifBlank { oldTermOrWord },
-                    preferredRomanHinglish = newRomanHinglishTerm,
-                    preferredHindiWording = newRomanHinglishTerm,
-                    preferredEnglishWording = newRomanHinglishTerm,
-                    preserveOriginalEnglish = true,
-                    pronunciationGuidance = pronunciationGuidance.ifBlank { newRomanHinglishTerm },
-                    contextNotes = "Scoped update ($scope)",
-                    replacementScope = scope
-                )
+            val sourceTerm = japaneseTerm.trim().ifBlank { oldTermOrWord.trim() }
+            val termKey = MixedScriptLanguageEngine.normalizedTermKey(sourceTerm, cleanNewTerm)
+            val targetProjectId = if (dictLevel == "PROJECT") episode.projectId else null
+            val targetAnime = if (dictLevel == "ANIME") project?.animeSeriesName?.trim() else null
+
+            val existing = dao.getAllDictionaryEntriesOnce().find { entry ->
+                entry.dictionaryLevel == dictLevel &&
+                    entry.projectId == targetProjectId &&
+                    (entry.animeSeriesName?.trim() ?: "").equals(targetAnime ?: "", ignoreCase = true) &&
+                    MixedScriptLanguageEngine.normalizedTermKey(entry.japaneseSourceTerm, MixedScriptLanguageEngine.preferredDisplayTerm(entry)) == termKey
+            }
+
+            val hasDevanagari = MixedScriptLanguageEngine.containsDevanagari(cleanNewTerm)
+            val entryToSave = DictionaryEntryEntity(
+                id = existing?.id ?: 0L,
+                dictionaryLevel = dictLevel,
+                projectId = targetProjectId,
+                animeSeriesName = targetAnime,
+                japaneseSourceTerm = sourceTerm,
+                preferredMixedScript = cleanNewTerm,
+                preferredRomanHinglish = cleanNewTerm,
+                preferredHindiWording = if (hasDevanagari) cleanNewTerm else (existing?.preferredHindiWording ?: ""),
+                preferredEnglishWording = if (!hasDevanagari) cleanNewTerm else (existing?.preferredEnglishWording ?: ""),
+                preserveOriginalEnglish = !hasDevanagari,
+                pronunciationGuidance = pronunciationGuidance.trim().ifBlank { existing?.pronunciationGuidance ?: "" },
+                contextNotes = "Scoped update ($scope)",
+                replacementScope = scope,
+                updatedAt = System.currentTimeMillis()
             )
+            dao.insertDictionaryEntry(entryToSave)
         }
+
+        val resolvedDicts = MixedScriptLanguageEngine.resolveScopedDictionaries(
+            allEntries = dao.getAllDictionaryEntriesOnce(),
+            projectId = episode.projectId,
+            animeSeriesName = project?.animeSeriesName
+        )
 
         val dialogues = dao.getDialoguesChronologicalOnce(episodeId)
         val candidates = when (scope) {
@@ -2947,12 +3448,21 @@ $dialogueLinesPrompt
         var affectedCount = 0
         for (dlg in candidates) {
             if (dlg.romanHinglishText.isBlank()) continue
-            val updatedText = if (oldTermOrWord.isNotBlank() && dlg.romanHinglishText.contains(oldTermOrWord, ignoreCase = true)) {
-                dlg.romanHinglishText.replace(Regex(Regex.escape(oldTermOrWord), RegexOption.IGNORE_CASE), newRomanHinglishTerm)
-            } else if (!dlg.romanHinglishText.contains(newRomanHinglishTerm, ignoreCase = true)) {
-                "${dlg.romanHinglishText.trimEnd('.')} ($newRomanHinglishTerm)."
-            } else {
-                dlg.romanHinglishText
+            var updatedText = dlg.romanHinglishText
+            if (oldTermOrWord.isNotBlank()) {
+                val boundaryPattern = Regex(
+                    "(?<![\\p{L}\\p{N}_\\u0900-\\u097F])${Regex.escape(oldTermOrWord.trim())}(?![\\p{L}\\p{N}_\\u0900-\\u097F])",
+                    RegexOption.IGNORE_CASE
+                )
+                updatedText = boundaryPattern.replace(updatedText) { cleanNewTerm }
+            }
+            updatedText = MixedScriptLanguageEngine.applyDictionariesToDisplayText(
+                displayText = updatedText,
+                japaneseSource = dlg.japaneseText,
+                resolvedEntries = resolvedDicts
+            )
+            if (updatedText == dlg.romanHinglishText && scope !in listOf("ONLY_HERE", "CURRENT_DIALOGUE")) {
+                continue
             }
             regenerateSingleDialogueOnly(
                 dialogueId = dlg.id,
@@ -2965,25 +3475,6 @@ $dialogueLinesPrompt
             affectedCount++
         }
         affectedCount
-    }
-
-    private fun applyDictionariesToLine(
-        romanHinglish: String,
-        dictionaries: List<DictionaryEntryEntity>
-    ): String {
-        var result = romanHinglish
-        for (entry in dictionaries) {
-            if (entry.preferredHindiWording.isNotBlank() &&
-                entry.preferredHindiWording != entry.preferredRomanHinglish &&
-                result.contains(entry.preferredHindiWording, ignoreCase = true)
-            ) {
-                result = result.replace(
-                    Regex(Regex.escape(entry.preferredHindiWording), RegexOption.IGNORE_CASE),
-                    entry.preferredRomanHinglish
-                )
-            }
-        }
-        return result
     }
 
     private suspend fun recordAgentJob(

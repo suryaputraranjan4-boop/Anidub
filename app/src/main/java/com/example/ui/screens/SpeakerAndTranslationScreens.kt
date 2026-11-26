@@ -299,8 +299,12 @@ fun SpeakerProfilesView(viewModel: StudioViewModel) {
 
 /**
  * TRANSLATION & DICTIONARY STUDIO
- * Clean Roman Hinglish translation editor (Japanese -> Roman Hinglish, never Devanagari)
- * paired with Global / Anime / Project dictionary management.
+ * Permanent Mixed-Script Hindi-English (Devanagari + English) translation editor with:
+ * - Live mixed-script compliance validation + one-tap "Fix Script with Gemini" repair
+ * - Timing source transparency (`ASR-Aligned` / `Acoustic-Estimated` / `Manual`) & split parent ref
+ * - Separate read-only TTS pronunciation feed preview
+ * - Genuinely editable 3-Tier Dictionaries (`Project > Anime > Global`) with strict project/anime isolation,
+ *   live search, Add / Edit / Delete CRUD, and full Devanagari / English / Mixed-Script / Pronunciation fields.
  */
 @Composable
 fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
@@ -308,23 +312,40 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
     val dictionaries by viewModel.dictionaries.collectAsState()
     val activeProject by viewModel.activeProject.collectAsState()
     val banner by viewModel.pipelineBanner.collectAsState()
+    val config by viewModel.studioConfig.collectAsState()
 
     var subMode by remember { mutableStateOf("TRANSLATIONS") } // TRANSLATIONS or DICTIONARIES
-    var dictLevelFilter by remember { mutableStateOf("GLOBAL") } // GLOBAL, ANIME, PROJECT
-    var showAddDictDialog by remember { mutableStateOf(false) }
+    var dictLevelFilter by remember { mutableStateOf("ALL_ACTIVE") } // ALL_ACTIVE, PROJECT, ANIME, GLOBAL
+    var dictSearchQuery by remember { mutableStateOf("") }
+    var editingDictEntry by remember { mutableStateOf<DictionaryEntryEntity?>(null) }
+    var showDictDialog by remember { mutableStateOf(false) }
     var editingDialogue by remember { mutableStateOf<DialogueSegmentEntity?>(null) }
 
     val emotions = listOf("NEUTRAL", "ANGRY", "EXCITED", "CALM", "SAD", "HAPPY", "FEARFUL", "SHOUTING", "WHISPERING")
 
+    // Strictly scoped active dictionaries for the current project/anime (zero cross-project leakage)
+    val activeScopedDicts = remember(dictionaries, activeProject) {
+        com.example.engine.MixedScriptLanguageEngine.resolveScopedDictionaries(
+            allEntries = dictionaries,
+            projectId = activeProject?.id,
+            animeSeriesName = activeProject?.animeSeriesName
+        )
+    }
+
     if (editingDialogue != null) {
         val dlg = editingDialogue!!
-        var hinglishText by remember(dlg.id) { mutableStateOf(dlg.romanHinglishText) }
+        var mixedText by remember(dlg.id) { mutableStateOf(dlg.romanHinglishText) }
         var emotion by remember(dlg.id) { mutableStateOf(dlg.emotion) }
         var style by remember(dlg.id) { mutableStateOf(dlg.speakingStyle) }
-        val hasDevanagari = Regex("[\\u0900-\\u097F]").containsMatchIn(hinglishText)
+        var isFixingScript by remember(dlg.id) { mutableStateOf(false) }
+
+        val scriptCheck = remember(mixedText) {
+            com.example.engine.MixedScriptLanguageEngine.validateMixedScript(mixedText)
+        }
+        val showRomanWarning = mixedText.isNotBlank() && !scriptCheck.isValid
 
         AlertDialog(
-            onDismissRequest = { editingDialogue = null },
+            onDismissRequest = { if (!isFixingScript) editingDialogue = null },
             containerColor = StudioSurfaceElevated,
             title = { Text("Translate ${dlg.dialogueId}", color = StudioTextPrimary) },
             text = {
@@ -333,19 +354,46 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                         Text(dlg.japaneseText, style = MaterialTheme.typography.bodySmall, color = StudioTextSecondary)
                     }
                     OutlinedTextField(
-                        value = hinglishText,
-                        onValueChange = { hinglishText = it },
-                        label = { Text("Roman Hinglish (Latin Script Only)") },
-                        modifier = Modifier.fillMaxWidth(),
-                        isError = hasDevanagari,
+                        value = mixedText,
+                        onValueChange = { mixedText = it },
+                        label = { Text("Mixed-Script Hindi-English (देवनागरी + English)") },
+                        placeholder = { Text("उदाहरण: मुझे तुम्हारे साथ जाना है, but अभी time नहीं है।") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("dialogue_mixed_script_input"),
+                        isError = showRomanWarning,
                         minLines = 2
                     )
-                    if (hasDevanagari) {
+                    if (showRomanWarning) {
                         Text(
-                            "Devanagari script detected. Use Roman Hinglish (e.g., 'Mujhe kam mat samajhna.').",
+                            text = scriptCheck.issueSummary.ifBlank {
+                                "Romanized Hindi detected. Write Hindi words in Devanagari and keep English words in English."
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             color = StudioAmber
                         )
+                        OutlinedButton(
+                            onClick = {
+                                isFixingScript = true
+                                viewModel.fixDialogueScriptWithGemini(dlg.id, mixedText) { result ->
+                                    isFixingScript = false
+                                    result.onSuccess { fixed -> mixedText = fixed }
+                                }
+                            },
+                            enabled = !isFixingScript,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .testTag("fix_script_gemini_btn"),
+                            border = BorderStroke(1.dp, StudioViolet)
+                        ) {
+                            Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                if (isFixingScript) "Fixing Script with Gemini…" else "Fix Script with Gemini",
+                                color = StudioViolet
+                            )
+                        }
                     }
                     OutlinedTextField(
                         value = style,
@@ -384,48 +432,83 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     TextButton(
-                        enabled = !hasDevanagari,
+                        enabled = !isFixingScript && mixedText.isNotBlank(),
                         onClick = {
-                            viewModel.updateDialogueTranslationOnly(dlg, hinglishText, emotion, style)
+                            viewModel.updateDialogueTranslationOnly(dlg, mixedText, emotion, style)
                             editingDialogue = null
-                        }
+                        },
+                        modifier = Modifier.testTag("dialogue_save_text_btn")
                     ) {
                         Text("Save Text", color = StudioCyan)
                     }
                     TextButton(
-                        enabled = !hasDevanagari && hinglishText.isNotBlank(),
+                        enabled = !isFixingScript && mixedText.isNotBlank(),
                         onClick = {
-                            viewModel.updateAndRegenerateSingleDialogue(dlg.id, hinglishText, emotion)
+                            viewModel.updateAndRegenerateSingleDialogue(dlg.id, mixedText, emotion)
                             editingDialogue = null
-                        }
+                        },
+                        modifier = Modifier.testTag("dialogue_save_voice_btn")
                     ) {
                         Text("Save & Voice", color = StudioViolet)
                     }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { editingDialogue = null }) {
+                TextButton(
+                    enabled = !isFixingScript,
+                    onClick = { editingDialogue = null }
+                ) {
                     Text("Cancel", color = StudioTextSecondary)
                 }
             }
         )
     }
 
-    if (showAddDictDialog) {
-        var jpTerm by remember { mutableStateOf("") }
-        var romanTerm by remember { mutableStateOf("") }
-        var pronGuide by remember { mutableStateOf("") }
-        var notes by remember { mutableStateOf("") }
-        var level by remember { mutableStateOf(dictLevelFilter) }
+    if (showDictDialog) {
+        val existing = editingDictEntry
+        val defaultLevel = existing?.dictionaryLevel ?: when (dictLevelFilter) {
+            "PROJECT", "ANIME", "GLOBAL" -> dictLevelFilter
+            else -> if (activeProject != null) "PROJECT" else "GLOBAL"
+        }
+        var level by remember(existing?.id, showDictDialog) { mutableStateOf(defaultLevel) }
+        var jpTerm by remember(existing?.id, showDictDialog) { mutableStateOf(existing?.japaneseSourceTerm ?: "") }
+        var mixedTerm by remember(existing?.id, showDictDialog) {
+            mutableStateOf(
+                existing?.let { com.example.engine.MixedScriptLanguageEngine.preferredDisplayTerm(it) } ?: ""
+            )
+        }
+        var hindiTerm by remember(existing?.id, showDictDialog) { mutableStateOf(existing?.preferredHindiWording ?: "") }
+        var englishTerm by remember(existing?.id, showDictDialog) { mutableStateOf(existing?.preferredEnglishWording ?: "") }
+        var pronGuide by remember(existing?.id, showDictDialog) { mutableStateOf(existing?.pronunciationGuidance ?: "") }
+        var notes by remember(existing?.id, showDictDialog) { mutableStateOf(existing?.contextNotes ?: "") }
+
+        val scopeBlockedReason = when {
+            level == "PROJECT" && activeProject == null -> "Create or open a project first to save Project-level terms."
+            level == "ANIME" && activeProject?.animeSeriesName.isNullOrBlank() -> "Active project has no Anime Series name; select Project or Global."
+            else -> null
+        }
 
         AlertDialog(
-            onDismissRequest = { showAddDictDialog = false },
+            onDismissRequest = {
+                showDictDialog = false
+                editingDictEntry = null
+            },
             containerColor = StudioSurfaceElevated,
-            title = { Text("Add Dictionary Term", color = StudioTextPrimary) },
+            title = {
+                Text(
+                    if (existing != null) "Edit Dictionary Term" else "Add Dictionary Term",
+                    color = StudioTextPrimary
+                )
+            },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Scope Precedence: PROJECT > ANIME > GLOBAL",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StudioTextMuted
+                    )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("GLOBAL", "ANIME", "PROJECT").forEach { lvl ->
+                        listOf("PROJECT", "ANIME", "GLOBAL").forEach { lvl ->
                             FilterChip(
                                 selected = level == lvl,
                                 onClick = { level = lvl },
@@ -433,25 +516,53 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                             )
                         }
                     }
+                    if (scopeBlockedReason != null) {
+                        Text(scopeBlockedReason, style = MaterialTheme.typography.labelSmall, color = StudioAmber)
+                    }
                     OutlinedTextField(
                         value = jpTerm,
                         onValueChange = { jpTerm = it },
-                        label = { Text("Japanese Term") },
-                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Japanese Source Term") },
+                        placeholder = { Text("e.g., 領域展開 or 先輩") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("dict_jp_source_input"),
                         singleLine = true
                     )
                     OutlinedTextField(
-                        value = romanTerm,
-                        onValueChange = { romanTerm = it },
-                        label = { Text("Preferred Roman Hinglish / English") },
-                        modifier = Modifier.fillMaxWidth(),
+                        value = mixedTerm,
+                        onValueChange = { mixedTerm = it },
+                        label = { Text("Preferred Mixed-Script (देवनागरी / English)") },
+                        placeholder = { Text("e.g., Domain Expansion or सीनियर") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("dict_mixed_script_input"),
                         singleLine = true
                     )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = hindiTerm,
+                            onValueChange = { hindiTerm = it },
+                            label = { Text("Hindi (देवनागरी)") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true
+                        )
+                        OutlinedTextField(
+                            value = englishTerm,
+                            onValueChange = { englishTerm = it },
+                            label = { Text("English Wording") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true
+                        )
+                    }
                     OutlinedTextField(
                         value = pronGuide,
                         onValueChange = { pronGuide = it },
-                        label = { Text("Pronunciation Hint (Optional)") },
-                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("TTS Pronunciation Guidance (Roman / Spoken)") },
+                        placeholder = { Text("Optional TTS override — never alters display text") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("dict_pronunciation_input"),
                         singleLine = true
                     )
                     OutlinedTextField(
@@ -464,31 +575,44 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                 }
             },
             confirmButton = {
+                val resolvedPreferred = mixedTerm.trim()
+                    .ifBlank { hindiTerm.trim() }
+                    .ifBlank { englishTerm.trim() }
                 TextButton(
-                    enabled = jpTerm.isNotBlank() && romanTerm.isNotBlank(),
+                    enabled = scopeBlockedReason == null && (jpTerm.isNotBlank() || resolvedPreferred.isNotBlank()) && resolvedPreferred.isNotBlank(),
                     onClick = {
                         viewModel.addOrUpdateDictionaryEntry(
                             DictionaryEntryEntity(
+                                id = existing?.id ?: 0L,
                                 dictionaryLevel = level,
                                 projectId = if (level == "PROJECT") activeProject?.id else null,
                                 animeSeriesName = if (level == "ANIME") activeProject?.animeSeriesName else null,
                                 japaneseSourceTerm = jpTerm.trim(),
-                                preferredRomanHinglish = romanTerm.trim(),
-                                preferredHindiWording = romanTerm.trim(),
-                                preferredEnglishWording = romanTerm.trim(),
-                                preserveOriginalEnglish = true,
-                                pronunciationGuidance = pronGuide.trim().ifBlank { romanTerm.trim() },
-                                contextNotes = notes.trim()
+                                preferredMixedScript = resolvedPreferred,
+                                preferredRomanHinglish = resolvedPreferred,
+                                preferredHindiWording = hindiTerm.trim(),
+                                preferredEnglishWording = englishTerm.trim(),
+                                preserveOriginalEnglish = !com.example.engine.MixedScriptLanguageEngine.containsDevanagari(resolvedPreferred),
+                                pronunciationGuidance = pronGuide.trim(),
+                                contextNotes = notes.trim(),
+                                replacementScope = existing?.replacementScope ?: level
                             )
                         )
-                        showAddDictDialog = false
-                    }
+                        showDictDialog = false
+                        editingDictEntry = null
+                    },
+                    modifier = Modifier.testTag("dict_save_btn")
                 ) {
-                    Text("Save Term", color = StudioViolet)
+                    Text(if (existing != null) "Update Term" else "Save Term", color = StudioViolet)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showAddDictDialog = false }) {
+                TextButton(
+                    onClick = {
+                        showDictDialog = false
+                        editingDictEntry = null
+                    }
+                ) {
                     Text("Cancel", color = StudioTextSecondary)
                 }
             }
@@ -502,7 +626,7 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Mode Switcher: Translations vs Dictionaries
+        // Mode Switcher: Mixed-Script Translations vs 3-Tier Dictionaries
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -511,8 +635,10 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                 FilterChip(
                     selected = subMode == "TRANSLATIONS",
                     onClick = { subMode = "TRANSLATIONS" },
-                    label = { Text("Hinglish Editor (${dialogues.size})") },
-                    modifier = Modifier.weight(1f),
+                    label = { Text("Mixed-Script (${dialogues.size})") },
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("tab_translations_mode"),
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = StudioViolet.copy(alpha = 0.2f),
                         selectedLabelColor = StudioViolet,
@@ -522,8 +648,10 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                 FilterChip(
                     selected = subMode == "DICTIONARIES",
                     onClick = { subMode = "DICTIONARIES" },
-                    label = { Text("Dictionaries (${dictionaries.size})") },
-                    modifier = Modifier.weight(1f),
+                    label = { Text("Dictionaries (${activeScopedDicts.size})") },
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("tab_dictionaries_mode"),
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = StudioCyan.copy(alpha = 0.2f),
                         selectedLabelColor = StudioCyan,
@@ -542,9 +670,9 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Roman Hinglish Translation", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+                            Text("Mixed-Script Hindi-English (देवनागरी + English)", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                             Text(
-                                "Powered by Gemini 3.8 Flash via Firebase AI Logic with 3-tier dictionary enforcement.",
+                                "Powered by ${config.geminiModelName} via Firebase AI Logic • Hindi in Devanagari, natural English preserved • 3-tier dictionary precedence.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = StudioTextSecondary
                             )
@@ -576,22 +704,45 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                     StudioEmptyState(
                         icon = Icons.Default.Translate,
                         title = "No Dialogues Ready for Translation",
-                        description = "Segment and transcribe dialogue lines in the Transcript tab first before translating into Roman Hinglish.",
+                        description = "Segment and transcribe dialogue lines in the Transcript tab first before translating into Mixed-Script Hindi-English.",
                         testTagPrefix = "translation_empty"
                     )
                 }
             } else {
                 items(dialogues, key = { it.id }) { dlg ->
                     val accent = speakerAccentColor(dlg.speakerLabel)
+                    val validation = remember(dlg.romanHinglishText) {
+                        if (dlg.romanHinglishText.isBlank()) null
+                        else com.example.engine.MixedScriptLanguageEngine.validateMixedScript(dlg.romanHinglishText)
+                    }
+                    val timingPillLabel = when (dlg.timingStatus) {
+                        "VERIFIED_ASR_ALIGNED" -> "ASR-Aligned"
+                        "ACOUSTIC_ESTIMATED" -> "Acoustic-Est."
+                        "MANUAL" -> "Manual Timing"
+                        else -> null
+                    }
+                    val timingPillColor = when (dlg.timingStatus) {
+                        "VERIFIED_ASR_ALIGNED" -> StudioEmerald
+                        "ACOUSTIC_ESTIMATED" -> StudioAmber
+                        else -> StudioTextSecondary
+                    }
+
                     StudioCard(padding = 14.dp) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
                                 StatusPill(text = dlg.dialogueId, color = accent)
                                 StatusPill(text = dlg.emotion, color = StudioCyan)
+                                if (timingPillLabel != null) {
+                                    StatusPill(text = timingPillLabel, color = timingPillColor)
+                                }
                                 Text(
                                     text = "${"%.2f".format(dlg.originalDurationMs / 1000.0)}s",
                                     style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
@@ -600,9 +751,37 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                             }
                             IconButton(
                                 onClick = { editingDialogue = dlg },
-                                modifier = Modifier.size(48.dp)
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .testTag("edit_dialogue_${dlg.dialogueId}")
                             ) {
                                 Icon(Icons.Default.Edit, contentDescription = "Edit translation", tint = StudioViolet, modifier = Modifier.size(18.dp))
+                            }
+                        }
+
+                        if (dlg.sourceDialogueRef.isNotBlank() && dlg.sourceDialogueRef != dlg.dialogueId) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Split sentence from ${dlg.sourceDialogueRef}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = StudioTextMuted
+                            )
+                        }
+
+                        if (validation != null && !validation.isValid) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                StatusPill(text = "Legacy Roman Hindi — Needs Fix", color = StudioAmber)
+                                TextButton(
+                                    onClick = { editingDialogue = dlg },
+                                    modifier = Modifier.heightIn(min = 48.dp)
+                                ) {
+                                    Text("Fix Script", color = StudioViolet)
+                                }
                             }
                         }
 
@@ -624,7 +803,7 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                                         )
                                     }
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text("ROMAN HINGLISH", style = MaterialTheme.typography.labelSmall, color = StudioViolet)
+                                        Text("MIXED-SCRIPT HINDI-ENGLISH", style = MaterialTheme.typography.labelSmall, color = StudioViolet)
                                         Spacer(modifier = Modifier.height(4.dp))
                                         Text(
                                             text = dlg.romanHinglishText.ifBlank { "Not translated yet" },
@@ -645,7 +824,7 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                                     }
                                     HorizontalDivider(color = StudioBorderSubtle)
                                     Column {
-                                        Text("ROMAN HINGLISH", style = MaterialTheme.typography.labelSmall, color = StudioViolet)
+                                        Text("MIXED-SCRIPT HINDI-ENGLISH", style = MaterialTheme.typography.labelSmall, color = StudioViolet)
                                         Text(
                                             text = dlg.romanHinglishText.ifBlank { "Not translated yet — tap Edit or run Gemini." },
                                             style = MaterialTheme.typography.bodyLarge,
@@ -659,7 +838,7 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                         if (dlg.ttsNormalizedText.isNotBlank()) {
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = "TTS Phonetic: ${dlg.ttsNormalizedText}",
+                                text = "TTS Pronunciation Feed: ${dlg.ttsNormalizedText}",
                                 style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
                                 color = StudioTextMuted
                             )
@@ -668,15 +847,20 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                 }
             }
         } else {
-            // 3-Tier Dictionaries: Global, Anime, Project
+            // 3-Tier Dictionaries: Strictly Isolated to Active Project & Anime Series + Global
             item {
                 StudioSectionHeader(
                     title = "Terminology Dictionaries",
-                    subtitle = "Priority: Project > Anime > Global",
+                    subtitle = "Active Scope Precedence: Project > Anime > Global (isolated per project)",
                     trailing = {
                         Button(
-                            onClick = { showAddDictDialog = true },
-                            modifier = Modifier.heightIn(min = 48.dp),
+                            onClick = {
+                                editingDictEntry = null
+                                showDictDialog = true
+                            },
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("dict_add_btn"),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = StudioViolet,
                                 contentColor = Color(0xFF0A0B0F)
@@ -690,30 +874,83 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                     }
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("GLOBAL", "ANIME", "PROJECT").forEach { lvl ->
+                OutlinedTextField(
+                    value = dictSearchQuery,
+                    onValueChange = { dictSearchQuery = it },
+                    label = { Text("Search Japanese, Devanagari, English, or notes") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("dict_search_input"),
+                    singleLine = true
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(
+                        "ALL_ACTIVE" to "All Active",
+                        "PROJECT" to "Project",
+                        "ANIME" to "Anime",
+                        "GLOBAL" to "Global"
+                    ).forEach { (key, label) ->
                         FilterChip(
-                            selected = dictLevelFilter == lvl,
-                            onClick = { dictLevelFilter = lvl },
-                            label = { Text(lvl) }
+                            selected = dictLevelFilter == key,
+                            onClick = { dictLevelFilter = key },
+                            label = { Text(label, style = MaterialTheme.typography.labelSmall) }
                         )
                     }
                 }
             }
 
-            val scopedDicts = dictionaries.filter { it.dictionaryLevel == dictLevelFilter }
-            if (scopedDicts.isEmpty()) {
+            // Strictly isolate entries belonging to active project / active anime series / global
+            val strictlyIsolatedEntries = dictionaries.filter { entry ->
+                val matchesScopeIsolation = when (entry.dictionaryLevel.uppercase()) {
+                    "PROJECT" -> activeProject != null && entry.projectId == activeProject!!.id
+                    "ANIME" -> !activeProject?.animeSeriesName.isNullOrBlank() &&
+                        entry.animeSeriesName.equals(activeProject!!.animeSeriesName, ignoreCase = true)
+                    else -> entry.projectId == null && entry.animeSeriesName.isNullOrBlank()
+                }
+                val matchesTab = dictLevelFilter == "ALL_ACTIVE" ||
+                    entry.dictionaryLevel.equals(dictLevelFilter, ignoreCase = true)
+                val q = dictSearchQuery.trim()
+                val matchesSearch = q.isEmpty() ||
+                    entry.japaneseSourceTerm.contains(q, ignoreCase = true) ||
+                    entry.preferredMixedScript.contains(q, ignoreCase = true) ||
+                    entry.preferredRomanHinglish.contains(q, ignoreCase = true) ||
+                    entry.preferredHindiWording.contains(q, ignoreCase = true) ||
+                    entry.preferredEnglishWording.contains(q, ignoreCase = true) ||
+                    entry.pronunciationGuidance.contains(q, ignoreCase = true) ||
+                    entry.contextNotes.contains(q, ignoreCase = true)
+                matchesScopeIsolation && matchesTab && matchesSearch
+            }.sortedWith(
+                compareBy<DictionaryEntryEntity> {
+                    when (it.dictionaryLevel.uppercase()) {
+                        "PROJECT" -> 0
+                        "ANIME" -> 1
+                        else -> 2
+                    }
+                }.thenByDescending { it.updatedAt }
+            )
+
+            if (strictlyIsolatedEntries.isEmpty()) {
                 item {
                     StudioEmptyState(
                         icon = Icons.Default.Book,
-                        title = "No $dictLevelFilter Dictionary Terms",
-                        description = "Add recurring character names, anime attacks, or English loanwords so Gemini translation and TTS pronunciation stay consistent.",
-                        primaryActionLabel = "Add $dictLevelFilter Term",
-                        onPrimaryAction = { showAddDictDialog = true }
+                        title = if (dictSearchQuery.isBlank()) "No Dictionary Terms in This Scope" else "No Matching Dictionary Terms",
+                        description = "Add character names, anime attacks, Devanagari Hindi wording, English loanwords, and TTS pronunciation hints. Project entries override Anime entries, which override Global.",
+                        primaryActionLabel = "Add Term",
+                        onPrimaryAction = {
+                            editingDictEntry = null
+                            showDictDialog = true
+                        }
                     )
                 }
             } else {
-                items(scopedDicts, key = { it.id }) { entry ->
+                items(strictlyIsolatedEntries, key = { it.id }) { entry ->
+                    val preferred = com.example.engine.MixedScriptLanguageEngine.preferredDisplayTerm(entry)
+                    val scopeColor = when (entry.dictionaryLevel.uppercase()) {
+                        "PROJECT" -> StudioViolet
+                        "ANIME" -> StudioCyan
+                        else -> StudioEmerald
+                    }
                     StudioCard(padding = 12.dp) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -721,22 +958,52 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "${entry.japaneseSourceTerm}  →  ${entry.preferredRomanHinglish}",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = StudioTextPrimary
-                                )
-                                Text(
-                                    text = "Pronunciation: ${entry.pronunciationGuidance.ifBlank { entry.preferredRomanHinglish }}${if (entry.contextNotes.isNotBlank()) " • ${entry.contextNotes}" else ""}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = StudioTextSecondary
-                                )
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    StatusPill(text = entry.dictionaryLevel, color = scopeColor)
+                                    Text(
+                                        text = "${entry.japaneseSourceTerm.ifBlank { "(Term)" }}  →  $preferred",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = StudioTextPrimary
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                val detailParts = buildList {
+                                    if (entry.preferredHindiWording.isNotBlank()) add("HI: ${entry.preferredHindiWording}")
+                                    if (entry.preferredEnglishWording.isNotBlank()) add("EN: ${entry.preferredEnglishWording}")
+                                    if (entry.pronunciationGuidance.isNotBlank()) add("TTS: ${entry.pronunciationGuidance}")
+                                    if (entry.contextNotes.isNotBlank()) add(entry.contextNotes)
+                                }
+                                if (detailParts.isNotEmpty()) {
+                                    Text(
+                                        text = detailParts.joinToString(" • "),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = StudioTextSecondary
+                                    )
+                                }
                             }
-                            IconButton(
-                                onClick = { viewModel.deleteDictionaryEntry(entry.id) },
-                                modifier = Modifier.size(48.dp)
-                            ) {
-                                Icon(Icons.Default.DeleteOutline, contentDescription = "Delete term", tint = StudioTextMuted)
+                            Row {
+                                IconButton(
+                                    onClick = {
+                                        editingDictEntry = entry
+                                        showDictDialog = true
+                                    },
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .testTag("dict_edit_${entry.id}")
+                                ) {
+                                    Icon(Icons.Default.Edit, contentDescription = "Edit term", tint = StudioViolet)
+                                }
+                                IconButton(
+                                    onClick = { viewModel.deleteDictionaryEntry(entry.id) },
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .testTag("dict_delete_${entry.id}")
+                                ) {
+                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Delete term", tint = StudioTextMuted)
+                                }
                             }
                         }
                     }
