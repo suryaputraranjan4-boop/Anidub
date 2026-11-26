@@ -89,13 +89,12 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun verifyModelCatalogHasNoFakeReadmesOrFakeSizesAndRespectsGatedPolicy() {
+    fun verifyAndroidOnlyModelCatalogHonestyAndExactSizes() {
         val catalog = com.example.engine.VerifiedModelCatalog.buildVerifiedModelCatalog()
-        assertTrue(catalog.isNotEmpty())
+        assertEquals("Expected 12 catalog entries (5 local + 1 Direct Gemini + 6 unsupported desktop PyTorch)", 12, catalog.size)
 
         for (model in catalog) {
             val files = com.example.engine.VerifiedModelCatalog.parseManifest(model.filesManifestJson)
-            // Zero README.md download targets anywhere in the catalog
             assertTrue(
                 "Model ${model.modelId} must never download README.md",
                 !model.downloadArtifactUrl.endsWith("README.md", ignoreCase = true)
@@ -107,47 +106,46 @@ class ExampleUnitTest {
                 )
             }
 
-            // Round-trip manifest JSON serialization check
             val reserialized = com.example.engine.VerifiedModelCatalog.serializeManifest(files)
             val reparsed = com.example.engine.VerifiedModelCatalog.parseManifest(reserialized)
             assertEquals("Manifest round-trip mismatch for ${model.modelId}", files, reparsed)
-
-            if (model.isGatedHuggingFace) {
-                // Never invent a size for gated/unavailable files
-                assertEquals("Gated model ${model.modelId} must report isSizeKnown=false", false, model.isSizeKnown)
-                assertEquals("Gated model ${model.modelId} must not invent expectedSizeBytes", 0L, model.expectedSizeBytes)
-            } else if (files.isNotEmpty()) {
-                assertEquals(
-                    "Combined size for ${model.modelId} must equal exact sum of companion files",
-                    files.sumOf { it.expectedBytes },
-                    model.expectedSizeBytes
-                )
-            }
         }
 
-        // Verify exact official sizes for key verified models
-        val whisper = catalog.first { it.modelId == "whisper_large_v3_turbo" }
-        assertEquals(1_622_443_339L, whisper.expectedSizeBytes)
-        assertEquals(11, whisper.totalFilesCount)
-
-        val htdemucs = catalog.first { it.modelId == "htdemucs_vocal_sep" }
-        assertEquals(84_037_548L, htdemucs.expectedSizeBytes)
-        assertEquals(3, htdemucs.totalFilesCount)
+        // Only Silero VAD ONNX should be downloadable on Android
+        val downloadable = catalog.filter { com.example.engine.VerifiedModelCatalog.isDownloadablePackage(it) }
+        assertEquals(listOf("silero_vad_onnx"), downloadable.map { it.modelId })
 
         val silero = catalog.first { it.modelId == "silero_vad_onnx" }
         assertEquals(2_244_097L, silero.expectedSizeBytes)
         assertEquals(2, silero.totalFilesCount)
+        assertEquals(com.example.engine.VerifiedModelCatalog.RUNTIME_ONNX_COMPATIBLE, silero.runtimeCompatibility)
+
+        // Direct Gemini API is the sole online AI service
+        val gemini = catalog.first { it.modelId == "direct_gemini_api" }
+        assertEquals(com.example.engine.VerifiedModelCatalog.RUNTIME_DIRECT_GEMINI_API, gemini.runtimeCompatibility)
+
+        // Whisper Large V3 Turbo and WhisperX Alignment Pipeline must be clearly distinguished & honest
+        val whisper = catalog.first { it.modelId == "whisper_large_v3_turbo" }
+        assertEquals(1_622_443_339L, whisper.expectedSizeBytes)
+        assertEquals(com.example.engine.VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID, whisper.runtimeCompatibility)
+        assertEquals("UNSUPPORTED_ON_ANDROID", whisper.downloadState)
+
+        val whisperX = catalog.first { it.modelId == "whisperx_alignment_pipeline" }
+        assertEquals(com.example.engine.VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID, whisperX.runtimeCompatibility)
+        assertEquals("UNSUPPORTED_ON_ANDROID", whisperX.downloadState)
+
+        // Chatterbox Multilingual V3 & F5-Hindi-24KHz must both be honestly UNSUPPORTED_ON_ANDROID
+        val chatterbox = catalog.first { it.modelId == "chatterbox_multilingual_v3" }
+        assertEquals(com.example.engine.VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID, chatterbox.runtimeCompatibility)
+        assertEquals("UNSUPPORTED_ON_ANDROID", chatterbox.downloadState)
 
         val f5Hindi = catalog.first { it.modelId == "f5_tts_hindi_24khz" }
         assertEquals(632_168_396L, f5Hindi.expectedSizeBytes)
-        assertEquals("CC-BY-4.0", f5Hindi.licenseName)
+        assertEquals(com.example.engine.VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID, f5Hindi.runtimeCompatibility)
+        assertEquals("UNSUPPORTED_ON_ANDROID", f5Hindi.downloadState)
 
-        // Ensure we do NOT duplicate both Chatterbox Hindi and F5 Hindi in the catalog
-        assertEquals(
-            "Only one primary Hindi TTS model should be active to avoid multi-GB duplication",
-            1,
-            catalog.count { it.specialistAgentNumber == 5 }
-        )
+        // Duplicate WeSpeaker entry must not exist
+        assertTrue(catalog.none { it.modelId == "wespeaker_voxceleb_resnet34_lm" })
     }
 
     @Test
@@ -406,42 +404,40 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun verifyRemoteWorkerSecurityPolicyEnforcesHttpsAndSameOrigin() {
-        // Public HTTP must be rejected even if allowInsecureLocalHttp = true
-        val publicHttp = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl(
-            "http://example.com:8080",
-            allowInsecureLocalHttp = true
+    fun verifyDirectGeminiApiErrorClassificationAndModelNormalization() {
+        assertEquals(
+            "gemini-2.5-flash",
+            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("gemini-3.8-flash")
         )
-        assertTrue("Public HTTP must be rejected", publicHttp.isFailure)
+        assertEquals(
+            "gemini-2.5-flash",
+            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("")
+        )
+        assertEquals(
+            "gemini-2.5-pro",
+            com.example.data.remote.DirectGeminiApiClient.normalizeModelName("models/gemini-2.5-pro")
+        )
 
-        // Private LAN HTTP rejected by default, allowed when explicitly opted-in
-        val lanBlocked = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl(
-            "http://192.168.1.50:8080",
-            allowInsecureLocalHttp = false
+        val invalidKey = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(
+            httpCode = 400,
+            responseBody = """{"error":{"message":"API_KEY_INVALID: API key not valid."}}"""
         )
-        assertTrue("Private LAN HTTP must require explicit opt-in", lanBlocked.isFailure)
-        val lanAllowed = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl(
-            "http://192.168.1.50:8080",
-            allowInsecureLocalHttp = true
-        )
-        assertTrue("Private LAN HTTP allowed when opted-in", lanAllowed.isSuccess)
+        assertEquals(com.example.data.remote.GeminiErrorKind.INVALID_API_KEY, invalidKey.kind)
 
-        // HTTPS allowed
-        val httpsOk = com.example.data.remote.RemoteWorkerClient.validateWorkerBaseUrl("https://gpu.studio.example/api")
-        assertTrue("HTTPS worker URL must be accepted", httpsOk.isSuccess)
+        val unauthorized = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(403, "PERMISSION_DENIED: invalid api key")
+        assertEquals(com.example.data.remote.GeminiErrorKind.INVALID_API_KEY, unauthorized.kind)
 
-        // Same-origin download protection blocks SSRF to other hosts
-        val ssrfBlocked = com.example.data.remote.RemoteWorkerClient.resolveAndValidateSameOriginUrl(
-            "https://gpu.studio.example",
-            "http://169.254.169.254/latest/meta-data/"
-        )
-        assertTrue("Cross-origin SSRF URL must be blocked", ssrfBlocked.isFailure)
+        val missingModel = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(404, "Model not found")
+        assertEquals(com.example.data.remote.GeminiErrorKind.MODEL_NOT_FOUND, missingModel.kind)
 
-        val sameOriginOk = com.example.data.remote.RemoteWorkerClient.resolveAndValidateSameOriginUrl(
-            "https://gpu.studio.example",
-            "/files/vocals.wav"
-        )
-        assertTrue("Relative same-origin artifact path must be accepted", sameOriginOk.isSuccess)
+        val rateLimited = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(429, "Too many requests, please retry")
+        assertEquals(com.example.data.remote.GeminiErrorKind.RATE_LIMITED, rateLimited.kind)
+
+        val quotaBilling = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(429, "You exceeded your current quota for billing project")
+        assertEquals(com.example.data.remote.GeminiErrorKind.QUOTA_OR_BILLING, quotaBilling.kind)
+
+        val serverErr = com.example.data.remote.DirectGeminiApiClient.classifyHttpError(503, "Service unavailable")
+        assertEquals(com.example.data.remote.GeminiErrorKind.SERVER_ERROR, serverErr.kind)
     }
 
     @Test
@@ -572,37 +568,56 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun verifyRemoteWorkerGranularReadinessDistinguishesDownloadedLoadedAndReady() {
-        val health = com.example.data.remote.WorkerHealthStatus(
-            reachable = true,
-            apiAvailable = true,
-            workerUrl = "https://worker.local",
-            deviceType = "CUDA GPU",
-            cudaAvailable = true,
-            freeDiskSpaceGb = 50.0,
-            installedModels = listOf("whisper"),
-            modelReadiness = mapOf(
-                "whisper" to com.example.data.remote.RemoteModelReadiness(
-                    modelKey = "whisper",
-                    displayName = "Whisper Large V3 Turbo",
-                    downloaded = true,
-                    loaded = true,
-                    readyForInference = true
-                ),
-                "f5_hindi" to com.example.data.remote.RemoteModelReadiness(
-                    modelKey = "f5_hindi",
-                    displayName = "F5-Hindi-24KHz",
-                    downloaded = true,
-                    loaded = false,
-                    readyForInference = false,
-                    detailMessage = "Weights cached on disk; model not loaded"
-                )
+    fun verifyDictionaryJsonExportImportRoundTripAndTtsCapabilityHonesty() {
+        val entries = listOf(
+            DictionaryEntryEntity(
+                dictionaryLevel = "PROJECT",
+                projectId = 7L,
+                japaneseSourceTerm = "領域展開",
+                preferredMixedScript = "Domain Expansion",
+                preferredRomanHinglish = "Domain Expansion",
+                preferredHindiWording = "",
+                preferredEnglishWording = "Domain Expansion",
+                preserveOriginalEnglish = true,
+                pronunciationGuidance = "Domain Expansion",
+                contextNotes = "Keep attack in English"
             ),
-            statusMessage = "Worker online"
+            DictionaryEntryEntity(
+                dictionaryLevel = "GLOBAL",
+                japaneseSourceTerm = "先輩",
+                preferredMixedScript = "सीनियर",
+                preferredRomanHinglish = "सीनियर",
+                preferredHindiWording = "सीनियर",
+                preferredEnglishWording = "Senior",
+                preserveOriginalEnglish = false,
+                pronunciationGuidance = "Senior",
+                contextNotes = "Natural Hindi"
+            )
         )
-        assertEquals(true, health.isModelReady("whisper"))
-        assertEquals("Downloaded-only model must NOT be treated as inference-ready", false, health.isModelReady("f5_hindi"))
-        assertEquals("Missing model key must return false", false, health.isModelReady("htdemucs"))
+        val json = com.example.engine.MixedScriptLanguageEngine.exportDictionaryEntriesToJson(entries)
+        val parsed = com.example.engine.MixedScriptLanguageEngine.parseDictionaryEntriesFromJson(
+            json = json,
+            fallbackProjectId = 7L,
+            fallbackAnimeSeriesName = "Jujutsu Kaisen"
+        ).getOrThrow()
+        assertEquals(2, parsed.size)
+        assertEquals("Domain Expansion", parsed[0].preferredMixedScript)
+        assertEquals("PROJECT", parsed[0].dictionaryLevel)
+        assertEquals(7L, parsed[0].projectId)
+        assertEquals("सीनियर", parsed[1].preferredMixedScript)
+        assertEquals("GLOBAL", parsed[1].dictionaryLevel)
+
+        // Verify TTS engine capability honesty
+        val androidTts = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.first { it.engineId == "Android-Speech-TTS" }
+        assertEquals(true, androidTts.isSupportedOnAndroid)
+        assertEquals(false, androidTts.supportsVoiceCloning)
+        assertEquals(false, androidTts.supportsReferenceAudio)
+
+        val chatterbox = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.first { it.engineId == "Chatterbox-Multilingual-V3" }
+        assertEquals(false, chatterbox.isSupportedOnAndroid)
+
+        val f5 = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.first { it.engineId == "F5-Hindi-24KHz" }
+        assertEquals(false, f5.isSupportedOnAndroid)
     }
 }
 

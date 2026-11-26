@@ -9,11 +9,19 @@ data class TtsEngineDescriptor(
     val modelVersion: String,
     val licenseName: String,
     val runtimeType: String,
+    val isSupportedOnAndroid: Boolean,
     val isExperimentalArchived: Boolean,
-    val supportsCrossLanguageCloning: Boolean,
+    val supportsVoiceCloning: Boolean,
+    val supportsReferenceAudio: Boolean,
+    val supportsNeuralEmotionControl: Boolean,
+    val supportedLanguages: String,
+    val outputSampleRateHz: Int,
     val supportedEmotions: List<String>,
     val statusWarning: String? = null
-)
+) {
+    val supportsCrossLanguageCloning: Boolean
+        get() = supportsVoiceCloning
+}
 
 data class SynthesizedDialogueResult(
     val outputFile: File,
@@ -28,43 +36,75 @@ data class SynthesizedDialogueResult(
 )
 
 /**
- * Pronunciation & TTS Normalization Engine.
+ * Honest Pronunciation & TTS Normalization Engine (Android-Only Architecture).
  *
  * Strictly separates:
  * - Canonical display & subtitle text (Permanent Mixed-Script: Devanagari Hindi + English)
  * - Internal TTS pronunciation text (Dictionary pronunciation guidance applied with
  *   deterministic Project > Anime > Global precedence and longest-phrase boundary matching)
  *
- * NOTE: Legacy synthetic sine-wave oscillators are permanently absent. All synthesis runs through
- * genuine Remote GPU `F5-Hindi-24KHz` (when model readiness is confirmed) or genuine on-device
- * Android `TextToSpeech.synthesizeToFile()` (honestly labeled generic system TTS).
+ * Strict Honesty Rules:
+ * - Only `Android-Speech-TTS` is locally runnable on Android (explicit generic system TTS fallback — NO voice cloning).
+ * - `Chatterbox-Multilingual-V3` and `F5-Hindi-24KHz` are explicitly listed as `isSupportedOnAndroid = false`
+ *   so the UI never disguises Android TTS as Chatterbox or F5-Hindi or claims voice cloning is available on-device.
  */
 object HinglishTtsNormalizer {
 
     val AVAILABLE_TTS_ENGINES = listOf(
         TtsEngineDescriptor(
-            engineId = "F5-Hindi-24KHz",
-            displayName = "F5-Hindi-24KHz (Remote GPU) + Android Speech TTS Fallback",
-            modelVersion = "SPRINGLab/F5-Hindi-24KHz (model_2500000.safetensors)",
-            licenseName = "CC-BY-4.0",
-            runtimeType = "REMOTE_PYTHON_GPU_WORKER + ANDROID_SPEECH_TTS",
-            isExperimentalArchived = false,
-            supportsCrossLanguageCloning = false,
-            supportedEmotions = listOf("NEUTRAL", "CALM", "EXCITED", "ANGRY", "SAD", "FEARFUL", "HAPPY", "WHISPERING", "SHOUTING"),
-            statusWarning = "Uses Remote GPU Worker (F5-Hindi-24KHz) ONLY when worker health confirms F5-Hindi is loaded and ready; falls back to generic on-device Android Speech TTS (no voice cloning)."
-        ),
-        TtsEngineDescriptor(
             engineId = "Android-Speech-TTS",
-            displayName = "Android Speech TTS (Generic System hi-IN / en-IN)",
+            displayName = "Android System TextToSpeech (Explicit Local Fallback)",
             modelVersion = "android.speech.tts.TextToSpeech",
             licenseName = "Android System Speech Engine",
-            runtimeType = "ANDROID_LOCAL",
+            runtimeType = "ANDROID_LOCAL_FALLBACK",
+            isSupportedOnAndroid = true,
             isExperimentalArchived = false,
-            supportsCrossLanguageCloning = false,
-            supportedEmotions = listOf("NEUTRAL", "ANGRY", "CALM", "EXCITED", "SAD", "FEARFUL", "HAPPY"),
-            statusWarning = "Generic on-device system TTS via Android TextToSpeech.synthesizeToFile() (no voice cloning). Speaks Devanagari Hindi + English mixed-script natively when a hi-IN voice pack is installed."
+            supportsVoiceCloning = false,
+            supportsReferenceAudio = false,
+            supportsNeuralEmotionControl = false,
+            supportedLanguages = "Hindi (hi-IN) + Indian English (en-IN) via installed Android TTS voice pack",
+            outputSampleRateHz = 24000,
+            supportedEmotions = listOf("NEUTRAL", "CALM", "EXCITED", "ANGRY", "SAD", "FEARFUL", "HAPPY"),
+            statusWarning = "Explicit on-device fallback: generic Android system voice via TextToSpeech.synthesizeToFile(). Pitch/rate adjustments only — NO voice cloning, NO reference-audio cloning, and NO neural emotion synthesis."
+        ),
+        TtsEngineDescriptor(
+            engineId = "Chatterbox-Multilingual-V3",
+            displayName = "Chatterbox Multilingual V3 (Unsupported on Android)",
+            modelVersion = "ResembleAI/chatterbox (500M LLaMA + S3Gen + HiFi-GAN)",
+            licenseName = "MIT License",
+            runtimeType = "UNSUPPORTED_ON_ANDROID",
+            isSupportedOnAndroid = false,
+            isExperimentalArchived = false,
+            supportsVoiceCloning = false, // False on Android because model cannot execute locally
+            supportsReferenceAudio = false,
+            supportsNeuralEmotionControl = false,
+            supportedLanguages = "23 languages incl. Hindi & English (Desktop PyTorch GPU only)",
+            outputSampleRateHz = 24000,
+            supportedEmotions = emptyList(),
+            statusWarning = "UNSUPPORTED ON ANDROID: Requires Python/PyTorch GPU runtime (~3.2 GB weights: T3 LLaMA + S3Gen + HiFi-GAN). No official ONNX/Android runtime exists. Android TTS is NEVER disguised as Chatterbox."
+        ),
+        TtsEngineDescriptor(
+            engineId = "F5-Hindi-24KHz",
+            displayName = "F5-Hindi-24KHz (Unsupported on Android)",
+            modelVersion = "SPRINGLab/F5-Hindi-24KHz (model_2500000.safetensors)",
+            licenseName = "CC-BY-4.0",
+            runtimeType = "UNSUPPORTED_ON_ANDROID",
+            isSupportedOnAndroid = false,
+            isExperimentalArchived = false,
+            supportsVoiceCloning = false, // False on Android because model cannot execute locally
+            supportsReferenceAudio = false,
+            supportsNeuralEmotionControl = false,
+            supportedLanguages = "Hindi (hi) — Desktop PyTorch GPU only",
+            outputSampleRateHz = 24000,
+            supportedEmotions = emptyList(),
+            statusWarning = "UNSUPPORTED ON ANDROID: Requires Python/PyTorch f5-tts + Vocos vocoder (~632 MB Safetensors). Not executable locally on Android without an ONNX/TFLite runtime export."
         )
     )
+
+    fun descriptorFor(engineId: String): TtsEngineDescriptor {
+        return AVAILABLE_TTS_ENGINES.firstOrNull { it.engineId.equals(engineId, ignoreCase = true) }
+            ?: AVAILABLE_TTS_ENGINES.first()
+    }
 
     /**
      * Generates the internal TTS pronunciation representation while keeping the canonical
@@ -86,7 +126,7 @@ object HinglishTtsNormalizer {
     }
 
     /**
-     * Produces the exact clean speakable text sent directly to Android Speech TTS or Remote F5-Hindi-24KHz.
+     * Produces the exact clean speakable text sent directly to Android Speech TTS.
      * Applies dictionary pronunciation overrides with longest-phrase boundary matching and strips
      * any bracketed markers without mutating the user-visible display text.
      */

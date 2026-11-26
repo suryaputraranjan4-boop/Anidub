@@ -114,7 +114,6 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
     val speakers by viewModel.speakers.collectAsState()
     val history by viewModel.voiceGenerationRecords.collectAsState()
     val config by viewModel.studioConfig.collectAsState()
-    val workerHealth by viewModel.workerHealth.collectAsState()
     val playback by viewModel.playbackState.collectAsState()
     val banner by viewModel.pipelineBanner.collectAsState()
     val scope = rememberCoroutineScope()
@@ -123,8 +122,9 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
     val groupedBatches = remember(batchDialogues) {
         batchDialogues.groupBy { it.speakerLabel }.toSortedMap()
     }
-    val selectedEngine = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.find { it.engineId == config.selectedTtsEngine }
-        ?: HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.first()
+    val selectedEngine = HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.find {
+        it.engineId == config.selectedTtsEngine && it.isSupportedOnAndroid
+    } ?: HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.first { it.isSupportedOnAndroid }
 
     LazyColumn(
         modifier = Modifier
@@ -133,7 +133,7 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Honest Engine Availability & Profile Selector
+        // Honest Android-Only Voice Engine Status & Capability Matrix
         item {
             StudioCard(elevated = true) {
                 Row(
@@ -142,55 +142,69 @@ fun VoiceGenerationView(viewModel: StudioViewModel) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Voice Synthesis Engine", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
-                    val remoteF5Ready = workerHealth?.isModelReady("f5_hindi") == true
-                    val workerReachable = workerHealth?.reachable == true
                     StatusPill(
-                        text = when {
-                            remoteF5Ready -> "REMOTE F5-HINDI READY"
-                            workerReachable -> "WORKER F5 NOT READY"
-                            else -> "ANDROID SPEECH TTS"
-                        },
-                        color = when {
-                            remoteF5Ready -> StudioEmerald
-                            workerReachable -> StudioAmber
-                            else -> StudioCyan
-                        }
+                        text = "ANDROID SYSTEM TTS",
+                        color = StudioCyan
                     )
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = when {
-                        workerHealth?.isModelReady("f5_hindi") == true ->
-                            "Remote GPU worker verified & F5-Hindi-24KHz loaded at ${config.remoteWorkerBaseUrl}. Selected engine: ${selectedEngine.displayName}."
-                        workerHealth?.reachable == true ->
-                            "Remote worker reachable, but F5-Hindi-24KHz is not loaded/ready for inference. Falling back to genuine on-device Android Speech TTS (generic voice, no cloning)."
-                        else ->
-                            "No remote PyTorch GPU worker connected. Genuine spoken Hindi-English audio is synthesized on-device via Android Speech TTS (generic system voice, no voice cloning) + WSOLA synchronization."
-                    },
+                    text = "Active Local Engine: ${selectedEngine.displayName}. Synthesizes real spoken Hindi-English audio on-device + WSOLA timing synchronization. Clearly labeled as a generic system TTS fallback — never disguised as Chatterbox or F5-Hindi.",
                     style = MaterialTheme.typography.bodySmall,
                     color = StudioTextSecondary
                 )
                 Spacer(modifier = Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MetadataChipRow(
+                    items = listOf(
+                        "Voice Cloning" to if (selectedEngine.supportsVoiceCloning) "Yes" else "No",
+                        "Ref Audio" to if (selectedEngine.supportsReferenceAudio) "Yes" else "No",
+                        "Neural Emotion" to if (selectedEngine.supportsNeuralEmotionControl) "Yes" else "No",
+                        "Rate" to "${selectedEngine.outputSampleRateHz / 1000} kHz"
+                    )
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.forEach { eng ->
-                        FilterChip(
-                            selected = config.selectedTtsEngine == eng.engineId,
-                            onClick = {
-                                scope.launch {
-                                    viewModel.prefsRepo.updateModelSelections(
-                                        asrVariant = config.selectedAsrVariant,
-                                        ttsEngine = eng.engineId,
-                                        separationModel = config.selectedSeparationModel
-                                    )
-                                }
-                            },
-                            label = {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = if (eng.isExperimentalArchived) "${eng.engineId} (Archived)" else eng.engineId,
-                                    style = MaterialTheme.typography.labelSmall
+                                    text = eng.displayName,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (eng.isSupportedOnAndroid) StudioTextPrimary else StudioTextMuted
+                                )
+                                Text(
+                                    text = if (eng.isSupportedOnAndroid) {
+                                        "On-device Android Speech TTS • ${eng.supportedLanguages}"
+                                    } else {
+                                        eng.statusWarning ?: "Desktop PyTorch model — unsupported on Android"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (eng.isSupportedOnAndroid) StudioTextSecondary else StudioAmber
                                 )
                             }
-                        )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            if (eng.isSupportedOnAndroid) {
+                                FilterChip(
+                                    selected = selectedEngine.engineId == eng.engineId,
+                                    onClick = {
+                                        scope.launch {
+                                            viewModel.prefsRepo.updateModelSelections(
+                                                asrVariant = config.selectedAsrVariant,
+                                                ttsEngine = eng.engineId,
+                                                separationModel = config.selectedSeparationModel
+                                            )
+                                        }
+                                    },
+                                    label = { Text("Active", style = MaterialTheme.typography.labelSmall) }
+                                )
+                            } else {
+                                StatusPill(text = "UNSUPPORTED", color = StudioAmber)
+                            }
+                        }
                     }
                 }
                 if (!selectedEngine.statusWarning.isNullOrBlank()) {

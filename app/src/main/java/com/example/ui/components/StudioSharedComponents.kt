@@ -174,8 +174,8 @@ fun StatusPill(
 
 fun statusColorFor(status: String): Color = when (status.uppercase()) {
     "COMPLETED", "PASSED", "INSTALLED", "VERIFIED", "READY", "SYNCED", "SUCCESS", "BUILT_IN" -> StudioEmerald
-    "RUNNING", "DOWNLOADING", "VERIFYING", "TRANSLATED", "GENERATED", "RETRIED" -> StudioCyan
-    "WARNING", "PENDING", "WAITING", "PAUSED_CHECKPOINT" -> StudioAmber
+    "RUNNING", "DOWNLOADING", "DOWNLOADED", "VERIFYING", "LOADING", "PROCESSING", "TRANSLATED", "GENERATED", "RETRIED" -> StudioCyan
+    "WARNING", "PENDING", "WAITING", "PAUSED_CHECKPOINT", "UNSUPPORTED_ON_ANDROID" -> StudioAmber
     "FAILED", "ERROR", "CORRUPTED", "BLOCKED" -> StudioCrimson
     else -> StudioTextMuted
 }

@@ -16,12 +16,13 @@ import kotlin.coroutines.resume
 import kotlin.math.abs
 
 /**
- * Genuine On-Device Android Speech Synthesizer (Agent 15 Fallback when Remote F5-Hindi-24KHz GPU Worker is offline).
+ * Genuine On-Device Android System TextToSpeech Engine (Explicit Local Fallback).
  *
  * Uses Android's real `android.speech.tts.TextToSpeech.synthesizeToFile()` engine with Hindi (`hi-IN`)
  * or Indian English (`en-IN`) speech voices to render actual human-intelligible spoken audio to WAV.
  *
  * Strict Honesty Rules:
+ * - Explicitly labeled as Android System TextToSpeech generic fallback (NO voice cloning, NEVER disguised as Chatterbox or F5-Hindi).
  * - ZERO fake sine-wave oscillators or placeholder tones.
  * - Verifies that the generated WAV exists, decodes cleanly, and contains real non-silent speech energy
  *   (RMS > -55 dBFS). If the device has no functioning TTS voice pack, returns Result.failure explicitly.
@@ -70,7 +71,7 @@ class AndroidSpeechTtsEngine(private val context: Context) {
                 return@withContext Result.failure(
                     IllegalStateException(
                         "Android TextToSpeech engine failed to initialize (status=$initStatus). " +
-                            "Install Google Speech Services (hi-IN voice) on the device or configure a Remote GPU Worker for F5-Hindi-24KHz."
+                            "Install Google Speech Services with Hindi (hi-IN) voice data in Android System Settings."
                     )
                 )
             }
@@ -99,8 +100,8 @@ class AndroidSpeechTtsEngine(private val context: Context) {
             if (chosenLocaleLabel.isBlank()) {
                 return@withContext Result.failure(
                     IllegalStateException(
-                        "No supported Hindi (hi-IN) or English TTS voice pack is installed on this device. " +
-                            "Install Google Speech Services voice data or connect a Remote GPU Worker with F5-Hindi-24KHz."
+                        "No supported Hindi (hi-IN) or English TTS voice pack is installed on this Android device. " +
+                            "Install Google Speech Services voice data in Android System Settings -> Accessibility -> Text-to-speech."
                     )
                 )
             }

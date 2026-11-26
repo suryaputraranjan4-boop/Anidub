@@ -123,16 +123,13 @@ fun HomeDashboardScreen(viewModel: StudioViewModel) {
     val recentExports by viewModel.allExports.collectAsState()
     val activeEpisode by viewModel.activeEpisode.collectAsState()
     val activeProject by viewModel.activeProject.collectAsState()
+    val geminiKeyState by viewModel.geminiKeyState.collectAsState()
 
     val availableBytes = remember { viewModel.modelDownloadManager.getAvailableStorageBytes() }
     val modelsUsedBytes = remember(models) { viewModel.modelDownloadManager.getModelsStorageUsedBytes() }
     val localReadyCount = models.count {
         ModelDownloadManager.isLocalRuntime(it.runtimeCompatibility) &&
-            (it.downloadState == "INSTALLED" || it.downloadState == "BUILT_IN")
-    }
-    val remoteReadyCount = models.count {
-        !ModelDownloadManager.isLocalRuntime(it.runtimeCompatibility) &&
-            (it.downloadState == "INSTALLED" || it.runtimeCompatibility == "EXTERNAL_API")
+            it.downloadState in setOf("READY", "INSTALLED", "BUILT_IN")
     }
 
     LazyColumn(
@@ -358,8 +355,8 @@ fun HomeDashboardScreen(viewModel: StudioViewModel) {
             StudioCard {
                 MetadataChipRow(
                     items = listOf(
-                        "Local Ready" to "$localReadyCount models",
-                        "Cloud / API" to "$remoteReadyCount active",
+                        "Local Ready" to "$localReadyCount modules",
+                        "Gemini API" to if (geminiKeyState.isConfigured) "Key Set" else "Key Missing",
                         "Free Space" to formatBytes(availableBytes)
                     )
                 )
@@ -925,17 +922,23 @@ fun GuidedProjectImportScreen(viewModel: StudioViewModel) {
                                 }
                             }
                             Spacer(modifier = Modifier.height(12.dp))
-                            Text("Preferred Voice Engine Profile", style = MaterialTheme.typography.labelMedium, color = StudioTextSecondary)
+                            Text("On-Device Voice Engine", style = MaterialTheme.typography.labelMedium, color = StudioTextSecondary)
                             Spacer(modifier = Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.forEach { engine ->
+                                HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.filter { it.isSupportedOnAndroid }.forEach { engine ->
                                     FilterChip(
                                         selected = state.preferredTtsEngine == engine.engineId,
                                         onClick = { viewModel.updateGuidedImport { it.copy(preferredTtsEngine = engine.engineId) } },
-                                        label = { Text(engine.engineId, style = MaterialTheme.typography.labelSmall) }
+                                        label = { Text(engine.displayName, style = MaterialTheme.typography.labelSmall) }
                                     )
                                 }
                             }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Uses Android System TextToSpeech locally (generic voice, no voice cloning). Desktop PyTorch models like Chatterbox & F5-Hindi are unsupported on Android.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = StudioTextMuted
+                            )
                         }
                     }
                 }

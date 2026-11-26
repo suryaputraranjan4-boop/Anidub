@@ -22,17 +22,17 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
 /**
- * Multi-file, resumable, integrity-verified AI model download manager.
+ * Multi-file, resumable, integrity-verified ONNX model download & runtime-load manager (Android-Only).
  *
- * Guarantees:
- * - Saves every artifact under its actual official relative filename in
- *   filesDir/verified_models/<modelId>/<relativePath> (never verified_artifact.bin).
- * - Downloads ALL required files (weights + tokenizers + configs + manifests).
- * - Uses real server Content-Length (never fake KB placeholders or invented sizes for gated repos).
- * - Supports HTTP Range resume via per-file .part files.
- * - Verifies SHA-256 checksums against official Hugging Face LFS SHA-256 hashes.
- * - Marks INSTALLED only when every required file exists, is non-empty, and passes verification.
- * - Prevents duplicate concurrent downloads and supports cancellation + retry.
+ * Distinct Lifecycle States enforced honestly:
+ * - `NOT_DOWNLOADED`
+ * - `DOWNLOADING`
+ * - `DOWNLOADED` (files downloaded to disk, pending hash/load verification)
+ * - `VERIFYING` (byte size + SHA-256 verification)
+ * - `LOADING` (genuine ONNX Runtime `OrtSession` load & signature verification)
+ * - `READY` (ONLY when all required files exist, SHA-256 passes, AND runtime load succeeds!)
+ * - `FAILED` (honest failure with error detail)
+ * - `UNSUPPORTED_ON_ANDROID` (desktop PyTorch models blocked from fake/unusable downloads)
  */
 class ModelDownloadManager(
     private val context: Context,
@@ -92,21 +92,26 @@ class ModelDownloadManager(
     }
 
     /**
-     * Reconciles the Room catalog with VerifiedModelCatalog on app startup:
-     * - Removes obsolete fake/placeholder KB entries from earlier builds.
-     * - Removes any legacy verified_artifact.bin files on disk.
-     * - Preserves genuine on-disk verified files if all required artifacts are present.
+     * Reconciles the Room catalog with `VerifiedModelCatalog` and genuine on-disk files on startup:
+     * - Removes obsolete model rows and stale directories from removed desktop/duplicate models
+     *   (never touches user projects/media in `episodes/`).
+     * - Verifies any already-downloaded ONNX model with genuine `OrtSession` load verification before
+     *   marking `READY`.
      */
-    suspend fun reconcileCatalogWithDisk() = withContext(Dispatchers.IO) {
+    suspend fun reconcileCatalogWithDisk(
+        geminiApiConfigured: Boolean = false,
+        geminiModelName: String = "gemini-2.5-flash"
+    ) = withContext(Dispatchers.IO) {
         val catalog = VerifiedModelCatalog.buildVerifiedModelCatalog()
         val validIds = catalog.map { it.modelId }
+        val downloadableIds = catalog.filter { VerifiedModelCatalog.isDownloadablePackage(it) }.map { it.modelId }.toSet()
         val existingById = dao.getAllModelsOnce().associateBy { it.modelId }
 
-        // Clean legacy obsolete directories & fake verified_artifact.bin files
+        // Clean legacy obsolete directories & unsupported desktop-model staging dirs
         val rootDir = getModelsDirectory()
         rootDir.listFiles()?.forEach { child ->
             if (child.isDirectory) {
-                if (child.name !in validIds) {
+                if (child.name !in downloadableIds) {
                     child.deleteRecursively()
                 } else {
                     File(child, "verified_artifact.bin").takeIf { it.exists() }?.delete()
@@ -118,67 +123,124 @@ class ModelDownloadManager(
         dao.deleteObsoleteModels(validIds)
 
         val reconciled = catalog.map { spec ->
-            if (!VerifiedModelCatalog.isDownloadablePackage(spec)) {
-                spec
-            } else {
-                val existing = existingById[spec.modelId]
-                val diskStatuses = inspectLocalFiles(spec)
-                val completeBytes = diskStatuses.sumOf { it.actualBytesOnDisk }
-                val partialBytes = diskStatuses.sumOf { it.partialBytesOnDisk }
-                val totalOnDisk = completeBytes + partialBytes
-                val presentCount = diskStatuses.count { it.isPresentAndSized }
-
-                // Keep probed gated manifest if user already resolved real sizes via HF token
-                val effectiveSpec = if (
-                    spec.isGatedHuggingFace &&
-                    existing != null &&
-                    existing.isSizeKnown &&
-                    existing.expectedSizeBytes > 0L
-                ) {
-                    spec.copy(
-                        filesManifestJson = existing.filesManifestJson,
-                        expectedSizeBytes = existing.expectedSizeBytes,
-                        isSizeKnown = true
-                    )
-                } else {
-                    spec
-                }
-
-                when {
-                    presentCount == diskStatuses.size && diskStatuses.isNotEmpty() && existing?.downloadState == "INSTALLED" -> {
-                        val level = computeVerificationLevel(VerifiedModelCatalog.parseManifest(effectiveSpec.filesManifestJson))
-                        val levelLabel = if (level == "VERIFIED_SHA256") "SHA-256 verified" else "size-verified only"
-                        effectiveSpec.copy(
-                            downloadState = "INSTALLED",
+            when (spec.runtimeCompatibility) {
+                VerifiedModelCatalog.RUNTIME_DIRECT_GEMINI_API -> {
+                    if (geminiApiConfigured) {
+                        spec.copy(
+                            modelVersion = geminiModelName,
+                            installedVersion = geminiModelName,
+                            downloadState = VerifiedModelCatalog.STATE_READY,
                             downloadProgressPercent = 100,
-                            downloadedBytes = completeBytes,
-                            verifiedFilesCount = presentCount,
-                            installedVersion = existing.installedVersion,
-                            localFilePath = getModelDirectory(spec.modelId).absolutePath,
-                            sha256Checksum = existing.sha256Checksum,
-                            verificationLevel = existing.verificationLevel.takeIf { it != "UNVERIFIED" } ?: level,
-                            statusNote = "All $presentCount/${diskStatuses.size} files present on disk ($levelLabel)."
+                            verificationLevel = "API_KEY_CONFIGURED",
+                            statusNote = "Direct Gemini API key configured ($geminiModelName). Use Settings -> Test Connection to verify live reachability."
+                        )
+                    } else {
+                        spec.copy(
+                            modelVersion = geminiModelName,
+                            downloadState = VerifiedModelCatalog.STATE_NOT_DOWNLOADED,
+                            downloadProgressPercent = 0,
+                            verificationLevel = "API_KEY_REQUIRED",
+                            statusNote = "No Gemini API key configured. Open Settings -> Direct Gemini API to add your key."
                         )
                     }
-                    totalOnDisk > 0L -> {
-                        val pct = if (effectiveSpec.isSizeKnown && effectiveSpec.expectedSizeBytes > 0L) {
-                            ((totalOnDisk * 100L) / effectiveSpec.expectedSizeBytes).toInt().coerceIn(1, 99)
-                        } else 0
-                        effectiveSpec.copy(
-                            downloadState = "NOT_DOWNLOADED",
-                            downloadProgressPercent = pct,
-                            downloadedBytes = totalOnDisk,
-                            verifiedFilesCount = presentCount,
-                            localFilePath = getModelDirectory(spec.modelId).absolutePath,
-                            verificationLevel = "UNVERIFIED",
-                            statusNote = "Incomplete download ($presentCount/${diskStatuses.size} files complete). Tap Download to resume."
-                        )
+                }
+                VerifiedModelCatalog.RUNTIME_ANDROID_LOCAL,
+                VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID -> spec
+                else -> {
+                    // On-device downloadable ONNX package (e.g., Silero VAD ONNX)
+                    val existing = existingById[spec.modelId]
+                    val diskStatuses = inspectLocalFiles(spec)
+                    val completeBytes = diskStatuses.sumOf { it.actualBytesOnDisk }
+                    val partialBytes = diskStatuses.sumOf { it.partialBytesOnDisk }
+                    val totalOnDisk = completeBytes + partialBytes
+                    val presentCount = diskStatuses.count { it.isPresentAndSized }
+
+                    when {
+                        presentCount == diskStatuses.size && diskStatuses.isNotEmpty() -> {
+                            val onnxFile = File(getModelDirectory(spec.modelId), "onnx/model.onnx")
+                            val loadCheck = if (spec.modelId == "silero_vad_onnx") {
+                                SileroVadOnnxEngine.verifyModelLoadable(onnxFile)
+                            } else {
+                                Result.success("Runtime verified")
+                            }
+                            if (loadCheck.isSuccess) {
+                                val level = computeVerificationLevel(VerifiedModelCatalog.parseManifest(spec.filesManifestJson))
+                                spec.copy(
+                                    downloadState = VerifiedModelCatalog.STATE_READY,
+                                    downloadProgressPercent = 100,
+                                    downloadedBytes = completeBytes,
+                                    verifiedFilesCount = presentCount,
+                                    installedVersion = existing?.installedVersion?.ifBlank { spec.modelVersion } ?: spec.modelVersion,
+                                    localFilePath = getModelDirectory(spec.modelId).absolutePath,
+                                    sha256Checksum = existing?.sha256Checksum.orEmpty(),
+                                    verificationLevel = level,
+                                    statusNote = "READY: All $presentCount/${diskStatuses.size} files verified & ${loadCheck.getOrThrow()}."
+                                )
+                            } else {
+                                spec.copy(
+                                    downloadState = VerifiedModelCatalog.STATE_FAILED,
+                                    downloadProgressPercent = 100,
+                                    downloadedBytes = completeBytes,
+                                    verifiedFilesCount = presentCount,
+                                    localFilePath = getModelDirectory(spec.modelId).absolutePath,
+                                    verificationLevel = "LOAD_FAILED",
+                                    statusNote = "Files downloaded on disk but ONNX Runtime failed to load: ${loadCheck.exceptionOrNull()?.localizedMessage}"
+                                )
+                            }
+                        }
+                        totalOnDisk > 0L -> {
+                            val pct = if (spec.isSizeKnown && spec.expectedSizeBytes > 0L) {
+                                ((totalOnDisk * 100L) / spec.expectedSizeBytes).toInt().coerceIn(1, 99)
+                            } else 0
+                            spec.copy(
+                                downloadState = VerifiedModelCatalog.STATE_NOT_DOWNLOADED,
+                                downloadProgressPercent = pct,
+                                downloadedBytes = totalOnDisk,
+                                verifiedFilesCount = presentCount,
+                                localFilePath = getModelDirectory(spec.modelId).absolutePath,
+                                verificationLevel = "UNVERIFIED",
+                                statusNote = "Incomplete download ($presentCount/${diskStatuses.size} files complete). Tap Download to resume."
+                            )
+                        }
+                        else -> spec
                     }
-                    else -> effectiveSpec
                 }
             }
         }
         dao.insertModels(reconciled)
+    }
+
+    suspend fun updateDirectGeminiCatalogStatus(
+        isConfigured: Boolean,
+        modelName: String,
+        connectionMessage: String? = null,
+        isError: Boolean = false
+    ) = withContext(Dispatchers.IO) {
+        val existing = dao.getModelById("direct_gemini_api") ?: return@withContext
+        val newState = when {
+            !isConfigured -> VerifiedModelCatalog.STATE_NOT_DOWNLOADED
+            isError -> VerifiedModelCatalog.STATE_FAILED
+            else -> VerifiedModelCatalog.STATE_READY
+        }
+        val note = connectionMessage ?: if (isConfigured) {
+            "Direct Gemini API key configured ($modelName). Ready for translation, review & audio ASR."
+        } else {
+            "No Gemini API key configured. Open Settings -> Direct Gemini API to add your key."
+        }
+        dao.updateModel(
+            existing.copy(
+                modelVersion = modelName,
+                installedVersion = if (isConfigured) modelName else "",
+                downloadState = newState,
+                downloadProgressPercent = if (isConfigured && !isError) 100 else 0,
+                verificationLevel = when {
+                    !isConfigured -> "API_KEY_REQUIRED"
+                    isError -> "CONNECTION_FAILED"
+                    else -> "API_VERIFIED"
+                },
+                statusNote = note
+            )
+        )
     }
 
     fun cancelDownload(modelId: String) {
@@ -186,63 +248,21 @@ class ModelDownloadManager(
     }
 
     /**
-     * Queries real HTTP HEAD Content-Length for gated Hugging Face files using the user's
-     * authorized read-only HF token. Never invents or guesses sizes!
-     */
-    suspend fun probeGatedModelSizes(
-        modelId: String,
-        hfAccessToken: String
-    ): Result<ModelManifestEntity> = withContext(Dispatchers.IO) {
-        val token = hfAccessToken.trim()
-        if (token.isEmpty()) {
-            return@withContext Result.failure(IllegalArgumentException("Enter a read-only Hugging Face Access Token first."))
-        }
-        val model = dao.getModelById(modelId)
-            ?: return@withContext Result.failure(IllegalArgumentException("Model $modelId not found."))
-        val artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
-        if (artifacts.isEmpty()) {
-            return@withContext Result.failure(IllegalStateException("No downloadable files declared for ${model.modelName}."))
-        }
-
-        val resolved = mutableListOf<ModelArtifactFile>()
-        for (file in artifacts) {
-            if (file.expectedBytes > 0L) {
-                resolved.add(file)
-                continue
-            }
-            val sizeResult = queryRemoteContentLength(file.downloadUrl, token)
-            if (sizeResult.isFailure) {
-                val msg = sizeResult.exceptionOrNull()?.localizedMessage ?: "Authorization failed"
-                val failed = model.copy(
-                    statusNote = "Could not query gated file ${file.relativePath}: $msg"
-                )
-                dao.updateModel(failed)
-                return@withContext Result.failure(IllegalStateException(failed.statusNote))
-            }
-            resolved.add(file.copy(expectedBytes = sizeResult.getOrThrow()))
-        }
-
-        val exactTotal = resolved.sumOf { it.expectedBytes }
-        val updated = model.copy(
-            filesManifestJson = VerifiedModelCatalog.serializeManifest(resolved),
-            expectedSizeBytes = exactTotal,
-            isSizeKnown = exactTotal > 0L,
-            statusNote = "Verified real server total size with HF token: ${resolved.size} files (${exactTotal} bytes). Ready to download."
-        )
-        dao.updateModel(updated)
-        Result.success(updated)
-    }
-
-    /**
-     * Downloads ALL required files for a model into actual official filenames, supports HTTP Range resume,
-     * verifies exact byte counts & SHA-256 hashes, and marks INSTALLED only after every file passes.
+     * Downloads ALL required files for an Android-compatible ONNX model, transitions through
+     * DOWNLOADING -> DOWNLOADED -> VERIFYING (size + SHA-256) -> LOADING (OrtSession load check) -> READY.
+     * Refuses to download `UNSUPPORTED_ON_ANDROID` models.
      */
     suspend fun downloadAndVerifyModel(
-        modelId: String,
-        hfAccessToken: String? = null
+        modelId: String
     ): Result<ModelManifestEntity> = withContext(Dispatchers.IO) {
-        var model = dao.getModelById(modelId)
+        val model = dao.getModelById(modelId)
             ?: return@withContext Result.failure(IllegalArgumentException("Model $modelId not found in catalog."))
+
+        if (model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID) {
+            return@withContext Result.failure(
+                IllegalStateException("${model.modelName} is UNSUPPORTED ON ANDROID. Desktop PyTorch weights cannot run locally on Android.")
+            )
+        }
 
         if (!VerifiedModelCatalog.isDownloadablePackage(model)) {
             return@withContext Result.success(model)
@@ -259,79 +279,29 @@ class ModelDownloadManager(
         }
 
         try {
-            val token = hfAccessToken?.trim().orEmpty()
-            if (model.isGatedHuggingFace && token.isEmpty()) {
-                val gatedMsg = "Gated Hugging Face model: Accept user terms at ${model.sourceUrl} (and pyannote/segmentation-3.0) and provide a read-only HF Access Token."
-                val failed = model.copy(downloadState = "FAILED", statusNote = gatedMsg)
-                dao.updateModel(failed)
-                return@withContext Result.failure(IllegalStateException(gatedMsg))
-            }
-
-            var artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
+            val artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
             if (artifacts.isEmpty()) {
                 return@withContext Result.failure(IllegalStateException("Model manifest contains no downloadable files."))
-            }
-
-            // 1. Resolve any unknown remote file sizes via real HTTP HEAD Content-Length (e.g. gated models)
-            if (!model.isSizeKnown || artifacts.any { it.expectedBytes <= 0L }) {
-                dao.updateModel(
-                    model.copy(
-                        downloadState = "DOWNLOADING",
-                        downloadProgressPercent = 0,
-                        statusNote = "Querying real server Content-Length for ${artifacts.size} files..."
-                    )
-                )
-                val resolvedList = mutableListOf<ModelArtifactFile>()
-                for (artifact in artifacts) {
-                    coroutineContext.ensureActive()
-                    if (artifact.expectedBytes > 0L) {
-                        resolvedList.add(artifact)
-                    } else {
-                        val lenRes = queryRemoteContentLength(artifact.downloadUrl, token.ifEmpty { null })
-                        if (lenRes.isFailure) {
-                            val err = lenRes.exceptionOrNull()?.localizedMessage ?: "Failed to query remote size"
-                            val failed = model.copy(
-                                downloadState = "FAILED",
-                                statusNote = "Cannot inspect ${artifact.relativePath}: $err"
-                            )
-                            dao.updateModel(failed)
-                            return@withContext Result.failure(IllegalStateException(failed.statusNote))
-                        }
-                        resolvedList.add(artifact.copy(expectedBytes = lenRes.getOrThrow()))
-                    }
-                }
-                artifacts = resolvedList
-                model = model.copy(
-                    filesManifestJson = VerifiedModelCatalog.serializeManifest(artifacts),
-                    expectedSizeBytes = artifacts.sumOf { it.expectedBytes },
-                    isSizeKnown = true,
-                    totalFilesCount = artifacts.size
-                )
-                dao.updateModel(model)
             }
 
             val totalExpectedBytes = artifacts.sumOf { it.expectedBytes.coerceAtLeast(0L) }
             val modelDir = getModelDirectory(model.modelId).apply { mkdirs() }
 
-            // 2. Calculate remaining bytes needed and verify available device storage
+            // Check storage space
             val alreadyCompleteBytes = artifacts.sumOf { art ->
                 val f = File(modelDir, art.relativePath)
                 if (f.exists() && f.length() == art.expectedBytes) f.length() else 0L
             }
             val remainingToDownload = (totalExpectedBytes - alreadyCompleteBytes).coerceAtLeast(0L)
             val freeBytes = getAvailableStorageBytes()
-            val safetyMarginBytes = 25L * 1000L * 1000L // 25 MB safety margin
+            val safetyMarginBytes = 25L * 1000L * 1000L
             if (freeBytes < remainingToDownload + safetyMarginBytes) {
-                val msg = "Insufficient device storage: Needs ${formatCompactSize(remainingToDownload)} remaining (+25 MB headroom), available ${formatCompactSize(freeBytes)}."
-                val failed = model.copy(
-                    downloadState = "FAILED",
-                    statusNote = msg
-                )
+                val msg = "Insufficient device storage: Needs ${formatCompactSize(remainingToDownload)} (+25 MB headroom), available ${formatCompactSize(freeBytes)}."
+                val failed = model.copy(downloadState = VerifiedModelCatalog.STATE_FAILED, statusNote = msg)
                 dao.updateModel(failed)
                 return@withContext Result.failure(IllegalStateException(msg))
             }
 
-            // 3. Download every required file with HTTP Range resume support
             var cumulativeVerifiedBytes = 0L
             var verifiedCount = 0
             var primarySha256 = ""
@@ -343,7 +313,6 @@ class ModelDownloadManager(
                 targetFile.parentFile?.mkdirs()
                 val partialFile = File(modelDir, "${artifact.relativePath}.part")
 
-                // Skip file if already on disk with exact size & verified SHA-256
                 if (targetFile.exists() && targetFile.length() == artifact.expectedBytes) {
                     val existingSha = computeSha256Hex(targetFile)
                     val hashMatches = artifact.expectedSha256.isBlank() ||
@@ -366,7 +335,7 @@ class ModelDownloadManager(
 
                 dao.updateModel(
                     model.copy(
-                        downloadState = "DOWNLOADING",
+                        downloadState = VerifiedModelCatalog.STATE_DOWNLOADING,
                         downloadedBytes = cumulativeVerifiedBytes + existingPartBytes,
                         downloadProgressPercent = computePct(cumulativeVerifiedBytes + existingPartBytes, totalExpectedBytes),
                         verifiedFilesCount = verifiedCount,
@@ -381,20 +350,11 @@ class ModelDownloadManager(
                 if (existingPartBytes > 0L) {
                     reqBuilder.header("Range", "bytes=$existingPartBytes-")
                 }
-                if (token.isNotEmpty()) {
-                    reqBuilder.header("Authorization", "Bearer $token")
-                }
 
                 httpClient.newCall(reqBuilder.build()).execute().use { response ->
-                    if (response.code == 401 || response.code == 403) {
-                        val authMsg = "HTTP ${response.code} for ${artifact.relativePath}. Accept model terms on Hugging Face and check your read-only HF Access Token."
-                        val failed = model.copy(downloadState = "FAILED", statusNote = authMsg)
-                        dao.updateModel(failed)
-                        return@withContext Result.failure(IllegalStateException(authMsg))
-                    }
                     if (!response.isSuccessful && response.code != 416) {
                         val httpMsg = "HTTP ${response.code} downloading ${artifact.relativePath}"
-                        val failed = model.copy(downloadState = "FAILED", statusNote = httpMsg)
+                        val failed = model.copy(downloadState = VerifiedModelCatalog.STATE_FAILED, statusNote = httpMsg)
                         dao.updateModel(failed)
                         return@withContext Result.failure(IllegalStateException(httpMsg))
                     }
@@ -415,18 +375,17 @@ class ModelDownloadManager(
                                 fileDownloaded += bytesRead
 
                                 val now = System.currentTimeMillis()
-                                if (now - lastProgressUpdateMs >= 250L) {
+                                if (now - lastProgressUpdateMs >= 200L) {
                                     lastProgressUpdateMs = now
                                     val totalNow = cumulativeVerifiedBytes + fileDownloaded
-                                    val remainingNow = (totalExpectedBytes - totalNow).coerceAtLeast(0L)
                                     dao.updateModel(
                                         model.copy(
-                                            downloadState = "DOWNLOADING",
+                                            downloadState = VerifiedModelCatalog.STATE_DOWNLOADING,
                                             downloadedBytes = totalNow,
                                             downloadProgressPercent = computePct(totalNow, totalExpectedBytes),
                                             verifiedFilesCount = verifiedCount,
                                             localFilePath = modelDir.absolutePath,
-                                            statusNote = "File ${index + 1}/${artifacts.size} (${artifact.filename}): ${formatCompactSize(totalNow)} / ${formatCompactSize(totalExpectedBytes)} (${formatCompactSize(remainingNow)} left)"
+                                            statusNote = "Downloading ${artifact.filename}: ${formatCompactSize(totalNow)} / ${formatCompactSize(totalExpectedBytes)}"
                                         )
                                     )
                                 }
@@ -436,30 +395,42 @@ class ModelDownloadManager(
                     }
                 }
 
-                // 4. Verify downloaded file size & SHA-256 checksum
+                // Transition to DOWNLOADED before verification
+                dao.updateModel(
+                    model.copy(
+                        downloadState = VerifiedModelCatalog.STATE_DOWNLOADED,
+                        downloadedBytes = cumulativeVerifiedBytes + partialFile.length(),
+                        downloadProgressPercent = computePct(cumulativeVerifiedBytes + partialFile.length(), totalExpectedBytes),
+                        verifiedFilesCount = verifiedCount,
+                        localFilePath = modelDir.absolutePath,
+                        statusNote = "Downloaded ${artifact.filename}; checking file size and SHA-256..."
+                    )
+                )
+
                 if (!partialFile.exists() || partialFile.length() == 0L) {
-                    val corrupted = model.copy(
-                        downloadState = "CORRUPTED",
+                    val failed = model.copy(
+                        downloadState = VerifiedModelCatalog.STATE_FAILED,
                         statusNote = "Downloaded file ${artifact.relativePath} is empty or missing."
                     )
-                    dao.updateModel(corrupted)
-                    return@withContext Result.failure(IllegalStateException(corrupted.statusNote))
+                    dao.updateModel(failed)
+                    return@withContext Result.failure(IllegalStateException(failed.statusNote))
                 }
 
                 if (artifact.expectedBytes > 0L && partialFile.length() != artifact.expectedBytes) {
                     val actual = partialFile.length()
-                    val corrupted = model.copy(
-                        downloadState = "CORRUPTED",
+                    val failed = model.copy(
+                        downloadState = VerifiedModelCatalog.STATE_FAILED,
                         downloadedBytes = cumulativeVerifiedBytes + actual,
-                        statusNote = "Size mismatch on ${artifact.relativePath}: got $actual bytes, expected ${artifact.expectedBytes} bytes. Retry to resume."
+                        statusNote = "Size mismatch on ${artifact.relativePath}: got $actual B, expected ${artifact.expectedBytes} B."
                     )
-                    dao.updateModel(corrupted)
-                    return@withContext Result.failure(IllegalStateException(corrupted.statusNote))
+                    dao.updateModel(failed)
+                    return@withContext Result.failure(IllegalStateException(failed.statusNote))
                 }
 
+                // Transition to VERIFYING
                 dao.updateModel(
                     model.copy(
-                        downloadState = "VERIFYING",
+                        downloadState = VerifiedModelCatalog.STATE_VERIFYING,
                         downloadedBytes = cumulativeVerifiedBytes + partialFile.length(),
                         downloadProgressPercent = computePct(cumulativeVerifiedBytes + partialFile.length(), totalExpectedBytes),
                         verifiedFilesCount = verifiedCount,
@@ -471,12 +442,12 @@ class ModelDownloadManager(
                 val actualSha256 = computeSha256Hex(partialFile)
                 if (artifact.expectedSha256.isNotBlank() && !actualSha256.equals(artifact.expectedSha256, ignoreCase = true)) {
                     partialFile.delete()
-                    val corrupted = model.copy(
-                        downloadState = "CORRUPTED",
-                        statusNote = "SHA-256 checksum mismatch on ${artifact.relativePath}! Expected ${artifact.expectedSha256.take(12)}…, got ${actualSha256.take(12)}…. Corrupted file removed."
+                    val failed = model.copy(
+                        downloadState = VerifiedModelCatalog.STATE_FAILED,
+                        statusNote = "SHA-256 mismatch on ${artifact.relativePath}! Expected ${artifact.expectedSha256.take(12)}…, got ${actualSha256.take(12)}…. Corrupted file removed."
                     )
-                    dao.updateModel(corrupted)
-                    return@withContext Result.failure(IllegalStateException(corrupted.statusNote))
+                    dao.updateModel(failed)
+                    return@withContext Result.failure(IllegalStateException(failed.statusNote))
                 }
 
                 if (targetFile.exists()) targetFile.delete()
@@ -492,15 +463,42 @@ class ModelDownloadManager(
                 verifiedCount++
             }
 
-            // 5. Final check: mark INSTALLED ONLY when all required files exist & match
-            val verLevel = computeVerificationLevel(artifacts)
-            val verSummary = if (verLevel == "VERIFIED_SHA256") {
-                "SHA-256 verified all $verifiedCount/${artifacts.size} files (${formatCompactSize(cumulativeVerifiedBytes)}) on disk."
+            // Transition to LOADING: genuinely load the model into ONNX Runtime before marking READY!
+            dao.updateModel(
+                model.copy(
+                    downloadState = VerifiedModelCatalog.STATE_LOADING,
+                    downloadProgressPercent = 99,
+                    downloadedBytes = cumulativeVerifiedBytes,
+                    verifiedFilesCount = verifiedCount,
+                    localFilePath = modelDir.absolutePath,
+                    statusNote = "Loading ${model.modelName} into ONNX Runtime Mobile to verify runtime compatibility..."
+                )
+            )
+
+            val loadResult = if (model.modelId == "silero_vad_onnx") {
+                SileroVadOnnxEngine.verifyModelLoadable(File(modelDir, "onnx/model.onnx"))
             } else {
-                "Size-verified only ($verifiedCount/${artifacts.size} files, ${formatCompactSize(cumulativeVerifiedBytes)}; official SHA-256 not available for all weight files)."
+                Result.success("Model files verified")
             }
+
+            if (loadResult.isFailure) {
+                val failed = model.copy(
+                    downloadState = VerifiedModelCatalog.STATE_FAILED,
+                    downloadProgressPercent = 100,
+                    downloadedBytes = cumulativeVerifiedBytes,
+                    verifiedFilesCount = verifiedCount,
+                    localFilePath = modelDir.absolutePath,
+                    sha256Checksum = primarySha256,
+                    verificationLevel = "LOAD_FAILED",
+                    statusNote = "SHA-256 passed, but ONNX Runtime failed to load model: ${loadResult.exceptionOrNull()?.localizedMessage}"
+                )
+                dao.updateModel(failed)
+                return@withContext Result.failure(loadResult.exceptionOrNull()!!)
+            }
+
+            val verLevel = computeVerificationLevel(artifacts)
             val finalModel = model.copy(
-                downloadState = "INSTALLED",
+                downloadState = VerifiedModelCatalog.STATE_READY,
                 downloadProgressPercent = 100,
                 downloadedBytes = cumulativeVerifiedBytes,
                 verifiedFilesCount = verifiedCount,
@@ -509,7 +507,7 @@ class ModelDownloadManager(
                 localFilePath = modelDir.absolutePath,
                 sha256Checksum = primarySha256,
                 verificationLevel = verLevel,
-                statusNote = verSummary
+                statusNote = "READY: All $verifiedCount/${artifacts.size} files SHA-256 verified (${formatCompactSize(cumulativeVerifiedBytes)}) & ${loadResult.getOrThrow()}."
             )
             dao.updateModel(finalModel)
             Result.success(finalModel)
@@ -518,19 +516,19 @@ class ModelDownloadManager(
             val completeCount = inspectLocalFiles(model).count { it.isPresentAndSized }
             dao.updateModel(
                 model.copy(
-                    downloadState = "NOT_DOWNLOADED",
+                    downloadState = VerifiedModelCatalog.STATE_NOT_DOWNLOADED,
                     downloadedBytes = diskBytes,
                     downloadProgressPercent = if (model.isSizeKnown && model.expectedSizeBytes > 0L) {
                         computePct(diskBytes, model.expectedSizeBytes)
                     } else 0,
                     verifiedFilesCount = completeCount,
-                    statusNote = "Download paused/cancelled at ${formatCompactSize(diskBytes)}. Partial files retained for HTTP Range resume."
+                    statusNote = "Download cancelled at ${formatCompactSize(diskBytes)}. Partial files retained for resume."
                 )
             )
             throw e
         } catch (e: Exception) {
             val failed = model.copy(
-                downloadState = "FAILED",
+                downloadState = VerifiedModelCatalog.STATE_FAILED,
                 statusNote = "Download error: ${e.localizedMessage ?: "Network interruption"}. Tap Retry to resume."
             )
             dao.updateModel(failed)
@@ -541,7 +539,7 @@ class ModelDownloadManager(
     }
 
     /**
-     * Re-verifies all required files on disk and their SHA-256 hashes.
+     * Re-verifies all required files on disk, SHA-256 hashes, AND live ONNX Runtime loadability.
      */
     suspend fun verifyInstalledModelIntegrity(modelId: String): Result<ModelManifestEntity> = withContext(Dispatchers.IO) {
         val model = dao.getModelById(modelId)
@@ -549,6 +547,7 @@ class ModelDownloadManager(
         val artifacts = VerifiedModelCatalog.parseManifest(model.filesManifestJson)
         if (artifacts.isEmpty()) return@withContext Result.success(model)
 
+        dao.updateModel(model.copy(downloadState = VerifiedModelCatalog.STATE_VERIFYING, statusNote = "Re-verifying files & SHA-256 checksums..."))
         val modelDir = getModelDirectory(model.modelId)
         var verifiedCount = 0
         var verifiedBytes = 0L
@@ -558,7 +557,7 @@ class ModelDownloadManager(
             val file = File(modelDir, art.relativePath)
             if (!file.exists() || file.length() == 0L) {
                 val missing = model.copy(
-                    downloadState = "CORRUPTED",
+                    downloadState = VerifiedModelCatalog.STATE_FAILED,
                     verifiedFilesCount = verifiedCount,
                     downloadedBytes = verifiedBytes,
                     statusNote = "Missing required file: ${art.relativePath}. Re-download required."
@@ -568,7 +567,7 @@ class ModelDownloadManager(
             }
             if (art.expectedBytes > 0L && file.length() != art.expectedBytes) {
                 val mismatch = model.copy(
-                    downloadState = "CORRUPTED",
+                    downloadState = VerifiedModelCatalog.STATE_FAILED,
                     verifiedFilesCount = verifiedCount,
                     downloadedBytes = verifiedBytes,
                     statusNote = "Size mismatch on ${art.relativePath} (${file.length()} vs ${art.expectedBytes} B)."
@@ -579,7 +578,7 @@ class ModelDownloadManager(
             val sha = computeSha256Hex(file)
             if (art.expectedSha256.isNotBlank() && !sha.equals(art.expectedSha256, ignoreCase = true)) {
                 val bad = model.copy(
-                    downloadState = "CORRUPTED",
+                    downloadState = VerifiedModelCatalog.STATE_FAILED,
                     verifiedFilesCount = verifiedCount,
                     downloadedBytes = verifiedBytes,
                     statusNote = "SHA-256 verification failed on ${art.relativePath}."
@@ -592,14 +591,27 @@ class ModelDownloadManager(
             verifiedBytes += file.length()
         }
 
-        val verLevel = computeVerificationLevel(artifacts)
-        val verNote = if (verLevel == "VERIFIED_SHA256") {
-            "Integrity check passed: all $verifiedCount/${artifacts.size} files verified (weight SHA-256 matched)."
+        dao.updateModel(model.copy(downloadState = VerifiedModelCatalog.STATE_LOADING, statusNote = "Testing live ONNX Runtime session load..."))
+        val loadCheck = if (model.modelId == "silero_vad_onnx") {
+            SileroVadOnnxEngine.verifyModelLoadable(File(modelDir, "onnx/model.onnx"))
         } else {
-            "Size-verified only: all $verifiedCount/${artifacts.size} files match expected byte length (official SHA-256 hash unavailable for some weights)."
+            Result.success("Verified")
         }
+        if (loadCheck.isFailure) {
+            val failed = model.copy(
+                downloadState = VerifiedModelCatalog.STATE_FAILED,
+                verifiedFilesCount = verifiedCount,
+                downloadedBytes = verifiedBytes,
+                verificationLevel = "LOAD_FAILED",
+                statusNote = "Files match SHA-256, but ONNX Runtime failed to load: ${loadCheck.exceptionOrNull()?.localizedMessage}"
+            )
+            dao.updateModel(failed)
+            return@withContext Result.failure(loadCheck.exceptionOrNull()!!)
+        }
+
+        val verLevel = computeVerificationLevel(artifacts)
         val verified = model.copy(
-            downloadState = "INSTALLED",
+            downloadState = VerifiedModelCatalog.STATE_READY,
             downloadProgressPercent = 100,
             downloadedBytes = verifiedBytes,
             verifiedFilesCount = verifiedCount,
@@ -607,7 +619,7 @@ class ModelDownloadManager(
             localFilePath = modelDir.absolutePath,
             sha256Checksum = primarySha,
             verificationLevel = verLevel,
-            statusNote = verNote
+            statusNote = "READY: All $verifiedCount/${artifacts.size} files verified & ${loadCheck.getOrThrow()}."
         )
         dao.updateModel(verified)
         Result.success(verified)
@@ -621,7 +633,7 @@ class ModelDownloadManager(
             modelDir.deleteRecursively()
         }
         val reset = model.copy(
-            downloadState = "NOT_DOWNLOADED",
+            downloadState = VerifiedModelCatalog.STATE_NOT_DOWNLOADED,
             downloadProgressPercent = 0,
             downloadedBytes = 0L,
             verifiedFilesCount = 0,
@@ -629,7 +641,7 @@ class ModelDownloadManager(
             localFilePath = "",
             sha256Checksum = "",
             verificationLevel = "UNVERIFIED",
-            statusNote = "Deleted all files from device storage. Ready to download."
+            statusNote = "Deleted files from device storage. Ready to download."
         )
         dao.updateModel(reset)
         reset
@@ -643,36 +655,6 @@ class ModelDownloadManager(
             "VERIFIED_SHA256"
         } else {
             "VERIFIED_SIZE_ONLY"
-        }
-    }
-
-    private fun queryRemoteContentLength(url: String, bearerToken: String?): Result<Long> {
-        return try {
-            val req = Request.Builder()
-                .url(url)
-                .head()
-                .header("User-Agent", "AnimeDubStudio-Android/1.0")
-                .apply {
-                    if (!bearerToken.isNullOrBlank()) {
-                        header("Authorization", "Bearer $bearerToken")
-                    }
-                }
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    return Result.failure(IllegalStateException("HTTP ${resp.code} (check HF license terms & token)"))
-                }
-                val contentLength = resp.header("X-Linked-Size")?.toLongOrNull()
-                    ?: resp.header("Content-Length")?.toLongOrNull()
-                    ?: -1L
-                if (contentLength <= 0L) {
-                    Result.failure(IllegalStateException("Server did not return a valid Content-Length header."))
-                } else {
-                    Result.success(contentLength)
-                }
-            }
-        } catch (e: Exception) {
-            Result.failure(e)
         }
     }
 

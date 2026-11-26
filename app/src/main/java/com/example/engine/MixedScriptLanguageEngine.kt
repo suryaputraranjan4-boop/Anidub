@@ -408,4 +408,125 @@ INCORRECT EXAMPLES (STRICTLY FORBIDDEN):
         val jp = japaneseSourceTerm.trim().lowercase(Locale.US)
         return if (jp.isNotEmpty()) jp else preferredDisplay.trim().lowercase(Locale.US)
     }
+
+    /**
+     * Pure-Kotlin JSON exporter for the 3-tier dictionary (`Project > Anime > Global`).
+     */
+    fun exportDictionaryEntriesToJson(entries: List<DictionaryEntryEntity>): String {
+        val sb = StringBuilder("[\n")
+        entries.forEachIndexed { idx, e ->
+            if (idx > 0) sb.append(",\n")
+            sb.append("  {")
+            sb.append("\"dictionaryLevel\":\"").append(escapeJsonString(e.dictionaryLevel)).append("\",")
+            sb.append("\"animeSeriesName\":\"").append(escapeJsonString(e.animeSeriesName.orEmpty())).append("\",")
+            sb.append("\"japaneseSourceTerm\":\"").append(escapeJsonString(e.japaneseSourceTerm)).append("\",")
+            sb.append("\"preferredMixedScript\":\"").append(escapeJsonString(e.preferredMixedScript)).append("\",")
+            sb.append("\"preferredHindiWording\":\"").append(escapeJsonString(e.preferredHindiWording)).append("\",")
+            sb.append("\"preferredEnglishWording\":\"").append(escapeJsonString(e.preferredEnglishWording)).append("\",")
+            sb.append("\"preferredRomanHinglish\":\"").append(escapeJsonString(e.preferredRomanHinglish)).append("\",")
+            sb.append("\"pronunciationGuidance\":\"").append(escapeJsonString(e.pronunciationGuidance)).append("\",")
+            sb.append("\"replacementScope\":\"").append(escapeJsonString(e.replacementScope)).append("\",")
+            sb.append("\"contextNotes\":\"").append(escapeJsonString(e.contextNotes)).append("\",")
+            sb.append("\"preserveOriginalEnglish\":").append(e.preserveOriginalEnglish)
+            sb.append("}")
+        }
+        sb.append("\n]")
+        return sb.toString()
+    }
+
+    /**
+     * Pure-Kotlin JSON parser for importing dictionary entries.
+     * Validates scope (`PROJECT`, `ANIME`, `GLOBAL`) and binds `PROJECT` / `ANIME` entries safely
+     * to the active project / anime series when omitted.
+     */
+    fun parseDictionaryEntriesFromJson(
+        json: String,
+        fallbackProjectId: Long?,
+        fallbackAnimeSeriesName: String
+    ): Result<List<DictionaryEntryEntity>> {
+        val trimmed = json.trim()
+        if (trimmed.isEmpty() || !trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+            return Result.failure(IllegalArgumentException("Dictionary import must be a valid JSON array `[...]`."))
+        }
+        val objRegex = Regex("\\{[^{}]*\\}")
+        val parsed = mutableListOf<DictionaryEntryEntity>()
+        val now = System.currentTimeMillis()
+        for (match in objRegex.findAll(trimmed)) {
+            val obj = match.value
+            val rawLevel = extractJsonField(obj, "dictionaryLevel").uppercase(Locale.US)
+            val level = when (rawLevel) {
+                "PROJECT", "ANIME", "GLOBAL" -> rawLevel
+                else -> "GLOBAL"
+            }
+            val jp = extractJsonField(obj, "japaneseSourceTerm").trim()
+            val mixed = extractJsonField(obj, "preferredMixedScript").trim()
+            val hindi = extractJsonField(obj, "preferredHindiWording").trim()
+            val english = extractJsonField(obj, "preferredEnglishWording").trim()
+            val roman = extractJsonField(obj, "preferredRomanHinglish").trim()
+            val pron = extractJsonField(obj, "pronunciationGuidance").trim()
+            val scopeStr = extractJsonField(obj, "replacementScope").trim().ifBlank { level }
+            val notes = extractJsonField(obj, "contextNotes").trim()
+            val preserveEn = extractJsonBool(obj, "preserveOriginalEnglish", true)
+            val animeFromJson = extractJsonField(obj, "animeSeriesName").trim()
+
+            val effectiveMixed = mixed.ifBlank { hindi.ifBlank { english.ifBlank { roman } } }
+            if (jp.isBlank() && effectiveMixed.isBlank()) continue
+
+            val effectiveProjectId = if (level == "PROJECT") fallbackProjectId else null
+            val effectiveAnime = if (level == "ANIME") {
+                animeFromJson.ifBlank { fallbackAnimeSeriesName }.takeIf { it.isNotBlank() }
+            } else {
+                null
+            }
+            parsed.add(
+                DictionaryEntryEntity(
+                    dictionaryLevel = level,
+                    projectId = effectiveProjectId,
+                    animeSeriesName = effectiveAnime,
+                    japaneseSourceTerm = jp,
+                    preferredRomanHinglish = roman.ifBlank { effectiveMixed },
+                    preferredMixedScript = effectiveMixed,
+                    preferredHindiWording = hindi,
+                    preferredEnglishWording = english,
+                    pronunciationGuidance = pron,
+                    replacementScope = scopeStr,
+                    contextNotes = notes,
+                    preserveOriginalEnglish = preserveEn,
+                    updatedAt = now
+                )
+            )
+        }
+        return if (parsed.isEmpty()) {
+            Result.failure(IllegalArgumentException("No valid dictionary entries were found in the provided JSON."))
+        } else {
+            Result.success(parsed)
+        }
+    }
+
+    private fun escapeJsonString(value: String): String {
+        return value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+    }
+
+    private fun unescapeJsonString(value: String): String {
+        return value
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+    }
+
+    private fun extractJsonField(obj: String, key: String): String {
+        val regex = Regex("\"$key\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
+        val raw = regex.find(obj)?.groupValues?.getOrNull(1) ?: return ""
+        return unescapeJsonString(raw)
+    }
+
+    private fun extractJsonBool(obj: String, key: String, default: Boolean): Boolean {
+        val regex = Regex("\"$key\"\\s*:\\s*(true|false)")
+        return regex.find(obj)?.groupValues?.getOrNull(1)?.toBooleanStrictOrNull() ?: default
+    }
 }

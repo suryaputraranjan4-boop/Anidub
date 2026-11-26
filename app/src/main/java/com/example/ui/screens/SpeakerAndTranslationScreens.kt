@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.ImportExport
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.filled.VerifiedUser
@@ -77,6 +79,7 @@ import com.example.ui.theme.StudioTextMuted
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioViolet
+import com.example.viewmodel.StudioOverlay
 import com.example.viewmodel.StudioViewModel
 
 /**
@@ -313,12 +316,16 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
     val activeProject by viewModel.activeProject.collectAsState()
     val banner by viewModel.pipelineBanner.collectAsState()
     val config by viewModel.studioConfig.collectAsState()
+    val geminiKeyState by viewModel.geminiKeyState.collectAsState()
 
     var subMode by remember { mutableStateOf("TRANSLATIONS") } // TRANSLATIONS or DICTIONARIES
+    var dialogueSearchQuery by remember { mutableStateOf("") }
     var dictLevelFilter by remember { mutableStateOf("ALL_ACTIVE") } // ALL_ACTIVE, PROJECT, ANIME, GLOBAL
     var dictSearchQuery by remember { mutableStateOf("") }
     var editingDictEntry by remember { mutableStateOf<DictionaryEntryEntity?>(null) }
     var showDictDialog by remember { mutableStateOf(false) }
+    var showImportExportDictDialog by remember { mutableStateOf(false) }
+    var dictJsonText by remember { mutableStateOf("") }
     var editingDialogue by remember { mutableStateOf<DialogueSegmentEntity?>(null) }
 
     val emotions = listOf("NEUTRAL", "ANGRY", "EXCITED", "CALM", "SAD", "HAPPY", "FEARFUL", "SHOUTING", "WHISPERING")
@@ -337,7 +344,9 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
         var mixedText by remember(dlg.id) { mutableStateOf(dlg.romanHinglishText) }
         var emotion by remember(dlg.id) { mutableStateOf(dlg.emotion) }
         var style by remember(dlg.id) { mutableStateOf(dlg.speakingStyle) }
-        var isFixingScript by remember(dlg.id) { mutableStateOf(false) }
+        var rewriteInstruction by remember(dlg.id) { mutableStateOf("") }
+        var reviewNotes by remember(dlg.id) { mutableStateOf<String?>(null) }
+        var isGeminiBusy by remember(dlg.id) { mutableStateOf(false) }
 
         val scriptCheck = remember(mixedText) {
             com.example.engine.MixedScriptLanguageEngine.validateMixedScript(mixedText)
@@ -345,9 +354,9 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
         val showRomanWarning = mixedText.isNotBlank() && !scriptCheck.isValid
 
         AlertDialog(
-            onDismissRequest = { if (!isFixingScript) editingDialogue = null },
+            onDismissRequest = { if (!isGeminiBusy) editingDialogue = null },
             containerColor = StudioSurfaceElevated,
-            title = { Text("Translate ${dlg.dialogueId}", color = StudioTextPrimary) },
+            title = { Text("Translate & Review ${dlg.dialogueId}", color = StudioTextPrimary) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     if (dlg.japaneseText.isNotBlank()) {
@@ -374,13 +383,16 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                         )
                         OutlinedButton(
                             onClick = {
-                                isFixingScript = true
+                                isGeminiBusy = true
                                 viewModel.fixDialogueScriptWithGemini(dlg.id, mixedText) { result ->
-                                    isFixingScript = false
-                                    result.onSuccess { fixed -> mixedText = fixed }
+                                    isGeminiBusy = false
+                                    result.onSuccess { fixed ->
+                                        mixedText = fixed
+                                        reviewNotes = "Mixed-script repaired via Direct Gemini API."
+                                    }
                                 }
                             },
-                            enabled = !isFixingScript,
+                            enabled = !isGeminiBusy && geminiKeyState.isConfigured,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .heightIn(min = 48.dp)
@@ -390,11 +402,62 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                             Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                if (isFixingScript) "Fixing Script with Gemini…" else "Fix Script with Gemini",
+                                if (isGeminiBusy) "Working with Gemini…" else "Fix Script with Gemini",
                                 color = StudioViolet
                             )
                         }
                     }
+
+                    // Gemini Dialogue Rewriting & Quality Review
+                    OutlinedTextField(
+                        value = rewriteInstruction,
+                        onValueChange = { rewriteInstruction = it },
+                        label = { Text("Gemini Rewrite / Review Instruction (Optional)") },
+                        placeholder = { Text("e.g., Make more dramatic, shorter for timing, check naturalness") },
+                        modifier = Modifier.fillMaxWidth().testTag("dialogue_rewrite_instruction_input"),
+                        singleLine = true
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            isGeminiBusy = true
+                            viewModel.reviewOrRewriteDialogueWithGemini(
+                                dialogueId = dlg.id,
+                                currentText = mixedText,
+                                instruction = rewriteInstruction
+                            ) { result ->
+                                isGeminiBusy = false
+                                result.onSuccess { review ->
+                                    mixedText = review.rewrittenMixedScript
+                                    emotion = review.emotion
+                                    val issuesSuffix = if (review.issuesFound.isNotEmpty()) {
+                                        " • Issues fixed: ${review.issuesFound.joinToString("; ")}"
+                                    } else ""
+                                    reviewNotes = (review.reviewNotes.ifBlank { "Reviewed and refined via Direct Gemini API." }) + issuesSuffix
+                                }
+                            }
+                        },
+                        enabled = !isGeminiBusy && geminiKeyState.isConfigured && (mixedText.isNotBlank() || dlg.japaneseText.isNotBlank()),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("review_rewrite_gemini_btn"),
+                        border = BorderStroke(1.dp, StudioCyan)
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = StudioCyan, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            if (isGeminiBusy) "Reviewing with Gemini…" else "Review & Rewrite with Direct Gemini",
+                            color = StudioCyan
+                        )
+                    }
+                    if (!reviewNotes.isNullOrBlank()) {
+                        Text(
+                            text = "Gemini Review: $reviewNotes",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = StudioEmerald
+                        )
+                    }
+
                     OutlinedTextField(
                         value = style,
                         onValueChange = { style = it },
@@ -432,7 +495,7 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     TextButton(
-                        enabled = !isFixingScript && mixedText.isNotBlank(),
+                        enabled = !isGeminiBusy && mixedText.isNotBlank(),
                         onClick = {
                             viewModel.updateDialogueTranslationOnly(dlg, mixedText, emotion, style)
                             editingDialogue = null
@@ -442,7 +505,7 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                         Text("Save Text", color = StudioCyan)
                     }
                     TextButton(
-                        enabled = !isFixingScript && mixedText.isNotBlank(),
+                        enabled = !isGeminiBusy && mixedText.isNotBlank(),
                         onClick = {
                             viewModel.updateAndRegenerateSingleDialogue(dlg.id, mixedText, emotion)
                             editingDialogue = null
@@ -455,10 +518,54 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
             },
             dismissButton = {
                 TextButton(
-                    enabled = !isFixingScript,
+                    enabled = !isGeminiBusy,
                     onClick = { editingDialogue = null }
                 ) {
                     Text("Cancel", color = StudioTextSecondary)
+                }
+            }
+        )
+    }
+
+    if (showImportExportDictDialog) {
+        AlertDialog(
+            onDismissRequest = { showImportExportDictDialog = false },
+            containerColor = StudioSurfaceElevated,
+            title = { Text("Import / Export Dictionaries (JSON)", color = StudioTextPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Copy exported JSON below to back up your Project, Anime, and Global dictionaries, or paste valid JSON entries to import.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudioTextSecondary
+                    )
+                    OutlinedTextField(
+                        value = dictJsonText,
+                        onValueChange = { dictJsonText = it },
+                        label = { Text("Dictionary JSON") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 140.dp, max = 260.dp)
+                            .testTag("dict_json_io_input"),
+                        maxLines = 10
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = dictJsonText.isNotBlank(),
+                    onClick = {
+                        viewModel.importDictionariesFromJson(dictJsonText)
+                        showImportExportDictDialog = false
+                    },
+                    modifier = Modifier.testTag("dict_json_import_confirm_btn")
+                ) {
+                    Text("Import JSON", color = StudioViolet)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showImportExportDictDialog = false }) {
+                    Text("Close", color = StudioTextSecondary)
                 }
             }
         )
@@ -662,6 +769,14 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
         }
 
         if (subMode == "TRANSLATIONS") {
+            val filteredDialogues = dialogues.filter { dlg ->
+                val q = dialogueSearchQuery.trim()
+                q.isEmpty() ||
+                    dlg.dialogueId.contains(q, ignoreCase = true) ||
+                    dlg.japaneseText.contains(q, ignoreCase = true) ||
+                    dlg.romanHinglishText.contains(q, ignoreCase = true) ||
+                    dlg.emotion.contains(q, ignoreCase = true)
+            }
             item {
                 StudioCard(elevated = true) {
                     Row(
@@ -672,16 +787,33 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Mixed-Script Hindi-English (देवनागरी + English)", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                             Text(
-                                "Powered by ${config.geminiModelName} via Firebase AI Logic • Hindi in Devanagari, natural English preserved • 3-tier dictionary precedence.",
+                                "Direct Gemini API (${config.geminiModelName}) • Hindi in Devanagari, natural English preserved • 3-tier dictionary precedence.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = StudioTextSecondary
                             )
                         }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        StatusPill(
+                            text = if (geminiKeyState.isConfigured) "API READY" else "KEY NEEDED",
+                            color = if (geminiKeyState.isConfigured) StudioEmerald else StudioAmber
+                        )
                     }
-                    Spacer(modifier = Modifier.height(12.dp))
+                    if (!geminiKeyState.isConfigured) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { viewModel.openOverlay(StudioOverlay.SETTINGS) },
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("translation_configure_api_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Key, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Configure Direct Gemini API Key in Settings", color = StudioAmber)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
                     Button(
                         onClick = { viewModel.runPipelineStages(8, 8) },
-                        enabled = !banner.isRunning && dialogues.any { it.japaneseText.isNotBlank() },
+                        enabled = !banner.isRunning && geminiKeyState.isConfigured && dialogues.any { it.japaneseText.isNotBlank() },
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
@@ -694,22 +826,36 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                     ) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Translate All Japanese Lines with Gemini")
+                        Text("Translate All Japanese Lines with Direct Gemini")
+                    }
+                    if (dialogues.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = dialogueSearchQuery,
+                            onValueChange = { dialogueSearchQuery = it },
+                            label = { Text("Filter dialogues by ID, Japanese, Hindi-English, or emotion") },
+                            modifier = Modifier.fillMaxWidth().testTag("dialogue_search_input"),
+                            singleLine = true
+                        )
                     }
                 }
             }
 
-            if (dialogues.isEmpty()) {
+            if (filteredDialogues.isEmpty()) {
                 item {
                     StudioEmptyState(
                         icon = Icons.Default.Translate,
-                        title = "No Dialogues Ready for Translation",
-                        description = "Segment and transcribe dialogue lines in the Transcript tab first before translating into Mixed-Script Hindi-English.",
+                        title = if (dialogues.isEmpty()) "No Dialogues Ready for Translation" else "No Matching Dialogues",
+                        description = if (dialogues.isEmpty()) {
+                            "Segment and transcribe dialogue lines in the Transcript tab first before translating into Mixed-Script Hindi-English."
+                        } else {
+                            "Clear the search filter to view all episode dialogues."
+                        },
                         testTagPrefix = "translation_empty"
                     )
                 }
             } else {
-                items(dialogues, key = { it.id }) { dlg ->
+                items(filteredDialogues, key = { it.id }) { dlg ->
                     val accent = speakerAccentColor(dlg.speakerLabel)
                     val validation = remember(dlg.romanHinglishText) {
                         if (dlg.romanHinglishText.isBlank()) null
@@ -853,23 +999,37 @@ fun TranslationAndDictionaryView(viewModel: StudioViewModel) {
                     title = "Terminology Dictionaries",
                     subtitle = "Active Scope Precedence: Project > Anime > Global (isolated per project)",
                     trailing = {
-                        Button(
-                            onClick = {
-                                editingDictEntry = null
-                                showDictDialog = true
-                            },
-                            modifier = Modifier
-                                .heightIn(min = 48.dp)
-                                .testTag("dict_add_btn"),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = StudioViolet,
-                                contentColor = Color(0xFF0A0B0F)
-                            ),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Add Term")
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = {
+                                    dictJsonText = viewModel.exportDictionariesToJson()
+                                    showImportExportDictDialog = true
+                                },
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("dict_import_export_btn"),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.ImportExport, contentDescription = "Import or export JSON", tint = StudioCyan, modifier = Modifier.size(16.dp))
+                            }
+                            Button(
+                                onClick = {
+                                    editingDictEntry = null
+                                    showDictDialog = true
+                                },
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("dict_add_btn"),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = StudioViolet,
+                                    contentColor = Color(0xFF0A0B0F)
+                                ),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Add Term")
+                            }
                         }
                     }
                 )

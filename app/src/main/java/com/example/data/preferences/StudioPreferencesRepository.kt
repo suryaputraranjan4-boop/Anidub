@@ -8,28 +8,24 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.data.remote.DirectGeminiApiClient
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
 private val Context.studioDataStore by preferencesDataStore(name = "anime_dub_studio_prefs")
 
-data class WorkerAndStudioConfig(
+/**
+ * Android-only studio configuration (Direct Gemini API + On-Device Android processing).
+ * External Python/GPU worker settings have been removed completely.
+ */
+data class StudioConfig(
     val onboardingCompleted: Boolean = false,
     val activeProjectId: Long = 1L,
     val activeEpisodeId: Long = 1L,
-    val remoteWorkerEnabled: Boolean = false,
-    val remoteWorkerBaseUrl: String = "",
-    val remoteWorkerAuthToken: String = "",
-    val remoteWorkerHasAuthToken: Boolean = false,
-    val allowInsecureLocalHttp: Boolean = false,
-    val workerGpuAvailable: Boolean = false,
-    val maxProcessingConcurrency: Int = 2,
-    val requestTimeoutSeconds: Int = 120,
-    val maxUploadLimitMb: Int = 2048,
-    val geminiModelName: String = "gemini-3.8-flash",
-    val selectedAsrVariant: String = "Whisper Large V3 Turbo",
-    val selectedTtsEngine: String = "F5-Hindi-24KHz",
-    val selectedSeparationModel: String = "HTDemucs",
+    val geminiModelName: String = DirectGeminiApiClient.DEFAULT_MODEL_ID,
+    val selectedAsrVariant: String = "Silero VAD ONNX + Direct Gemini Audio",
+    val selectedTtsEngine: String = "Android-Speech-TTS",
+    val selectedSeparationModel: String = "On-Device Bandpass/Residual DSP",
     val defaultExportResolution: String = "1920x1080 (1080p Full HD)",
     val defaultVideoBitrateKbps: Int = 8500,
     val defaultAudioCodec: String = "AAC-LC / PCM 16-bit",
@@ -43,15 +39,6 @@ class StudioPreferencesRepository(private val context: Context) {
         val ONBOARDING_DONE = booleanPreferencesKey("onboarding_done")
         val ACTIVE_PROJECT_ID = longPreferencesKey("active_project_id")
         val ACTIVE_EPISODE_ID = longPreferencesKey("active_episode_id")
-        val WORKER_ENABLED = booleanPreferencesKey("worker_enabled")
-        val WORKER_URL = stringPreferencesKey("worker_url")
-        val WORKER_AUTH_TOKEN = stringPreferencesKey("worker_auth_token")
-        val WORKER_HAS_TOKEN = booleanPreferencesKey("worker_has_token")
-        val ALLOW_INSECURE_LOCAL_HTTP = booleanPreferencesKey("allow_insecure_local_http")
-        val WORKER_GPU = booleanPreferencesKey("worker_gpu")
-        val MAX_CONCURRENCY = intPreferencesKey("max_concurrency")
-        val TIMEOUT_SEC = intPreferencesKey("timeout_sec")
-        val UPLOAD_LIMIT_MB = intPreferencesKey("upload_limit_mb")
         val GEMINI_MODEL_NAME = stringPreferencesKey("gemini_model_name")
         val SELECTED_ASR = stringPreferencesKey("selected_asr")
         val SELECTED_TTS = stringPreferencesKey("selected_tts")
@@ -63,25 +50,35 @@ class StudioPreferencesRepository(private val context: Context) {
         val AUDIO_SR = intPreferencesKey("audio_sr")
     }
 
-    val configFlow: Flow<WorkerAndStudioConfig> = context.studioDataStore.data.map { prefs: Preferences ->
-        val token = prefs[Keys.WORKER_AUTH_TOKEN] ?: ""
-        WorkerAndStudioConfig(
+    val configFlow: Flow<StudioConfig> = context.studioDataStore.data.map { prefs: Preferences ->
+        val storedModel = DirectGeminiApiClient.normalizeModelName(prefs[Keys.GEMINI_MODEL_NAME])
+        val storedTts = prefs[Keys.SELECTED_TTS].orEmpty()
+        val effectiveTts = if (storedTts.isBlank() || storedTts == "F5-Hindi-24KHz" || storedTts == "Chatterbox-Multilingual-V3") {
+            "Android-Speech-TTS"
+        } else {
+            storedTts
+        }
+        val storedSep = prefs[Keys.SELECTED_SEP].orEmpty()
+        val effectiveSep = if (storedSep.isBlank() || storedSep == "HTDemucs") {
+            "On-Device Bandpass/Residual DSP"
+        } else {
+            storedSep
+        }
+        val storedAsr = prefs[Keys.SELECTED_ASR].orEmpty()
+        val effectiveAsr = if (storedAsr.isBlank() || storedAsr.contains("Whisper", ignoreCase = true)) {
+            "Silero VAD ONNX + Direct Gemini Audio"
+        } else {
+            storedAsr
+        }
+
+        StudioConfig(
             onboardingCompleted = prefs[Keys.ONBOARDING_DONE] ?: false,
             activeProjectId = prefs[Keys.ACTIVE_PROJECT_ID] ?: 1L,
             activeEpisodeId = prefs[Keys.ACTIVE_EPISODE_ID] ?: 1L,
-            remoteWorkerEnabled = prefs[Keys.WORKER_ENABLED] ?: false,
-            remoteWorkerBaseUrl = prefs[Keys.WORKER_URL] ?: "",
-            remoteWorkerAuthToken = token,
-            remoteWorkerHasAuthToken = token.isNotBlank() || (prefs[Keys.WORKER_HAS_TOKEN] ?: false),
-            allowInsecureLocalHttp = prefs[Keys.ALLOW_INSECURE_LOCAL_HTTP] ?: false,
-            workerGpuAvailable = prefs[Keys.WORKER_GPU] ?: false,
-            maxProcessingConcurrency = prefs[Keys.MAX_CONCURRENCY] ?: 2,
-            requestTimeoutSeconds = prefs[Keys.TIMEOUT_SEC] ?: 120,
-            maxUploadLimitMb = prefs[Keys.UPLOAD_LIMIT_MB] ?: 2048,
-            geminiModelName = prefs[Keys.GEMINI_MODEL_NAME]?.takeIf { it.isNotBlank() } ?: "gemini-3.8-flash",
-            selectedAsrVariant = prefs[Keys.SELECTED_ASR] ?: "Whisper Large V3 Turbo",
-            selectedTtsEngine = prefs[Keys.SELECTED_TTS] ?: "F5-Hindi-24KHz",
-            selectedSeparationModel = prefs[Keys.SELECTED_SEP] ?: "HTDemucs",
+            geminiModelName = storedModel,
+            selectedAsrVariant = effectiveAsr,
+            selectedTtsEngine = effectiveTts,
+            selectedSeparationModel = effectiveSep,
             defaultExportResolution = prefs[Keys.EXPORT_RES] ?: "1920x1080 (1080p Full HD)",
             defaultVideoBitrateKbps = prefs[Keys.VIDEO_BITRATE] ?: 8500,
             defaultAudioCodec = prefs[Keys.AUDIO_CODEC] ?: "AAC-LC / PCM 16-bit",
@@ -101,32 +98,8 @@ class StudioPreferencesRepository(private val context: Context) {
         }
     }
 
-    suspend fun updateWorkerSettings(
-        enabled: Boolean,
-        url: String,
-        authToken: String = "",
-        hasAuthToken: Boolean = authToken.isNotBlank(),
-        allowInsecureLocalHttp: Boolean = false,
-        gpuAvailable: Boolean = false,
-        maxConcurrency: Int = 2,
-        timeoutSeconds: Int = 120,
-        uploadLimitMb: Int = 2048
-    ) {
-        context.studioDataStore.edit {
-            it[Keys.WORKER_ENABLED] = enabled
-            it[Keys.WORKER_URL] = url.trim()
-            it[Keys.WORKER_AUTH_TOKEN] = authToken.trim()
-            it[Keys.WORKER_HAS_TOKEN] = authToken.isNotBlank() || hasAuthToken
-            it[Keys.ALLOW_INSECURE_LOCAL_HTTP] = allowInsecureLocalHttp
-            it[Keys.WORKER_GPU] = gpuAvailable
-            it[Keys.MAX_CONCURRENCY] = maxConcurrency.coerceIn(1, 16)
-            it[Keys.TIMEOUT_SEC] = timeoutSeconds.coerceIn(15, 600)
-            it[Keys.UPLOAD_LIMIT_MB] = uploadLimitMb.coerceIn(100, 10240)
-        }
-    }
-
     suspend fun updateGeminiModelName(modelName: String) {
-        val clean = modelName.trim().ifBlank { "gemini-3.8-flash" }
+        val clean = DirectGeminiApiClient.normalizeModelName(modelName)
         context.studioDataStore.edit {
             it[Keys.GEMINI_MODEL_NAME] = clean
         }

@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
@@ -25,14 +26,18 @@ import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FactCheck
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Outbox
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -41,7 +46,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -61,6 +65,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.local.ModelManifestEntity
+import com.example.data.preferences.GeminiKeySource
+import com.example.data.remote.DirectGeminiApiClient
 import com.example.engine.HinglishTtsNormalizer
 import com.example.engine.ModelDownloadManager
 import com.example.engine.VerifiedModelCatalog
@@ -87,6 +93,7 @@ import com.example.ui.theme.StudioTextMuted
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioViolet
+import com.example.viewmodel.StudioOverlay
 import com.example.viewmodel.StudioViewModel
 import kotlinx.coroutines.launch
 
@@ -388,25 +395,27 @@ fun QcAndExportView(viewModel: StudioViewModel) {
 
 /**
  * MODEL LIBRARY SCREEN (PRIMARY TAB 5)
- * Shows verified downloadable AI models (with exact Hugging Face combined sizes, companion counts,
- * formats, languages, and honest runtime compatibility) separated from built-in Android & Firebase API runtimes.
+ * Android-only runtime audit: separates genuinely supported on-device Android/ONNX models,
+ * the Direct Gemini REST API service, and desktop PyTorch models honestly marked UNSUPPORTED_ON_ANDROID.
  */
 @Composable
 fun ModelLibraryScreen(viewModel: StudioViewModel) {
     val models by viewModel.models.collectAsState()
-    val downloadableModels = remember(models) {
-        models.filter { VerifiedModelCatalog.isDownloadablePackage(it) }
+    val geminiKeyState by viewModel.geminiKeyState.collectAsState()
+
+    val onDeviceLocalModels = remember(models) {
+        models.filter { ModelDownloadManager.isLocalRuntime(it.runtimeCompatibility) }
     }
-    val builtInAndCloudModels = remember(models) {
-        models.filterNot { VerifiedModelCatalog.isDownloadablePackage(it) }
+    val directGeminiModels = remember(models) {
+        models.filter { it.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_DIRECT_GEMINI_API }
+    }
+    val unsupportedDesktopModels = remember(models) {
+        models.filter { it.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID }
     }
     val usedBytes = remember(models) { viewModel.modelDownloadManager.getModelsStorageUsedBytes() }
     val freeBytes = remember(models) { viewModel.modelDownloadManager.getAvailableStorageBytes() }
-    val totalKnownPackageBytes = remember(downloadableModels) {
-        downloadableModels.filter { it.isSizeKnown }.sumOf { it.expectedSizeBytes }
-    }
-    val installedCount = remember(downloadableModels) {
-        downloadableModels.count { it.downloadState == "INSTALLED" }
+    val readyLocalCount = remember(onDeviceLocalModels) {
+        onDeviceLocalModels.count { it.downloadState in setOf("READY", "BUILT_IN", "INSTALLED") }
     }
 
     LazyColumn(
@@ -418,65 +427,104 @@ fun ModelLibraryScreen(viewModel: StudioViewModel) {
     ) {
         item {
             StudioSectionHeader(
-                title = "Model Assets & Downloads",
-                subtitle = "Verified official Hugging Face weights, companion manifests, and honest runtime compatibility"
+                title = "Model Assets & Android Runtime",
+                subtitle = "Android-only local inference + Direct Gemini API • Zero fake downloads or external workers"
             )
             Spacer(modifier = Modifier.height(6.dp))
             MetadataChipRow(
                 items = listOf(
-                    "Verified Packs" to "$installedCount / ${downloadableModels.size}",
-                    "Catalog Total" to "${formatBytes(totalKnownPackageBytes)}+",
+                    "Local Ready" to "$readyLocalCount / ${onDeviceLocalModels.size}",
+                    "Gemini API" to if (geminiKeyState.isConfigured) "Key Set" else "Key Missing",
                     "Disk Free" to formatBytes(freeBytes)
                 )
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "On-device model storage used: ${formatBytes(usedBytes)} • Ungated catalog requires ${formatBytes(totalKnownPackageBytes)} (+ gated pyannote after HF auth)",
+                text = "Verified local model storage used: ${formatBytes(usedBytes)} • Desktop PyTorch models are audited honestly below and blocked from fake downloads.",
                 style = MaterialTheme.typography.labelSmall,
                 color = StudioTextMuted
             )
         }
 
-        // Section 1: Verified Downloadable AI Model Packages
+        // Section 1: On-Device Android & ONNX Runtime Models
         item {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.padding(top = 6.dp)
             ) {
-                Icon(Icons.Default.Download, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(18.dp))
-                Text("Downloadable AI Models (Verified Sources)", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+                Icon(Icons.Default.PhoneAndroid, contentDescription = null, tint = StudioEmerald, modifier = Modifier.size(18.dp))
+                Text("On-Device Android & ONNX Runtime (${onDeviceLocalModels.size})", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
             }
         }
-        items(downloadableModels, key = { it.modelId }) { model ->
+        items(onDeviceLocalModels, key = { it.modelId }) { model ->
             ModelLibraryCard(
                 model = model,
                 onOpenDetail = { viewModel.openModelDetail(model.modelId) },
                 onDownload = { viewModel.downloadModel(model.modelId) },
                 onCancel = { viewModel.cancelModelDownload(model.modelId) },
-                onDelete = { viewModel.deleteModel(model.modelId) }
+                onDelete = { viewModel.deleteModel(model.modelId) },
+                onOpenSettings = { viewModel.openOverlay(StudioOverlay.SETTINGS) }
             )
         }
 
-        // Section 2: Built-In Android & Firebase Cloud Services (0 B Download)
-        item {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.padding(top = 8.dp)
-            ) {
-                Icon(Icons.Default.PhoneAndroid, contentDescription = null, tint = StudioEmerald, modifier = Modifier.size(18.dp))
-                Text("Built-In Android & Cloud Services (0 B)", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+        // Section 2: Direct Gemini API (Only Online AI Service)
+        if (directGeminiModels.isNotEmpty()) {
+            item {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(top = 8.dp)
+                ) {
+                    Icon(Icons.Default.Cloud, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(18.dp))
+                    Text("Direct Gemini API (Online Service)", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
+                }
+            }
+            items(directGeminiModels, key = { it.modelId }) { model ->
+                ModelLibraryCard(
+                    model = model,
+                    onOpenDetail = { viewModel.openModelDetail(model.modelId) },
+                    onDownload = {},
+                    onCancel = {},
+                    onDelete = {},
+                    onOpenSettings = { viewModel.openOverlay(StudioOverlay.SETTINGS) }
+                )
             }
         }
-        items(builtInAndCloudModels, key = { it.modelId }) { model ->
-            ModelLibraryCard(
-                model = model,
-                onOpenDetail = { viewModel.openModelDetail(model.modelId) },
-                onDownload = {},
-                onCancel = {},
-                onDelete = {}
-            )
+
+        // Section 3: Desktop PyTorch Models — Unsupported on Android
+        if (unsupportedDesktopModels.isNotEmpty()) {
+            item {
+                Column(modifier = Modifier.padding(top = 8.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(Icons.Default.Block, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(18.dp))
+                        Text(
+                            "Desktop PyTorch Models — Unsupported on Android (${unsupportedDesktopModels.size})",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = StudioTextPrimary
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Listed transparently so you know exact upstream weights and why they cannot execute locally on Android. Downloads are disabled to prevent wasting GBs of unusable storage.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StudioTextMuted
+                    )
+                }
+            }
+            items(unsupportedDesktopModels, key = { it.modelId }) { model ->
+                ModelLibraryCard(
+                    model = model,
+                    onOpenDetail = { viewModel.openModelDetail(model.modelId) },
+                    onDownload = {},
+                    onCancel = {},
+                    onDelete = {},
+                    onOpenSettings = { viewModel.openOverlay(StudioOverlay.SETTINGS) }
+                )
+            }
         }
     }
 }
@@ -487,14 +535,18 @@ private fun ModelLibraryCard(
     onOpenDetail: () -> Unit,
     onDownload: () -> Unit,
     onCancel: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onOpenSettings: () -> Unit
 ) {
     val provider = remember(model.modelId) { VerifiedModelCatalog.providerForModel(model.modelId) }
     val runtimeBadge = remember(model.runtimeCompatibility) {
         VerifiedModelCatalog.runtimeBadgeLabel(model.runtimeCompatibility)
     }
     val isDownloadable = remember(model) { VerifiedModelCatalog.isDownloadablePackage(model) }
-    val isDownloading = model.downloadState == "DOWNLOADING" || model.downloadState == "VERIFYING"
+    val isDirectGemini = model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_DIRECT_GEMINI_API
+    val isUnsupported = model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID
+    val isBusy = model.downloadState in setOf("DOWNLOADING", "DOWNLOADED", "VERIFYING", "LOADING", "PROCESSING")
+    val isReady = model.downloadState in setOf("READY", "INSTALLED", "BUILT_IN")
     val stateColor = statusColorFor(model.downloadState)
     val remainingBytes = if (model.isSizeKnown && model.expectedSizeBytes > 0L) {
         (model.expectedSizeBytes - model.downloadedBytes).coerceAtLeast(0L)
@@ -520,15 +572,17 @@ private fun ModelLibraryCard(
             }
             Spacer(modifier = Modifier.width(8.dp))
             val pillText = when {
-                model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_EXTERNAL_API -> "FIREBASE AI"
+                isUnsupported -> "UNSUPPORTED"
+                isDirectGemini && isReady -> "API READY"
+                isDirectGemini -> "KEY REQUIRED"
                 model.downloadState == "BUILT_IN" -> "BUILT-IN"
-                model.downloadState == "INSTALLED" && model.verificationLevel == "VERIFIED_SHA256" -> "SHA-256 VERIFIED"
-                model.downloadState == "INSTALLED" && model.verificationLevel == "VERIFIED_SIZE_ONLY" -> "SIZE VERIFIED"
-                model.downloadState == "INSTALLED" -> "INSTALLED"
+                isReady && model.verificationLevel == "VERIFIED_SHA256" -> "READY (ONNX)"
+                isReady -> "READY"
                 else -> model.downloadState.replace('_', ' ')
             }
             val pillColor = when {
-                model.downloadState == "INSTALLED" && model.verificationLevel == "VERIFIED_SIZE_ONLY" -> StudioCyan
+                isUnsupported -> StudioAmber
+                isDirectGemini && !isReady -> StudioAmber
                 else -> stateColor
             }
             StatusPill(
@@ -541,7 +595,6 @@ private fun ModelLibraryCard(
         Text(model.purpose, style = MaterialTheme.typography.bodySmall, color = StudioTextSecondary)
 
         Spacer(modifier = Modifier.height(8.dp))
-        // Format & Languages metadata strip
         Text(
             text = "Format: ${model.fileFormat} • Languages: ${model.supportedLanguages}",
             style = MaterialTheme.typography.labelSmall,
@@ -552,18 +605,13 @@ private fun ModelLibraryCard(
 
         if (isDownloadable) {
             Spacer(modifier = Modifier.height(8.dp))
-            val expectedLabel = when {
-                !model.isSizeKnown && model.isGatedHuggingFace -> "Gated (HF token required)"
-                model.expectedSizeBytes > 0L -> formatBytes(model.expectedSizeBytes)
-                else -> "Unknown"
-            }
+            val expectedLabel = if (model.expectedSizeBytes > 0L) formatBytes(model.expectedSizeBytes) else "Unknown"
             val downloadedLabel = formatBytes(model.downloadedBytes)
             val remainingLabel = when {
                 !model.isSizeKnown -> "—"
-                model.downloadState == "INSTALLED" -> "0 B"
+                isReady -> "0 B"
                 else -> formatBytes(remainingBytes)
             }
-
             MetadataChipRow(
                 items = listOf(
                     "Expected" to expectedLabel,
@@ -572,10 +620,18 @@ private fun ModelLibraryCard(
                     "Files" to "${model.verifiedFilesCount}/${model.totalFilesCount}"
                 )
             )
+        } else if (isUnsupported && model.isSizeKnown && model.expectedSizeBytes > 0L) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Upstream Desktop Size: ${formatBytes(model.expectedSizeBytes)} • ${model.statusNote}",
+                style = MaterialTheme.typography.labelSmall,
+                color = StudioAmber,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis
+            )
         }
 
-        // Progress bar during active download/verification or partial resume state
-        if (isDownloading || (isDownloadable && model.downloadedBytes > 0L && model.downloadState != "INSTALLED" && model.isSizeKnown)) {
+        if (isBusy || (isDownloadable && model.downloadedBytes > 0L && !isReady && model.isSizeKnown)) {
             Spacer(modifier = Modifier.height(10.dp))
             LinearProgressIndicator(
                 progress = { (model.downloadProgressPercent / 100f).coerceIn(0f, 1f) },
@@ -583,14 +639,14 @@ private fun ModelLibraryCard(
                     .fillMaxWidth()
                     .height(6.dp)
                     .clip(RoundedCornerShape(3.dp)),
-                color = if (isDownloading) StudioCyan else StudioAmber,
+                color = if (isBusy) StudioCyan else StudioAmber,
                 trackColor = StudioBorder
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = model.statusNote,
                 style = MaterialTheme.typography.labelSmall,
-                color = if (isDownloading) StudioCyan else StudioTextSecondary
+                color = if (isBusy) StudioCyan else StudioTextSecondary
             )
         } else if (model.downloadState == "FAILED" || model.downloadState == "CORRUPTED") {
             Spacer(modifier = Modifier.height(8.dp))
@@ -611,49 +667,58 @@ private fun ModelLibraryCard(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
-            if (isDownloadable) {
-                when {
-                    isDownloading -> {
-                        TextButton(
-                            onClick = onCancel,
-                            modifier = Modifier.testTag("model_cancel_${model.modelId}")
-                        ) {
-                            Icon(Icons.Default.Cancel, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Pause / Cancel", color = StudioAmber)
+            when {
+                isDirectGemini -> {
+                    TextButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.testTag("model_configure_gemini_btn")
+                    ) {
+                        Icon(Icons.Default.Settings, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(if (isReady) "API Settings" else "Configure Key", color = StudioViolet)
+                    }
+                }
+                isDownloadable -> {
+                    when {
+                        isBusy -> {
+                            TextButton(
+                                onClick = onCancel,
+                                modifier = Modifier.testTag("model_cancel_${model.modelId}")
+                            ) {
+                                Icon(Icons.Default.Cancel, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Pause / Cancel", color = StudioAmber)
+                            }
+                        }
+                        isReady -> {
+                            IconButton(
+                                onClick = onDelete,
+                                modifier = Modifier.size(48.dp).testTag("model_delete_${model.modelId}")
+                            ) {
+                                Icon(Icons.Default.DeleteOutline, contentDescription = "Delete model files", tint = StudioCrimson)
+                            }
+                        }
+                        else -> {
+                            TextButton(
+                                onClick = onDownload,
+                                modifier = Modifier.testTag("model_download_${model.modelId}")
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (model.downloadedBytes > 0L) "Resume" else "Download",
+                                    color = StudioViolet
+                                )
+                            }
                         }
                     }
-                    model.downloadState == "INSTALLED" -> {
-                        IconButton(
-                            onClick = onDelete,
-                            modifier = Modifier.size(48.dp).testTag("model_delete_${model.modelId}")
-                        ) {
-                            Icon(Icons.Default.DeleteOutline, contentDescription = "Delete model files", tint = StudioCrimson)
-                        }
-                    }
-                    model.isGatedHuggingFace -> {
-                        TextButton(
-                            onClick = onOpenDetail,
-                            modifier = Modifier.testTag("model_gated_${model.modelId}")
-                        ) {
-                            Icon(Icons.Default.Lock, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("HF Token Required", color = StudioAmber)
-                        }
-                    }
-                    else -> {
-                        TextButton(
-                            onClick = onDownload,
-                            modifier = Modifier.testTag("model_download_${model.modelId}")
-                        ) {
-                            Icon(Icons.Default.Download, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = if (model.downloadedBytes > 0L) "Resume" else "Download",
-                                color = StudioViolet
-                            )
-                        }
-                    }
+                }
+                else -> {
+                    Text(
+                        text = if (isUnsupported) "Tap to inspect why" else "Built-in",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StudioTextMuted
+                    )
                 }
             }
         }
@@ -661,16 +726,15 @@ private fun ModelLibraryCard(
 }
 
 /**
- * MODEL ASSET & COMPANION FILES DETAIL OVERLAY
- * Displays full official source URL, expected/downloaded/remaining bytes, compatibility summary,
- * per-file companion manifest breakdown with individual sizes & SHA-256 verification, and controls.
+ * MODEL ASSET & RUNTIME INSPECTOR OVERLAY
+ * Displays official source URL, expected/downloaded/remaining bytes, honest Android compatibility,
+ * per-file companion manifest breakdown with SHA-256 + ONNX load verification, and controls.
  */
 @Composable
 fun ModelDetailScreen(viewModel: StudioViewModel) {
     val models by viewModel.models.collectAsState()
     val selectedId by viewModel.selectedModelId.collectAsState()
     val model = models.find { it.modelId == selectedId }
-    var hfToken by remember(selectedId) { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -698,7 +762,10 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
         }
 
         val isDownloadable = remember(model) { VerifiedModelCatalog.isDownloadablePackage(model) }
-        val isDownloading = model.downloadState == "DOWNLOADING" || model.downloadState == "VERIFYING"
+        val isDirectGemini = model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_DIRECT_GEMINI_API
+        val isUnsupported = model.runtimeCompatibility == VerifiedModelCatalog.RUNTIME_UNSUPPORTED_ON_ANDROID
+        val isBusy = model.downloadState in setOf("DOWNLOADING", "DOWNLOADED", "VERIFYING", "LOADING", "PROCESSING")
+        val isReady = model.downloadState in setOf("READY", "INSTALLED")
         val diskStatuses = remember(model.modelId, model.filesManifestJson, model.downloadedBytes, model.downloadState) {
             viewModel.modelDownloadManager.inspectLocalFiles(model)
         }
@@ -711,13 +778,12 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(vertical = 10.dp)
         ) {
-            // Core Metadata Card
             item {
                 StudioCard(elevated = true) {
                     Text(model.modelName, style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StatusPill(text = VerifiedModelCatalog.runtimeBadgeLabel(model.runtimeCompatibility), color = StudioCyan)
+                        StatusPill(text = VerifiedModelCatalog.runtimeBadgeLabel(model.runtimeCompatibility), color = if (isUnsupported) StudioAmber else StudioCyan)
                         StatusPill(text = model.downloadState.replace('_', ' '), color = statusColorFor(model.downloadState))
                     }
                     Spacer(modifier = Modifier.height(10.dp))
@@ -727,7 +793,7 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                         Spacer(modifier = Modifier.height(12.dp))
                         MetadataChipRow(
                             items = listOf(
-                                "Expected Total" to if (model.isSizeKnown) formatBytes(model.expectedSizeBytes) else "Token required",
+                                "Expected Total" to if (model.isSizeKnown) formatBytes(model.expectedSizeBytes) else "Unknown",
                                 "Downloaded" to formatBytes(model.downloadedBytes),
                                 "Remaining" to if (model.isSizeKnown) formatBytes(remainingBytes) else "—",
                                 "Verified Files" to "${model.verifiedFilesCount}/${model.totalFilesCount}"
@@ -735,7 +801,7 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                         )
                     }
 
-                    if (isDownloading) {
+                    if (isBusy) {
                         Spacer(modifier = Modifier.height(10.dp))
                         LinearProgressIndicator(
                             progress = { (model.downloadProgressPercent / 100f).coerceIn(0f, 1f) },
@@ -755,17 +821,20 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                     DetailRow("License", "${model.licenseName} — ${model.licenseNotes}")
                     DetailRow("Runtime Compatibility", model.compatibilitySummary.ifBlank { model.runtimeCompatibility })
                     DetailRow("Required Dependencies", model.requiredDependencies)
+                    if (isUnsupported && model.isSizeKnown && model.expectedSizeBytes > 0L) {
+                        DetailRow("Upstream Desktop Package Size", "${formatBytes(model.expectedSizeBytes)} (${model.expectedSizeBytes} bytes)", mono = true)
+                    }
                     if (model.localFilePath.isNotBlank()) {
                         DetailRow("Device Storage Directory", model.localFilePath, mono = true)
                     }
                     if (isDownloadable) {
                         val verLabel = when (model.verificationLevel) {
-                            "VERIFIED_SHA256" -> "SHA-256 cryptographic digest verified"
-                            "VERIFIED_SIZE_ONLY" -> "Exact byte size verified (no official upstream SHA-256 published)"
-                            else -> "Unverified / Not installed"
+                            "VERIFIED_SHA256" -> "SHA-256 cryptographic digest + ONNX Runtime OrtSession load verified"
+                            "VERIFIED_SIZE_ONLY" -> "Exact byte size verified"
+                            else -> "Unverified / Not downloaded"
                         }
                         DetailRow(
-                            "Integrity Verification",
+                            "Integrity & Runtime Verification",
                             verLabel,
                             valueColor = when (model.verificationLevel) {
                                 "VERIFIED_SHA256" -> StudioEmerald
@@ -787,7 +856,6 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                 }
             }
 
-            // Required Companion Files Breakdown Card
             if (diskStatuses.isNotEmpty()) {
                 item {
                     StudioCard {
@@ -812,12 +880,9 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                                         style = MaterialTheme.typography.labelLarge.copy(fontFamily = JetBrainsMonoFamily),
                                         color = StudioTextPrimary
                                     )
-                                    val sizeDesc = when {
-                                        status.artifact.expectedBytes > 0L ->
-                                            "${formatBytes(status.artifact.expectedBytes)} (${status.artifact.expectedBytes} B)"
-                                        status.artifact.isGatedFile -> "Gated — query with HF token"
-                                        else -> "Unknown"
-                                    }
+                                    val sizeDesc = if (status.artifact.expectedBytes > 0L) {
+                                        "${formatBytes(status.artifact.expectedBytes)} (${status.artifact.expectedBytes} B)"
+                                    } else "Unknown"
                                     Text(
                                         text = "${status.artifact.role} • Expected: $sizeDesc",
                                         style = MaterialTheme.typography.labelSmall,
@@ -853,13 +918,6 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                                         tint = StudioEmerald,
                                         modifier = Modifier.size(20.dp)
                                     )
-                                } else if (status.artifact.isGatedFile && status.artifact.expectedBytes <= 0L) {
-                                    Icon(
-                                        Icons.Default.Lock,
-                                        contentDescription = "Gated file",
-                                        tint = StudioAmber,
-                                        modifier = Modifier.size(18.dp)
-                                    )
                                 } else {
                                     StatusPill(
                                         text = if (status.partialBytesOnDisk > 0L) "PARTIAL" else "PENDING",
@@ -872,43 +930,23 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                 }
             }
 
-            // Gated Hugging Face Token Panel
-            if (model.isGatedHuggingFace) {
+            if (isDirectGemini) {
                 item {
-                    StudioCard {
-                        Text("Gated Hugging Face Authorization", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Accept license terms on pyannote/speaker-diarization-3.1 AND pyannote/segmentation-3.0, then enter a read-only HF token to inspect real server sizes or download.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = StudioTextSecondary
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = hfToken,
-                            onValueChange = { hfToken = it },
-                            label = { Text("Read-Only HF Token (hf_...)") },
-                            modifier = Modifier.fillMaxWidth().testTag("hf_token_input"),
-                            singleLine = true
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedButton(
-                            onClick = { viewModel.probeGatedModelSizes(model.modelId, hfToken) },
-                            enabled = hfToken.isNotBlank() && !isDownloading,
-                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("probe_gated_size_btn"),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Text("Query Exact Server File Sizes (HEAD)", color = StudioCyan)
-                        }
+                    Button(
+                        onClick = { viewModel.openOverlay(StudioOverlay.SETTINGS) },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("detail_open_gemini_settings_btn"),
+                        colors = ButtonDefaults.buttonColors(containerColor = StudioViolet, contentColor = Color(0xFF0A0B0F)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Configure Direct Gemini API Key & Model")
                     }
                 }
-            }
-
-            // Download / Cancel / Verify / Delete Controls
-            if (isDownloadable) {
+            } else if (isDownloadable) {
                 item {
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                        if (isDownloading) {
+                        if (isBusy) {
                             OutlinedButton(
                                 onClick = { viewModel.cancelModelDownload(model.modelId) },
                                 modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("detail_cancel_download_btn"),
@@ -919,10 +957,10 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                         } else {
                             Button(
                                 onClick = {
-                                    if (model.downloadState == "INSTALLED") {
+                                    if (isReady) {
                                         viewModel.verifyModelIntegrity(model.modelId)
                                     } else {
-                                        viewModel.downloadModel(model.modelId, hfToken.takeIf { it.isNotBlank() })
+                                        viewModel.downloadModel(model.modelId)
                                     }
                                 },
                                 modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("detail_download_btn"),
@@ -930,23 +968,22 @@ fun ModelDetailScreen(viewModel: StudioViewModel) {
                                 shape = RoundedCornerShape(10.dp)
                             ) {
                                 Icon(
-                                    imageVector = if (model.downloadState == "INSTALLED") Icons.Default.VerifiedUser else Icons.Default.Download,
+                                    imageVector = if (isReady) Icons.Default.VerifiedUser else Icons.Default.Download,
                                     contentDescription = null,
                                     modifier = Modifier.size(18.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     when {
-                                        model.downloadState == "INSTALLED" && model.sha256Checksum.isNotBlank() -> "Re-Verify SHA-256"
-                                        model.downloadState == "INSTALLED" -> "Re-Verify Files"
+                                        isReady -> "Re-Verify SHA-256 & ONNX Load"
                                         model.downloadedBytes > 0L -> "Resume Download"
-                                        else -> "Download All Files"
+                                        else -> "Download & Verify ONNX Model"
                                     }
                                 )
                             }
                         }
 
-                        if (model.downloadState == "INSTALLED" || model.downloadedBytes > 0L) {
+                        if (isReady || model.downloadedBytes > 0L) {
                             OutlinedButton(
                                 onClick = { viewModel.deleteModel(model.modelId) },
                                 modifier = Modifier.heightIn(min = 48.dp).testTag("detail_delete_btn"),
@@ -1048,191 +1085,206 @@ fun ProcessingHistoryScreen(viewModel: StudioViewModel) {
 }
 
 /**
- * STUDIO & REMOTE WORKER SETTINGS OVERLAY
+ * DIRECT GEMINI API & ANDROID STUDIO SETTINGS OVERLAY
+ * Manages encrypted Direct Gemini API key storage, model selection, live connection testing,
+ * audio sample rate, and transparent Android-only local runtime diagnostics.
  */
 @Composable
 fun SettingsScreen(viewModel: StudioViewModel) {
     val config by viewModel.studioConfig.collectAsState()
-    val workerHealth by viewModel.workerHealth.collectAsState()
+    val geminiKeyState by viewModel.geminiKeyState.collectAsState()
+    val geminiConnection by viewModel.geminiConnectionStatus.collectAsState()
+    val isTestingGemini by viewModel.isTestingGeminiConnection.collectAsState()
     val scope = rememberCoroutineScope()
 
-    var workerUrl by remember(config.remoteWorkerBaseUrl) { mutableStateOf(config.remoteWorkerBaseUrl) }
-    var workerToken by remember(config.remoteWorkerAuthToken) { mutableStateOf(config.remoteWorkerAuthToken) }
-    var allowLocalHttp by remember(config.allowInsecureLocalHttp) { mutableStateOf(config.allowInsecureLocalHttp) }
+    var apiKeyInput by remember { mutableStateOf("") }
     val freeBytes = remember { viewModel.modelDownloadManager.getAvailableStorageBytes() }
     val modelBytes = remember { viewModel.modelDownloadManager.getModelsStorageUsedBytes() }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { viewModel.closeOverlay() }, modifier = Modifier.size(48.dp)) {
+            IconButton(
+                onClick = { viewModel.closeOverlay() },
+                modifier = Modifier.size(48.dp).testTag("settings_back_btn")
+            ) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = StudioTextPrimary)
             }
-            Text("Studio Settings", style = MaterialTheme.typography.titleLarge, color = StudioTextPrimary)
+            Text("Studio & Gemini API Settings", style = MaterialTheme.typography.titleLarge, color = StudioTextPrimary)
         }
 
         Spacer(modifier = Modifier.height(12.dp))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            // Direct Gemini API Key & Connection Test Card
             item {
-                StudioCard {
-                    Text("Self-Hosted GPU Inference Worker", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        "Optional endpoint for Python/PyTorch Safetensors models (Whisper Large V3 Turbo, HTDemucs, pyannote 3.1, F5-Hindi-24KHz). Uses HTTPS by default.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextSecondary
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    OutlinedTextField(
-                        value = workerUrl,
-                        onValueChange = { workerUrl = it },
-                        label = { Text("Worker Base URL") },
-                        placeholder = { Text("https://worker.yourdomain.com or http://192.168.1.100:8080") },
-                        modifier = Modifier.fillMaxWidth().testTag("settings_worker_url_input"),
-                        singleLine = true
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = workerToken,
-                        onValueChange = { workerToken = it },
-                        label = { Text("Bearer Auth Token (Optional)") },
-                        placeholder = { Text("Sent as Authorization: Bearer ...") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth().testTag("settings_worker_token_input"),
-                        singleLine = true
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
+                StudioCard(elevated = true) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                "Allow HTTP on Private LAN",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = StudioTextPrimary
-                            )
-                            Text(
-                                "Permits cleartext HTTP only for localhost/10.x/172.16-31.x/192.168.x hosts.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = StudioTextMuted
-                            )
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.Default.Key, contentDescription = null, tint = StudioViolet, modifier = Modifier.size(20.dp))
+                            Text("Direct Gemini API", style = MaterialTheme.typography.titleMedium, color = StudioTextPrimary)
                         }
-                        Switch(
-                            checked = allowLocalHttp,
-                            onCheckedChange = { allowLocalHttp = it },
-                            modifier = Modifier.testTag("settings_allow_lan_http_switch")
+                        StatusPill(
+                            text = when {
+                                geminiConnection?.isConnected == true -> "CONNECTED"
+                                geminiKeyState.isConfigured -> "KEY SAVED"
+                                else -> "NOT CONFIGURED"
+                            },
+                            color = when {
+                                geminiConnection?.isConnected == true -> StudioEmerald
+                                geminiKeyState.isConfigured -> StudioCyan
+                                else -> StudioAmber
+                            }
                         )
                     }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "The ONLY online AI service used by AnimeDub Studio. Connects directly to Google's official Gemini REST API (generativelanguage.googleapis.com) with no Firebase or external worker proxy.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudioTextSecondary
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    val keySourceLabel = when (geminiKeyState.source) {
+                        GeminiKeySource.USER_ENCRYPTED_KEYSTORE ->
+                            "Active Key: ${geminiKeyState.maskedKey} (Android Keystore AES-256-GCM)"
+                        GeminiKeySource.BUILD_CONFIG_SECRET ->
+                            "Active Key: ${geminiKeyState.maskedKey} (AI Studio BuildConfig Secret)"
+                        GeminiKeySource.NOT_CONFIGURED ->
+                            "No Gemini API key configured. Enter your key below to enable translation, transcription, script repair, and quality review."
+                    }
+                    Text(
+                        text = keySourceLabel,
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                        color = if (geminiKeyState.isConfigured) StudioEmerald else StudioAmber
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = apiKeyInput,
+                        onValueChange = { apiKeyInput = it },
+                        label = { Text(if (geminiKeyState.hasUserStoredKey) "Update Gemini API Key" else "Enter Gemini API Key") },
+                        placeholder = { Text("AIza...") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth().testTag("settings_gemini_api_key_input"),
+                        singleLine = true
+                    )
+
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
                             onClick = {
-                                val cleanUrl = workerUrl.trim()
-                                val cleanToken = workerToken.trim()
-                                scope.launch {
-                                    viewModel.prefsRepo.updateWorkerSettings(
-                                        enabled = cleanUrl.isNotBlank(),
-                                        url = cleanUrl,
-                                        authToken = cleanToken,
-                                        hasAuthToken = cleanToken.isNotBlank(),
-                                        allowInsecureLocalHttp = allowLocalHttp,
-                                        gpuAvailable = config.workerGpuAvailable,
-                                        maxConcurrency = config.maxProcessingConcurrency,
-                                        timeoutSeconds = config.requestTimeoutSeconds,
-                                        uploadLimitMb = config.maxUploadLimitMb
-                                    )
+                                val trimmed = apiKeyInput.trim()
+                                if (trimmed.isNotBlank()) {
+                                    viewModel.saveGeminiApiKey(trimmed)
+                                    apiKeyInput = ""
                                 }
-                                viewModel.verifyRemoteWorkerHealth(cleanUrl, cleanToken, allowLocalHttp)
                             },
-                            modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("settings_save_test_worker_btn"),
+                            enabled = apiKeyInput.trim().isNotBlank(),
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("settings_save_gemini_key_btn"),
                             colors = ButtonDefaults.buttonColors(containerColor = StudioViolet, contentColor = Color(0xFF0A0B0F)),
                             shape = RoundedCornerShape(10.dp)
                         ) {
-                            Text("Save & Test Connection")
+                            Text("Save Key")
+                        }
+                        if (geminiKeyState.hasUserStoredKey) {
+                            OutlinedButton(
+                                onClick = {
+                                    apiKeyInput = ""
+                                    viewModel.removeGeminiApiKey()
+                                },
+                                modifier = Modifier.heightIn(min = 48.dp).testTag("settings_remove_gemini_key_btn"),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("Remove", color = StudioCrimson)
+                            }
                         }
                     }
-                    if (workerHealth != null) {
-                        val health = workerHealth!!
-                        Spacer(modifier = Modifier.height(8.dp))
-                        WarningBanner(
-                            message = if (health.reachable) {
-                                "Worker reachable (${health.deviceType}, CUDA=${if (health.cudaAvailable) "Yes" else "No"}, API=${if (health.apiAvailable) "OK" else "Unavailable"}) — ${health.statusMessage}"
-                            } else {
-                                "Worker unreachable: ${health.statusMessage}"
-                            },
-                            isError = !health.reachable || !health.apiAvailable
-                        )
-                        if (health.reachable && health.modelReadiness.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                "Per-Model Worker Readiness",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = StudioTextPrimary
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            health.modelReadiness.values.forEach { m ->
-                                val readinessLabel = when {
-                                    m.readyForInference -> "Inference Ready"
-                                    m.loaded -> "Loaded (Not Ready)"
-                                    m.downloaded -> "Downloaded Only"
-                                    else -> "Not Downloaded"
-                                }
-                                val readinessColor = when {
-                                    m.readyForInference -> StudioEmerald
-                                    m.downloaded || m.loaded -> StudioAmber
-                                    else -> StudioCrimson
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(m.displayName, style = MaterialTheme.typography.bodySmall, color = StudioTextPrimary)
-                                        Text(
-                                            text = "Downloaded: ${if (m.downloaded) "Yes" else "No"} • Loaded: ${if (m.loaded) "Yes" else "No"}${if (m.detailMessage.isNotBlank()) " • ${m.detailMessage}" else ""}",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = StudioTextMuted
-                                        )
-                                    }
-                                    StatusPill(text = readinessLabel, color = readinessColor)
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("Gemini Model", style = MaterialTheme.typography.labelLarge, color = StudioTextPrimary)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        DirectGeminiApiClient.SUPPORTED_MODELS.chunked(2).forEach { rowModels ->
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                rowModels.forEach { option ->
+                                    FilterChip(
+                                        selected = config.geminiModelName == option.modelId,
+                                        onClick = { viewModel.updateSelectedGeminiModel(option.modelId) },
+                                        label = {
+                                            Text(
+                                                option.modelId,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("settings_gemini_${option.modelId}")
+                                    )
                                 }
                             }
                         }
                     }
-                }
-            }
 
-            item {
-                StudioCard {
-                    Text("Firebase AI Logic (Gemini Model)", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        "Used for Japanese ASR fallback (Stage 4) and Mixed-Script Hindi-English (Devanagari + English) translation (Stage 8) via Firebase App Check.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = StudioTextSecondary
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-argon").forEach { modelId ->
-                            FilterChip(
-                                selected = config.geminiModelName == modelId,
-                                onClick = {
-                                    scope.launch {
-                                        viewModel.prefsRepo.updateGeminiModelName(modelId)
-                                    }
-                                },
-                                label = { Text(modelId, style = MaterialTheme.typography.labelSmall) },
-                                modifier = Modifier.testTag("settings_gemini_$modelId")
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = { viewModel.testGeminiConnection() },
+                        enabled = !isTestingGemini && geminiKeyState.isConfigured,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("settings_test_gemini_btn"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        if (isTestingGemini) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                color = StudioCyan,
+                                strokeWidth = 2.dp
                             )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Testing Direct Gemini Connection…", color = StudioCyan)
+                        } else {
+                            Icon(Icons.Default.VerifiedUser, contentDescription = null, tint = StudioCyan, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Test Gemini Connection", color = StudioCyan)
                         }
+                    }
+
+                    if (geminiConnection != null) {
+                        val status = geminiConnection!!
+                        Spacer(modifier = Modifier.height(8.dp))
+                        WarningBanner(
+                            message = if (status.isConnected) {
+                                "Verified: ${status.message} (${status.latencyMs} ms)"
+                            } else {
+                                "Connection failed (${status.errorKind ?: "ERROR"}): ${status.message}"
+                            },
+                            isError = !status.isConnected
+                        )
                     }
                 }
             }
 
+            // Security Notice for Client-Side Android API Keys
+            item {
+                StudioCard {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Default.Security, contentDescription = null, tint = StudioAmber, modifier = Modifier.size(18.dp))
+                        Text("API Key Storage & Security Notice", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Your Gemini API key is encrypted at rest using Android Keystore (AES-256-GCM), sent only over HTTPS via the x-goog-api-key header, and never logged or written into project exports. Client-side Android apps cannot guarantee absolute secret extraction resistance on rooted/compromised devices; keep API quotas restricted and use a dedicated backend proxy for multi-user commercial releases.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudioTextSecondary
+                    )
+                }
+            }
+
+            // Android-Only Local Architecture & Audio Settings
             item {
                 StudioCard {
                     Text("Default Audio Sample Rate", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
@@ -1257,25 +1309,13 @@ fun SettingsScreen(viewModel: StudioViewModel) {
                         }
                     }
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text("Default Voice Engine Profile", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        HinglishTtsNormalizer.AVAILABLE_TTS_ENGINES.forEach { eng ->
-                            FilterChip(
-                                selected = config.selectedTtsEngine == eng.engineId,
-                                onClick = {
-                                    scope.launch {
-                                        viewModel.prefsRepo.updateModelSelections(
-                                            asrVariant = config.selectedAsrVariant,
-                                            ttsEngine = eng.engineId,
-                                            separationModel = config.selectedSeparationModel
-                                        )
-                                    }
-                                },
-                                label = { Text(eng.engineId, style = MaterialTheme.typography.labelSmall) }
-                            )
-                        }
-                    }
+                    Text("On-Device Android Processing Stack", style = MaterialTheme.typography.titleSmall, color = StudioTextPrimary)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "• Voice Activity Detection: Silero VAD v5 (ONNX Runtime)\n• Voice Synthesis: Android System TextToSpeech (Explicit local fallback — no neural voice cloning)\n• Stem Separation: On-Device Bandpass/Residual DSP (non-neural)\n• Speaker Grouping: On-Device Acoustic F0/Spectral Clustering (audio-only)\n• Mixing & Export: MediaCodec / MediaMuxer + WSOLA Time-Stretch",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudioTextSecondary
+                    )
                 }
             }
 

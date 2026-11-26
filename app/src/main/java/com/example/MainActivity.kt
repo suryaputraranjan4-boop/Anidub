@@ -90,7 +90,6 @@ import com.example.ui.theme.StudioTextMuted
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioViolet
-import com.example.util.configureAppCheck
 import com.example.viewmodel.MainTab
 import com.example.viewmodel.StudioOverlay
 import com.example.viewmodel.StudioViewModel
@@ -101,9 +100,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // MUST execute first before any Firebase.ai call (Firebase App Check mandate)
-        configureAppCheck(this, intent)
 
         enableEdgeToEdge()
         setContent {

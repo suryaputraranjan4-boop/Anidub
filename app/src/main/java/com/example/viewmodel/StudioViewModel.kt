@@ -23,10 +23,14 @@ import com.example.data.local.SpeakerProfileEntity
 import com.example.data.local.TimelineTrackEntity
 import com.example.data.local.TranscriptSegmentEntity
 import com.example.data.local.VoiceGenerationRecordEntity
+import com.example.data.preferences.GeminiApiKeyState
+import com.example.data.preferences.GeminiApiKeyStore
+import com.example.data.preferences.StudioConfig
 import com.example.data.preferences.StudioPreferencesRepository
-import com.example.data.preferences.WorkerAndStudioConfig
-import com.example.data.remote.RemoteWorkerClient
-import com.example.data.remote.WorkerHealthStatus
+import com.example.data.remote.DirectGeminiApiClient
+import com.example.data.remote.GeminiApiException
+import com.example.data.remote.GeminiConnectionTestResult
+import com.example.data.remote.GeminiDialogueRewriteResult
 import com.example.engine.AudioDspEngine
 import com.example.engine.AudioPlaybackState
 import com.example.engine.HinglishTtsNormalizer
@@ -113,7 +117,7 @@ data class GuidedImportState(
     val projectTitle: String = "",
     val animeSeriesName: String = "",
     val sampleRateHz: Int = 24000,
-    val preferredTtsEngine: String = "F5-Hindi-24KHz",
+    val preferredTtsEngine: String = "Android-Speech-TTS",
     val episodeNumber: Int = 1,
     val episodeTitle: String = "",
     val mediaStatus: MediaInspectionStatus = MediaInspectionStatus.IDLE,
@@ -141,9 +145,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val db = AnimeDubDatabase.getInstance(application)
     private val dao = db.dao()
     val prefsRepo = StudioPreferencesRepository(application)
+    val geminiKeyStore = GeminiApiKeyStore(application)
+    val geminiClient = DirectGeminiApiClient(geminiKeyStore)
     val modelDownloadManager = ModelDownloadManager(application, dao)
-    val coordinator = SevenSpecialistAgentsCoordinator(application, dao)
-    private val workerClient = RemoteWorkerClient()
+    val coordinator = SevenSpecialistAgentsCoordinator(application, dao, geminiClient)
     val audioPlayer = StudioAudioPlayer(viewModelScope)
 
     // 5-Tab Primary Navigation + Contextual Production Section + Focused Overlays
@@ -176,8 +181,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     private var activePipelineJob: Job? = null
 
-    private val _workerHealth = MutableStateFlow<WorkerHealthStatus?>(null)
-    val workerHealth: StateFlow<WorkerHealthStatus?> = _workerHealth.asStateFlow()
+    private val _geminiKeyState = MutableStateFlow(geminiKeyStore.getCurrentState())
+    val geminiKeyState: StateFlow<GeminiApiKeyState> = _geminiKeyState.asStateFlow()
+
+    private val _geminiConnectionStatus = MutableStateFlow<GeminiConnectionTestResult?>(null)
+    val geminiConnectionStatus: StateFlow<GeminiConnectionTestResult?> = _geminiConnectionStatus.asStateFlow()
+
+    private val _isTestingGeminiConnection = MutableStateFlow(false)
+    val isTestingGeminiConnection: StateFlow<Boolean> = _isTestingGeminiConnection.asStateFlow()
 
     private val _timelineZoom = MutableStateFlow(1.0f)
     val timelineZoom: StateFlow<Float> = _timelineZoom.asStateFlow()
@@ -191,8 +202,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     val playbackState: StateFlow<AudioPlaybackState> = audioPlayer.playbackState
 
-    val studioConfig: StateFlow<WorkerAndStudioConfig> = prefsRepo.configFlow
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), WorkerAndStudioConfig())
+    val studioConfig: StateFlow<StudioConfig> = prefsRepo.configFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), StudioConfig())
 
     private val _activeEpisodeId = MutableStateFlow(0L)
     val activeEpisodeId: StateFlow<Long> = _activeEpisodeId.asStateFlow()
@@ -273,9 +284,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
      */
     private fun initializeCatalogAndRestoreActiveEpisode() {
         viewModelScope.launch(Dispatchers.IO) {
-            modelDownloadManager.reconcileCatalogWithDisk()
-
             val savedConfig = prefsRepo.configFlow.first()
+            val keyState = geminiKeyStore.getCurrentState()
+            _geminiKeyState.value = keyState
+            modelDownloadManager.reconcileCatalogWithDisk(
+                geminiApiConfigured = keyState.isConfigured,
+                geminiModelName = savedConfig.geminiModelName
+            )
+
             val savedEp = if (savedConfig.activeEpisodeId > 0L) dao.getEpisodeById(savedConfig.activeEpisodeId) else null
             if (savedEp != null) {
                 _activeEpisodeId.value = savedEp.id
@@ -666,15 +682,25 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     )
                 )
 
-                // Move staged files into dedicated episode workspace directory
+                // Move staged files into dedicated episode workspace directory & clean staging copies
                 val epDir = coordinator.getEpisodeWorkspaceDir(placeholderEpId)
                 val stagedSrc = File(media.localSourcePath)
                 val finalSrc = File(epDir, stagedSrc.name.substringAfter("_", stagedSrc.name))
-                if (stagedSrc.exists()) stagedSrc.copyTo(finalSrc, overwrite = true)
+                if (stagedSrc.exists()) {
+                    stagedSrc.copyTo(finalSrc, overwrite = true)
+                    if (stagedSrc.absolutePath != finalSrc.absolutePath) {
+                        runCatching { stagedSrc.delete() }
+                    }
+                }
 
                 val stagedWav = File(media.extractedWavPath)
                 val finalWav = File(epDir, "master_original_pcm.wav")
-                if (stagedWav.exists()) stagedWav.copyTo(finalWav, overwrite = true)
+                if (stagedWav.exists()) {
+                    stagedWav.copyTo(finalWav, overwrite = true)
+                    if (stagedWav.absolutePath != finalWav.absolutePath) {
+                        runCatching { stagedWav.delete() }
+                    }
+                }
 
                 val savedEp = dao.getEpisodeById(placeholderEpId)
                 if (savedEp != null) {
@@ -734,25 +760,19 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
         val cfg = studioConfig.value
         val ttsEngine = cfg.selectedTtsEngine
-        val workerUrl = cfg.remoteWorkerBaseUrl
-        val workerToken = cfg.remoteWorkerAuthToken
-        val allowLanHttp = cfg.allowInsecureLocalHttp
         val geminiModel = cfg.geminiModelName
         activePipelineJob = viewModelScope.launch {
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = startStage,
                 activeStageTitle = "Starting Stage $startStage…",
-                activeDetail = "Initializing multi-agent coordinator…"
+                activeDetail = "Initializing Android-local + Direct Gemini API pipeline…"
             )
             val result = coordinator.executePipelineFromStage(
                 episodeId = epId,
                 startStage = startStage,
                 endStage = endStage,
                 selectedTtsEngine = ttsEngine,
-                remoteWorkerUrl = workerUrl,
-                remoteWorkerAuthToken = workerToken,
-                allowInsecureLocalHttp = allowLanHttp,
                 geminiModelName = geminiModel
             ) { stageNum, stageTitle, detail ->
                 _pipelineBanner.value = PipelineBannerState(
@@ -1002,6 +1022,45 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun reviewOrRewriteDialogueWithGemini(
+        dialogueId: Long,
+        currentText: String,
+        instruction: String,
+        onResult: (Result<GeminiDialogueRewriteResult>) -> Unit
+    ) {
+        val modelName = studioConfig.value.geminiModelName
+        viewModelScope.launch {
+            _pipelineBanner.value = PipelineBannerState(
+                isRunning = true,
+                activeStageNumber = 8,
+                activeStageTitle = "Gemini Dialogue Review & Rewrite",
+                activeDetail = "Polishing mixed-script Hindi-English line with scene context & dictionary…"
+            )
+            val res = coordinator.reviewOrRewriteDialogueWithGemini(
+                dialogueId = dialogueId,
+                currentMixedScript = currentText,
+                instruction = instruction,
+                geminiModelName = modelName
+            )
+            _pipelineBanner.value = res.fold(
+                onSuccess = { rw ->
+                    PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = rw.reviewNotes.ifBlank { "Dialogue reviewed and polished via Direct Gemini API." }
+                    )
+                },
+                onFailure = { err ->
+                    PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = err.localizedMessage ?: "Gemini review failed.",
+                        isError = true
+                    )
+                }
+            )
+            onResult(res)
+        }
+    }
+
     fun renameSpeakerCharacter(speaker: SpeakerProfileEntity, newCharacterName: String, consentConfirmed: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             val cleanName = newCharacterName.trim().ifBlank { "Speaker ${speaker.speakerLabel}" }
@@ -1034,10 +1093,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val cfg = studioConfig.value
                 coordinator.regenerateSingleDialogueOnly(
                     dialogueId = updated.id,
-                    selectedTtsEngine = cfg.selectedTtsEngine,
-                    remoteWorkerUrl = cfg.remoteWorkerBaseUrl,
-                    remoteWorkerAuthToken = cfg.remoteWorkerAuthToken,
-                    allowInsecureLocalHttp = cfg.allowInsecureLocalHttp
+                    selectedTtsEngine = cfg.selectedTtsEngine
                 )
             }
         }
@@ -1053,17 +1109,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = true,
                 activeStageNumber = 10,
-                activeStageTitle = "Synthesizing Dialogue Line",
-                activeDetail = "Generating real spoken Hindi/Hinglish clip & refreshing mix…"
+                activeStageTitle = "Synthesizing Dialogue Line (Local Android TTS)",
+                activeDetail = "Generating spoken Hindi/English clip & refreshing mix…"
             )
             val res = coordinator.regenerateSingleDialogueOnly(
                 dialogueId = dialogueId,
                 newRomanHinglishText = newRomanHinglish,
                 newEmotion = newEmotion,
-                selectedTtsEngine = cfg.selectedTtsEngine,
-                remoteWorkerUrl = cfg.remoteWorkerBaseUrl,
-                remoteWorkerAuthToken = cfg.remoteWorkerAuthToken,
-                allowInsecureLocalHttp = cfg.allowInsecureLocalHttp
+                selectedTtsEngine = cfg.selectedTtsEngine
             )
             _pipelineBanner.value = res.fold(
                 onSuccess = { dlg ->
@@ -1109,10 +1162,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 newRomanHinglishTerm = newRomanHinglishTerm,
                 pronunciationGuidance = pronunciationGuidance,
                 scope = scope,
-                selectedTtsEngine = cfg.selectedTtsEngine,
-                remoteWorkerUrl = cfg.remoteWorkerBaseUrl,
-                remoteWorkerAuthToken = cfg.remoteWorkerAuthToken,
-                allowInsecureLocalHttp = cfg.allowInsecureLocalHttp
+                selectedTtsEngine = cfg.selectedTtsEngine
             )
             _pipelineBanner.value = PipelineBannerState(
                 isRunning = false,
@@ -1178,6 +1228,58 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun deleteDictionaryEntry(id: Long) {
         viewModelScope.launch(Dispatchers.IO) {
             dao.deleteDictionaryEntry(id)
+        }
+    }
+
+    fun exportDictionariesToJson(): String {
+        return MixedScriptLanguageEngine.exportDictionaryEntriesToJson(dictionaries.value)
+    }
+
+    fun importDictionariesFromJson(
+        json: String,
+        onDone: (Result<Int>) -> Unit = {}
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeProj = activeProject.value
+            val parsed = MixedScriptLanguageEngine.parseDictionaryEntriesFromJson(
+                json = json,
+                fallbackProjectId = activeProj?.id,
+                fallbackAnimeSeriesName = activeProj?.animeSeriesName ?: activeProj?.title ?: ""
+            )
+            if (parsed.isFailure) {
+                val err = parsed.exceptionOrNull()!!
+                _pipelineBanner.value = PipelineBannerState(
+                    isRunning = false,
+                    statusBannerMessage = err.localizedMessage ?: "Dictionary JSON import failed.",
+                    isError = true
+                )
+                onDone(Result.failure(err))
+                return@launch
+            }
+            val incoming = parsed.getOrThrow()
+            var importedCount = 0
+            val existingAll = dao.getAllDictionaryEntriesOnce().toMutableList()
+            for (entry in incoming) {
+                val preferred = MixedScriptLanguageEngine.preferredDisplayTerm(entry)
+                val key = MixedScriptLanguageEngine.normalizedTermKey(entry.japaneseSourceTerm, preferred)
+                val dup = existingAll.find { ex ->
+                    ex.dictionaryLevel.equals(entry.dictionaryLevel, ignoreCase = true) &&
+                        ex.projectId == entry.projectId &&
+                        (ex.animeSeriesName?.trim() ?: "").equals(entry.animeSeriesName?.trim() ?: "", ignoreCase = true) &&
+                        MixedScriptLanguageEngine.normalizedTermKey(
+                            ex.japaneseSourceTerm,
+                            MixedScriptLanguageEngine.preferredDisplayTerm(ex)
+                        ) == key
+                }
+                val toSave = if (dup != null) entry.copy(id = dup.id) else entry
+                dao.insertDictionaryEntry(toSave)
+                importedCount++
+            }
+            _pipelineBanner.value = PipelineBannerState(
+                isRunning = false,
+                statusBannerMessage = "Imported $importedCount dictionary term(s) into 3-tier glossary."
+            )
+            onDone(Result.success(importedCount))
         }
     }
 
@@ -1310,20 +1412,21 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun downloadModel(modelId: String, hfToken: String? = null) {
+    fun downloadModel(modelId: String) {
         viewModelScope.launch {
-            modelDownloadManager.downloadAndVerifyModel(modelId, hfToken)
+            val res = modelDownloadManager.downloadAndVerifyModel(modelId)
+            if (res.isFailure) {
+                _pipelineBanner.value = PipelineBannerState(
+                    isRunning = false,
+                    statusBannerMessage = res.exceptionOrNull()?.localizedMessage ?: "Model download failed.",
+                    isError = true
+                )
+            }
         }
     }
 
     fun cancelModelDownload(modelId: String) {
         modelDownloadManager.cancelDownload(modelId)
-    }
-
-    fun probeGatedModelSizes(modelId: String, hfToken: String) {
-        viewModelScope.launch {
-            modelDownloadManager.probeGatedModelSizes(modelId, hfToken)
-        }
     }
 
     fun verifyModelIntegrity(modelId: String) {
@@ -1416,17 +1519,111 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun verifyRemoteWorkerHealth(
-        url: String,
-        authToken: String = studioConfig.value.remoteWorkerAuthToken,
-        allowInsecureLocalHttp: Boolean = studioConfig.value.allowInsecureLocalHttp
-    ) {
-        viewModelScope.launch {
-            _workerHealth.value = workerClient.checkWorkerHealth(
-                baseUrl = url,
-                authToken = authToken,
-                allowInsecureLocalHttp = allowInsecureLocalHttp
+    // --- Direct Gemini API Key & Connection Management ---
+
+    fun saveGeminiApiKey(rawKey: String, onDone: (Result<GeminiApiKeyState>) -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = geminiKeyStore.saveApiKey(rawKey)
+            res.fold(
+                onSuccess = { newState ->
+                    _geminiKeyState.value = newState
+                    _geminiConnectionStatus.value = null
+                    modelDownloadManager.updateDirectGeminiCatalogStatus(
+                        isConfigured = newState.isConfigured,
+                        modelName = studioConfig.value.geminiModelName
+                    )
+                    _pipelineBanner.value = PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = "Gemini API key saved encrypted in Android Keystore. Tap Test Connection to verify."
+                    )
+                },
+                onFailure = { err ->
+                    _pipelineBanner.value = PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = err.localizedMessage ?: "Invalid Gemini API key.",
+                        isError = true
+                    )
+                }
             )
+            onDone(res)
+        }
+    }
+
+    fun removeGeminiApiKey() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val newState = geminiKeyStore.removeApiKey()
+            _geminiKeyState.value = newState
+            _geminiConnectionStatus.value = null
+            modelDownloadManager.updateDirectGeminiCatalogStatus(
+                isConfigured = newState.isConfigured,
+                modelName = studioConfig.value.geminiModelName
+            )
+            _pipelineBanner.value = PipelineBannerState(
+                isRunning = false,
+                statusBannerMessage = if (newState.isConfigured) {
+                    "Removed custom key; falling back to build-configured GEMINI_API_KEY."
+                } else {
+                    "Gemini API key removed from Android Keystore."
+                }
+            )
+        }
+    }
+
+    fun updateSelectedGeminiModel(modelName: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            prefsRepo.updateGeminiModelName(modelName)
+            val normalized = DirectGeminiApiClient.normalizeModelName(modelName)
+            modelDownloadManager.updateDirectGeminiCatalogStatus(
+                isConfigured = geminiKeyStore.hasConfiguredKey(),
+                modelName = normalized
+            )
+        }
+    }
+
+    fun testGeminiConnection(modelName: String = studioConfig.value.geminiModelName) {
+        if (_isTestingGeminiConnection.value) return
+        viewModelScope.launch {
+            _isTestingGeminiConnection.value = true
+            val res = geminiClient.testConnection(modelName)
+            res.fold(
+                onSuccess = { ok ->
+                    _geminiConnectionStatus.value = ok
+                    modelDownloadManager.updateDirectGeminiCatalogStatus(
+                        isConfigured = true,
+                        modelName = ok.modelId,
+                        connectionMessage = ok.message,
+                        isError = false
+                    )
+                    _pipelineBanner.value = PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = ok.message
+                    )
+                },
+                onFailure = { err ->
+                    val kind = (err as? GeminiApiException)?.kind
+                    val msg = err.localizedMessage ?: "Gemini connection test failed."
+                    _geminiConnectionStatus.value = GeminiConnectionTestResult(
+                        isConnected = false,
+                        modelId = DirectGeminiApiClient.normalizeModelName(modelName),
+                        remoteDisplayName = "",
+                        latencyMs = 0L,
+                        message = msg,
+                        errorKind = kind
+                    )
+                    modelDownloadManager.updateDirectGeminiCatalogStatus(
+                        isConfigured = geminiKeyStore.hasConfiguredKey(),
+                        modelName = DirectGeminiApiClient.normalizeModelName(modelName),
+                        connectionMessage = msg,
+                        isError = true
+                    )
+                    _pipelineBanner.value = PipelineBannerState(
+                        isRunning = false,
+                        statusBannerMessage = msg,
+                        isError = true
+                    )
+                }
+            )
+            _isTestingGeminiConnection.value = false
         }
     }
 

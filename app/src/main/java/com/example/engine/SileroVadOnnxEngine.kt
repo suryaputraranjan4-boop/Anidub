@@ -37,6 +37,47 @@ object SileroVadOnnxEngine {
     private const val WINDOW_SAMPLES_16K = 512 // 32 ms at 16 kHz (Silero v5 standard)
     private const val CONTEXT_SAMPLES_V5 = 64  // Silero v5 prepends 64 context samples
 
+    /**
+     * Genuinely loads the ONNX graph into ONNX Runtime Mobile (`OrtSession`), verifies its
+     * Silero VAD v5 (`state`) or v4 (`h`, `c`) input tensor signature, and closes the session.
+     * Used during `LOADING -> READY` verification so a model is NEVER marked `READY` solely
+     * because bytes exist on disk.
+     */
+    fun verifyModelLoadable(modelOnnxFile: File): Result<String> {
+        if (!modelOnnxFile.exists() || !modelOnnxFile.isFile || modelOnnxFile.length() < 100_000L) {
+            return Result.failure(
+                IllegalStateException("Silero VAD ONNX model missing or truncated at ${modelOnnxFile.absolutePath}")
+            )
+        }
+        var session: OrtSession? = null
+        return try {
+            val env = OrtEnvironment.getEnvironment()
+            val opts = OrtSession.SessionOptions().apply {
+                setIntraOpNumThreads(1)
+            }
+            session = env.createSession(modelOnnxFile.absolutePath, opts)
+            val inputNames = session.inputNames
+            val signature = when {
+                inputNames.contains("state") -> "Silero VAD v5 ONNX (inputs: ${inputNames.joinToString()})"
+                inputNames.contains("h") && inputNames.contains("c") -> "Silero VAD v4 ONNX (inputs: ${inputNames.joinToString()})"
+                else -> return Result.failure(
+                    IllegalStateException("Loaded ONNX graph has incompatible Silero input signature: ${inputNames.joinToString()}")
+                )
+            }
+            Result.success("ONNX Runtime session verified: $signature")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Silero ONNX load verification failed: ${t.localizedMessage}", t)
+            Result.failure(
+                IllegalStateException("ONNX Runtime failed to load model.onnx: ${t.localizedMessage ?: t.javaClass.simpleName}", t)
+            )
+        } finally {
+            try {
+                session?.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     fun detectSpeechSegmentsOnnx(
         modelOnnxFile: File,
         audioBuffer: PcmAudioBuffer,
